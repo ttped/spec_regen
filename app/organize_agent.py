@@ -349,7 +349,7 @@ if __name__ == '__main__':
         "provider": "mission_assist",
         "model_name": "gemma3",
         "base_url": "http://devmissionassist.api.us.baesystems.com",
-        "api_key": "aTOIT9hJM3DBYMQbEY"
+        "api_key": ""
     }
     
     doc_stem = "S-133-05737_U_SSDD_CUI_classified"

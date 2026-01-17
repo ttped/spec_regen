@@ -124,7 +124,7 @@ if __name__ == '__main__':
         "provider": "mission_assist",
         "model_name": "gptoss", # gpt-oss or gemma3
         "base_url": "http://devmissionassist.api.us.baesystems.com",
-        "api_key": "aTOIT9hJM3DBYMQbEY"
+        "api_key": ""
     }
 
     doc_stems = get_document_stems(args.raw_ocr_dir)

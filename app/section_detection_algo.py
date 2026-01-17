@@ -2,6 +2,8 @@ import os
 import json
 import re
 from typing import List, Dict, Tuple, Optional
+import statistics
+from typing import List, Dict, Any
 
 def save_results_to_json(data: List[Dict], output_path: str):
     """
@@ -51,43 +53,78 @@ def load_all_ocr_files(directory: str) -> List[Dict]:
     print(f"Loaded data for {len(all_pages)} pages from {total_files} files.")
     return all_pages
 
-def reconstruct_paragraphs_from_page_dict(page_dict: Dict[str, List]) -> List[str]:
+def reconstruct_rich_paragraphs(page_dict: Dict[str, List]) -> List[Dict[str, Any]]:
     """
-    Reconstructs a list of paragraph strings from the word-level OCR data.
-    A new paragraph is identified by a change in 'block_num' or 'par_num'.
-
-    Args:
-        page_dict: The dictionary from the OCR containing word-level details.
-
-    Returns:
-        A list of strings, where each string is a reconstructed paragraph.
+    Converts Tesseract-style parallel arrays into 'Rich Paragraph' objects.
+    Each object contains the text plus spatial metadata (font size, indent, y-pos).
     """
     if not page_dict.get('text'):
         return []
 
-    paragraphs = []
-    current_paragraph_words = []
+    rich_paragraphs = []
     
+    # Initialize buffers for the current paragraph
+    current_words = []
+    current_heights = []
+    current_lefts = []
+    current_tops = []
+    
+    # We need to loop through the parallel arrays. 
+    # The 'block_num' and 'par_num' keys define when a paragraph changes.
+    count = len(page_dict['text'])
     last_block = page_dict['block_num'][0]
     last_par = page_dict['par_num'][0]
 
-    for i in range(len(page_dict['text'])):
+    for i in range(count):
+        # Extract data for the current word
+        word_text = str(page_dict['text'][i]).strip()
         block_num = page_dict['block_num'][i]
         par_num = page_dict['par_num'][i]
-        word_text = page_dict['text'][i]
-
-        if block_num != last_block or par_num != last_par:
-            if current_paragraph_words:
-                paragraphs.append(" ".join(current_paragraph_words))
-            current_paragraph_words = [word_text]
-            last_block, last_par = block_num, par_num
-        else:
-            current_paragraph_words.append(word_text)
-    
-    if current_paragraph_words:
-        paragraphs.append(" ".join(current_paragraph_words))
         
-    return paragraphs
+        # Skip empty strings (often just layout noise)
+        if not word_text:
+            continue
+            
+        # Check if we have started a new paragraph block
+        if block_num != last_block or par_num != last_par:
+            # SAVE PREVIOUS PARAGRAPH
+            if current_words:
+                rich_paragraphs.append({
+                    "text": " ".join(current_words),
+                    # Height is our best proxy for Font Size
+                    "avg_height": statistics.mean(current_heights),
+                    # Left is our proxy for Indentation
+                    "indentation": min(current_lefts), 
+                    # Top is used for sorting relative to images
+                    "y_position": min(current_tops),
+                    "block_id": f"{last_block}_{last_par}"
+                })
+            
+            # RESET BUFFERS
+            current_words = []
+            current_heights = []
+            current_lefts = []
+            current_tops = []
+            last_block, last_par = block_num, par_num
+
+        # ADD WORD TO BUFFER
+        # Tesseract visual data: left, top, width, height
+        current_words.append(word_text)
+        current_heights.append(page_dict['height'][i])
+        current_lefts.append(page_dict['left'][i])
+        current_tops.append(page_dict['top'][i])
+
+    # Don't forget the very last paragraph after the loop finishes
+    if current_words:
+        rich_paragraphs.append({
+            "text": " ".join(current_words),
+            "avg_height": statistics.mean(current_heights),
+            "indentation": min(current_lefts),
+            "y_position": min(current_tops),
+            "block_id": f"{last_block}_{last_par}"
+        })
+        
+    return rich_paragraphs
 
 def check_if_paragraph_is_header(text: str) -> Tuple[bool, Optional[str], Optional[str]]:
     """

@@ -361,7 +361,7 @@ def run_docx_creation(input_path: str, output_path: str, figures_base_path: str,
 
 if __name__ == '__main__':
     # Example of how to run this module standalone
-    doc_stem = "S-133-06923_A_CUI"
+    doc_stem = ""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
     input_file = os.path.join(script_dir, "..", "results", f"{doc_stem}_repaired.json")
