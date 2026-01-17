@@ -11,40 +11,58 @@ def save_results_to_json(data: List[Dict], output_path: str):
         os.makedirs(output_dir, exist_ok=True)
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=4)
-    print(f"Algorithmic organization results saved to {output_path}")
+    print(f"Results saved to {output_path}")
 
-def load_all_ocr_files(directory: str) -> List[Dict]:
-    """Loads all OCR JSON files from a specified directory."""
-    all_pages = []
-    print(f"Loading OCR files from: {directory}")
-    if not os.path.isdir(directory):
-        print(f"Error: Directory not found at {directory}")
+def load_single_document(filepath: str) -> List[Tuple[int, Dict]]:
+    """
+    Loads a single OCR JSON file. 
+    Returns a list of tuples: (page_number_int, page_dict).
+    Sorted strictly by integer page number.
+    """
+    print(f"Loading document: {filepath}")
+    if not os.path.exists(filepath):
+        print(f"Error: File not found at {filepath}")
         return []
-        
-    filenames = sorted(os.listdir(directory))
-    total_files = 0
 
-    for filename in filenames:
-        if filename.endswith(".json"):
-            total_files += 1
-            filepath = os.path.join(directory, filename)
-            with open(filepath, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                # Handle structure where pages are values in a dict
-                if isinstance(data, dict):
-                    all_pages.extend(data.values())
-                elif isinstance(data, list):
-                    all_pages.extend(data)
+    with open(filepath, 'r', encoding='utf-8') as f:
+        data = json.load(f)
 
-    print(f"Loaded data for {len(all_pages)} pages from {total_files} files.")
-    return all_pages
+    # The structure is { "1": {...}, "2": {...} }
+    # We must convert keys to integers for sorting: "10" comes after "2", not "1".
+    sorted_pages = []
+    
+    # Handle the case where the JSON might be a list (rare but possible in some exports)
+    if isinstance(data, list):
+        for idx, page_data in enumerate(data):
+            # Try to find a page number, otherwise use index + 1
+            p_num = page_data.get('page_num', idx + 1) 
+            sorted_pages.append((int(p_num), page_data))
+            
+    elif isinstance(data, dict):
+        for page_key, page_val in data.items():
+            try:
+                p_num = int(page_key)
+            except ValueError:
+                continue # Skip non-integer keys if any metadata keys exist
+            
+            # The actual word data is often inside a 'page_dict' key, 
+            # or sometimes the value *is* the page_dict.
+            actual_page_dict = page_val.get('page_dict', page_val)
+            sorted_pages.append((p_num, actual_page_dict))
 
-def reconstruct_rich_paragraphs(page_dict: Dict[str, List]) -> List[Dict[str, Any]]:
+    # STRICT SORT by page number
+    sorted_pages.sort(key=lambda x: x[0])
+    
+    print(f"Loaded {len(sorted_pages)} pages in correct order.")
+    return sorted_pages
+
+def reconstruct_rich_paragraphs(page_dict: Dict[str, List], page_num: int) -> List[Dict[str, Any]]:
     """
-    Converts Tesseract-style parallel arrays into 'Rich Paragraph' objects.
-    Each object contains the text plus spatial metadata (font size, indent).
+    Converts parallel arrays into 'Rich Paragraph' objects.
+    Now attaches 'page' metadata to every paragraph.
     """
-    if not page_dict.get('text'):
+    # Defensive check: ensure 'text' exists
+    if not page_dict or 'text' not in page_dict:
         return []
 
     rich_paragraphs = []
@@ -52,7 +70,7 @@ def reconstruct_rich_paragraphs(page_dict: Dict[str, List]) -> List[Dict[str, An
     current_heights = []
     current_lefts = []
     
-    # Safely get lists or defaults
+    # Get the lists, defaulting to empty if missing
     texts = page_dict.get('text', [])
     block_nums = page_dict.get('block_num', [])
     par_nums = page_dict.get('par_num', [])
@@ -62,67 +80,64 @@ def reconstruct_rich_paragraphs(page_dict: Dict[str, List]) -> List[Dict[str, An
     count = len(texts)
     if count == 0: return []
 
-    last_block = block_nums[0]
-    last_par = par_nums[0]
+    # Initialize tracking with the first item's ID
+    last_block = block_nums[0] if block_nums else 0
+    last_par = par_nums[0] if par_nums else 0
 
     for i in range(count):
         word_text = str(texts[i]).strip()
-        block_num = block_nums[i]
-        par_num = par_nums[i]
         
+        # Skip empty layout noise
         if not word_text:
             continue
             
-        # Check for new paragraph
+        block_num = block_nums[i]
+        par_num = par_nums[i]
+        
+        # Check for new paragraph (Block change or Paragraph ID change)
         if block_num != last_block or par_num != last_par:
             if current_words:
                 rich_paragraphs.append({
                     "text": " ".join(current_words),
                     "avg_height": statistics.mean(current_heights) if current_heights else 0,
                     "indentation": min(current_lefts) if current_lefts else 0,
-                    # We can use these IDs for debugging order if needed
-                    "block_id": f"{last_block}_{last_par}" 
+                    "page": page_num,  # <--- METADATA ADDED
+                    "block_id": f"{last_block}_{last_par}"
                 })
             
+            # Reset
             current_words = []
             current_heights = []
             current_lefts = []
             last_block, last_par = block_num, par_num
 
         current_words.append(word_text)
-        # Ensure we don't crash if metadata lists are shorter than text list (rare edge case)
         if i < len(heights): current_heights.append(heights[i])
         if i < len(lefts): current_lefts.append(lefts[i])
 
-    # Add the final paragraph
+    # Flush the final paragraph
     if current_words:
         rich_paragraphs.append({
             "text": " ".join(current_words),
             "avg_height": statistics.mean(current_heights) if current_heights else 0,
             "indentation": min(current_lefts) if current_lefts else 0,
+            "page": page_num, # <--- METADATA ADDED
             "block_id": f"{last_block}_{last_par}"
         })
         
     return rich_paragraphs
 
 def get_document_stats(all_paragraphs: List[Dict[str, Any]]) -> Dict[str, float]:
-    """
-    Calculates the 'Body Text' profile for the entire document.
-    Returns the mode (most common) font size and indentation.
-    """
+    """Calculates Document-wide visual baselines."""
     if not all_paragraphs:
         return {"body_size": 10, "body_indent": 0}
 
-    # Round heights to nearest integer to group similar fonts (e.g. 11.2 vs 11.5 -> 11)
     heights = [round(p['avg_height']) for p in all_paragraphs if p['avg_height'] > 0]
-    # Round indentation to nearest 5 pixels to group slight misalignments
     indents = [round(p['indentation'] / 5) * 5 for p in all_paragraphs]
 
-    # Calculate Mode (Most common value)
     try:
         body_size = statistics.mode(heights)
     except statistics.StatisticsError:
-        # If multiple modes, take the median as a fallback
         body_size = statistics.median(heights) if heights else 10
 
     try:
@@ -130,19 +145,15 @@ def get_document_stats(all_paragraphs: List[Dict[str, Any]]) -> Dict[str, float]
     except statistics.StatisticsError:
         body_indent = min(indents) if indents else 0
 
-    print(f"Document Stats - Body Font Size: ~{body_size}px, Body Margin: ~{body_indent}px")
     return {"body_size": body_size, "body_indent": body_indent}
 
 def check_if_header(para: Dict[str, Any], stats: Dict[str, float]) -> Tuple[bool, Optional[str], Optional[str]]:
-    """
-    Determines if a paragraph is a header using Regex + Visual Stats.
-    """
+    """Determines if a paragraph is a header using Regex + Visual Stats."""
     text = para['text']
     avg_height = para['avg_height']
     indent = para['indentation']
     
-    # 1. Regex Filter: Must start with a section number (e.g., "1.2", "A.")
-    # We allow loose matching here because the visual check will filter false positives
+    # 1. Regex: Must look like a header (e.g., "1.2 Title")
     match = re.match(r'^\s*([a-zA-Z0-9\.]+)\s+(.+)', text)
     match_num_only = re.match(r'^\s*([a-zA-Z0-9\.]+)\s*$', text)
 
@@ -154,24 +165,20 @@ def check_if_header(para: Dict[str, Any], stats: Dict[str, float]) -> Tuple[bool
     else:
         return False, None, None
 
-    # 2. Heuristics to clean up the Regex match
-    if not any(c.isdigit() for c in potential_num): return False, None, None # Must have digit
-    if len(potential_num) > 10: return False, None, None # Number too long
-    if potential_num.count('.') > 4: return False, None, None # Too deep (1.2.3.4.5 is rare)
+    # 2. Cleanup
+    if not any(c.isdigit() for c in potential_num): return False, None, None 
+    if len(potential_num) > 10: return False, None, None 
 
-    # 3. Visual Confirmation (The "Algorithmic" Layer)
+    # 3. Visual Confirmation
     is_visually_prominent = False
     
-    # Rule A: It is significantly larger than body text (e.g. > 10% larger)
+    # Larger than body text?
     if avg_height > (stats['body_size'] * 1.1):
         is_visually_prominent = True
-        
-    # Rule B: It matches body size, but is aligned to the left margin (common for sub-headers)
-    # We allow a small tolerance (e.g. 10px) for scanner skew
+    # Or, same size but strictly aligned to margin (and Regex matched)?
     elif avg_height >= (stats['body_size'] * 0.9) and indent <= (stats['body_indent'] + 10):
         is_visually_prominent = True
 
-    # If regex matched but visually it looks like indented body text or small footnote, reject it
     if not is_visually_prominent:
         return False, None, None
 
@@ -179,7 +186,8 @@ def check_if_header(para: Dict[str, Any], stats: Dict[str, float]) -> Tuple[bool
 
 def group_elements(classified_items: List[Dict]) -> List[Dict]:
     """
-    Merges 'unassigned_text_block' items into the preceding 'section' item.
+    Merges unassigned text. 
+    NOW PRESERVES 'page' info from the start of the block.
     """
     if not classified_items:
         return []
@@ -189,65 +197,53 @@ def group_elements(classified_items: List[Dict]) -> List[Dict]:
 
     for item in classified_items:
         if item['type'] == 'section':
-            # If we were building a section, save it
             if current_section:
                 merged_elements.append(current_section)
             
-            # Start a new section
             current_section = item
-            current_section['content'] = "" # Initialize content buffer
-        
+            current_section['content'] = "" 
+            # Ensure page metadata is top-level
+            if 'page' not in current_section:
+                current_section['page'] = item.get('page')
+
         elif item['type'] == 'unassigned_text_block':
             text = item.get('content', '')
             if current_section:
-                # Append to current section
                 if current_section['content']:
                     current_section['content'] += "\n\n" + text
                 else:
                     current_section['content'] = text
             else:
-                # No preceding section (preamble text), keep as unassigned
+                # Independent text block (preamble)
                 merged_elements.append(item)
 
-    # Append the last section being built
     if current_section:
         merged_elements.append(current_section)
             
     return merged_elements
 
-def run_algorithmic_organization(input_dir: str, output_path: str):
+def run_algorithmic_organization(input_file_path: str, output_path: str):
     """
-    Main orchestration function.
-    1. Loads all pages.
-    2. Converts raw OCR to Rich Paragraphs.
-    3. Calculates document-wide font stats.
-    4. Classifies and groups paragraphs.
+    Main orchestration function for a SINGLE document file.
     """
-    all_page_data = load_all_ocr_files(input_dir)
-    if not all_page_data:
-        return
+    # 1. Load pages sorted strictly by integer page number
+    sorted_pages = load_single_document(input_file_path)
     
-    # Sort pages (try by ID, fallback to file order)
-    try:
-        all_page_data.sort(key=lambda p: int(p.get('page_Id', 0)))
-    except (ValueError, KeyError, TypeError):
-        pass
+    if not sorted_pages:
+        print("No pages loaded. Exiting.")
+        return
 
-    # --- PASS 1: Convert to Rich Paragraphs & Collect Stats ---
+    # 2. Flatten into Rich Paragraphs with Page IDs
     all_rich_paragraphs = []
-    for page in all_page_data:
-        page_dict = page.get('page_dict')
-        if page_dict:
-            # Reconstruct paragraphs with metadata
-            paras = reconstruct_rich_paragraphs(page_dict)
-            all_rich_paragraphs.extend(paras)
+    for page_num, page_dict in sorted_pages:
+        paras = reconstruct_rich_paragraphs(page_dict, page_num)
+        all_rich_paragraphs.extend(paras)
 
-    # Calculate baseline (what does "normal" text look like in this specific doc?)
+    # 3. Calc Stats
     doc_stats = get_document_stats(all_rich_paragraphs)
 
-    # --- PASS 2: Classification ---
+    # 4. Classify
     classified_items = []
-    
     for para in all_rich_paragraphs:
         is_header_bool, sec_num, topic = check_if_header(para, doc_stats)
 
@@ -256,25 +252,31 @@ def run_algorithmic_organization(input_dir: str, output_path: str):
                 "type": "section",
                 "section_number": sec_num,
                 "topic": topic,
-                "content": "" # To be filled in grouping
+                "content": "",
+                "page": para['page']  # Track where the section started
             })
         else:
             classified_items.append({
                 "type": "unassigned_text_block",
-                "content": para['text']
+                "content": para['text'],
+                "page": para['page']  # Track where this text block is
             })
 
-    # --- PASS 3: Grouping ---
+    # 5. Group
     final_elements = group_elements(classified_items)
     save_results_to_json(final_elements, output_path)
 
 if __name__ == '__main__':
-    project_root = os.getcwd() 
+    # Usage Example
+    # In your pipeline, you would loop through files and call this for each one.
     
-    input_directory = os.path.join(project_root, "iris_ocr", "CM_Spec_OCR_and_figtab_output", "raw_data_advanced")
-    results_dir = os.path.join(project_root, "results")
-    output_filepath = os.path.join(results_dir, "algorithmic_organization_output.json")
+    # Just for testing locally:
+    project_root = os.getcwd() 
+    doc_stem = "S-133-06923" # Replace with your actual test file stem
+    
+    # Assuming file is at .../raw_data/S-133-06923.json
+    input_file = os.path.join(project_root, "iris_ocr", "CM_Spec_OCR_and_figtab_output", "raw_data", f"{doc_stem}.json")
+    output_file = os.path.join(project_root, "results", f"{doc_stem}_algo_organized.json")
 
-    print("--- Starting Algorithmic Organization (Visual-Aware) ---")
-    run_algorithmic_organization(input_directory, output_filepath)
-    print("--- Algorithmic Organization Finished ---")
+    print(f"--- Processing {doc_stem} ---")
+    run_algorithmic_organization(input_file, output_file)
