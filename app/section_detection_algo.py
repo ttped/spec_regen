@@ -47,82 +47,139 @@ def load_single_document(filepath: str) -> List[Tuple[int, Dict]]:
     sorted_pages.sort(key=lambda x: x[0])
     return sorted_pages
 
-def reconstruct_rich_paragraphs(page_dict: Dict[str, List], page_num: int) -> List[Dict[str, Any]]:
+def reconstruct_lines(page_dict: Dict[str, List], page_num: int) -> List[Dict[str, Any]]:
     """
-    Converts parallel arrays into 'Rich Paragraph' objects with spatial metadata.
+    Groups words into LINES instead of PARAGRAPHS.
+    This prevents headers from being 'lumped' into previous text blocks.
+    Calculates the Bounding Box (bbox) for each line.
     """
     if not page_dict or 'text' not in page_dict:
         return []
 
-    rich_paragraphs = []
+    rich_lines = []
+    
+    # Buffers for the current line
     current_words = []
     current_heights = []
     current_lefts = []
+    current_tops = []
+    current_rights = []  # To calc max width
+    current_bottoms = [] # To calc max height
     
     texts = page_dict.get('text', [])
+    # We use line_num to differentiate, fallback to par_num/block_num if needed
     block_nums = page_dict.get('block_num', [])
     par_nums = page_dict.get('par_num', [])
+    line_nums = page_dict.get('line_num', [])
+    
+    # Geometry
     heights = page_dict.get('height', [])
     lefts = page_dict.get('left', [])
+    tops = page_dict.get('top', [])
+    widths = page_dict.get('width', [])
     
     count = len(texts)
     if count == 0: return []
 
+    # Initialize with first item
     last_block = block_nums[0] if block_nums else 0
     last_par = par_nums[0] if par_nums else 0
+    last_line = line_nums[0] if line_nums else 0
 
     for i in range(count):
         word_text = str(texts[i]).strip()
         
+        # Skip empty strings, but DON'T skip logic checks 
+        # (sometimes empty strings mark structure, but usually safe to skip in Tesseract)
         if not word_text:
             continue
             
         block_num = block_nums[i]
         par_num = par_nums[i]
+        line_num = line_nums[i]
         
-        if block_num != last_block or par_num != last_par:
+        # BREAK CONDITION: New Block OR New Paragraph OR New Line
+        is_new_line = (block_num != last_block) or (par_num != last_par) or (line_num != last_line)
+        
+        if is_new_line:
             if current_words:
-                rich_paragraphs.append({
+                # Calculate BBOX: [min_left, min_top, max_right, max_bottom]
+                # width = right - left
+                min_left = min(current_lefts)
+                min_top = min(current_tops)
+                max_right = max(current_rights)
+                max_bottom = max(current_bottoms)
+                
+                rich_lines.append({
                     "text": " ".join(current_words),
                     "avg_height": statistics.mean(current_heights) if current_heights else 0,
-                    "indentation": min(current_lefts) if current_lefts else 0,
+                    "indentation": min_left,
                     "page": page_num,
-                    "block_id": f"{last_block}_{last_par}"
+                    "bbox": [min_left, min_top, max_right - min_left, max_bottom - min_top], # [x, y, w, h]
+                    "line_id": f"{last_block}_{last_par}_{last_line}"
                 })
             
+            # Reset buffers
             current_words = []
             current_heights = []
             current_lefts = []
-            last_block, last_par = block_num, par_num
+            current_tops = []
+            current_rights = []
+            current_bottoms = []
+            
+            last_block, last_par, last_line = block_num, par_num, line_num
 
+        # Add word data
         current_words.append(word_text)
+        
+        # Safety checks for indices
         if i < len(heights): current_heights.append(heights[i])
-        if i < len(lefts): current_lefts.append(lefts[i])
+        
+        if i < len(lefts) and i < len(tops) and i < len(widths) and i < len(heights):
+            l = lefts[i]
+            t = tops[i]
+            w = widths[i]
+            h = heights[i]
+            
+            current_lefts.append(l)
+            current_tops.append(t)
+            current_rights.append(l + w)
+            current_bottoms.append(t + h)
 
+    # Flush final line
     if current_words:
-        rich_paragraphs.append({
+        min_left = min(current_lefts)
+        min_top = min(current_tops)
+        max_right = max(current_rights)
+        max_bottom = max(current_bottoms)
+        
+        rich_lines.append({
             "text": " ".join(current_words),
             "avg_height": statistics.mean(current_heights) if current_heights else 0,
-            "indentation": min(current_lefts) if current_lefts else 0,
+            "indentation": min_left,
             "page": page_num,
-            "block_id": f"{last_block}_{last_par}"
+            "bbox": [min_left, min_top, max_right - min_left, max_bottom - min_top],
+            "line_id": f"{last_block}_{last_par}_{last_line}"
         })
         
-    return rich_paragraphs
+    return rich_lines
 
-def get_document_stats(all_paragraphs: List[Dict[str, Any]]) -> Dict[str, float]:
+def get_document_stats(all_lines: List[Dict[str, Any]]) -> Dict[str, float]:
     """
-    Calculates the 'Body Text' profile and the 'Left Margin'.
+    Calculates stats. We use LINES now, but the logic holds:
+    Body text is the most common height.
+    Left Margin is the most common minimum indentation.
     """
-    if not all_paragraphs:
+    if not all_lines:
         return {"body_size": 10, "margin_left": 0}
 
-    heights = [round(p['avg_height']) for p in all_paragraphs if p['avg_height'] > 0]
+    heights = [round(p['avg_height']) for p in all_lines if p['avg_height'] > 0]
     
-    # We look for the global minimum indentation to find the "Left Margin"
-    valid_indents = [p['indentation'] for p in all_paragraphs if p['indentation'] >= 0]
+    # Filter valid indents (avoid negatives)
+    valid_indents = [p['indentation'] for p in all_lines if p['indentation'] >= 0]
     
     try:
+        # We use min() here to find the "hard" left edge of the document
         margin_left = min(valid_indents) if valid_indents else 0
     except ValueError:
         margin_left = 0
@@ -135,17 +192,18 @@ def get_document_stats(all_paragraphs: List[Dict[str, Any]]) -> Dict[str, float]
     print(f"Document Stats - Body Font: ~{body_size}px, Left Margin: ~{margin_left}px")
     return {"body_size": body_size, "margin_left": margin_left}
 
-def check_if_header(para: Dict[str, Any], stats: Dict[str, float]) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
+def check_if_header_line(line: Dict[str, Any], stats: Dict[str, float]) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
     """
-    Determines if a paragraph is a header using Regex + Spatial Logic.
+    Checks if a LINE is a header.
     Returns: (is_header, section_number, title_text, run_in_content)
     """
-    text = para['text']
-    avg_height = para['avg_height']
-    indent = para['indentation']
+    text = line['text']
+    avg_height = line['avg_height']
+    indent = line['indentation']
     
-    # 1. Regex: Capture "1.0", "1.1", "A." at start of string
-    match = re.match(r'^\s*([A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*\.?)\s*(.*)', text)
+    # 1. Regex: Matches "1.0", "1.1", "A." at start of line
+    # Expanded to better catch "1.0" or "2.1.3" followed by spaces
+    match = re.match(r'^\s*([A-Z0-9]+(?:\.[A-Z0-9]+)*\.?)\s*(.*)', text)
     
     if not match:
         return False, None, None, None
@@ -153,57 +211,67 @@ def check_if_header(para: Dict[str, Any], stats: Dict[str, float]) -> Tuple[bool
     potential_num = match.group(1).strip()
     rest_of_line = match.group(2).strip()
 
-    # 2. Heuristics to reject obvious non-headers
+    # 2. Basic Heuristics
     if not any(c.isdigit() for c in potential_num): return False, None, None, None
     if len(potential_num) > 12: return False, None, None, None
     
-    # 3. SPATIAL FILTER: List Item vs Section
+    # 3. SPATIAL FILTER
+    # If the number is simple (1. or 1.1) AND indented -> likely a list item.
     is_complex_number = potential_num.count('.') >= 2
-    indent_tolerance = 25 # pixels
+    indent_tolerance = 25 
     
     if not is_complex_number:
         if indent > (stats['margin_left'] + indent_tolerance):
-            # It's a single digit (1.) or simple (1.1) but indented -> Likely a List Item
+            # Indented simple number -> List Item
             return False, None, None, None
 
-    # 4. Title Extraction (User Rule: First 1-2 words are title)
+    # 4. Title Extraction
     if not rest_of_line:
-        # Just "1.0" or "2.0"
+        # Case: "1.0" is on the line by itself.
         return True, potential_num.rstrip('.'), "", ""
 
+    # Heuristic: If we matched, we treat the rest as the title.
+    # Since we are processing by LINE now, it's safer to assume 
+    # the rest of the line is the Title, and the Body starts on the next line.
+    # However, for "1.2 Scope. The scope is..." we still split.
+    
     words = rest_of_line.split()
-    if len(words) <= 2:
-        title_text = rest_of_line
-        run_in_content = ""
-    else:
-        # Heuristic: First 2 words are title, rest is content
+    # If it looks like a sentence (long), split. If short, it's just the title.
+    if len(words) > 10: 
+        # Long line -> Run-in header
         title_text = " ".join(words[:2])
         run_in_content = " ".join(words[2:])
+    else:
+        # Short line -> Just Title
+        title_text = rest_of_line
+        run_in_content = ""
 
     return True, potential_num.rstrip('.'), title_text, run_in_content
 
-def group_elements(classified_items: List[Dict]) -> List[Dict]:
+def group_lines_into_sections(classified_lines: List[Dict]) -> List[Dict]:
     """
-    Merges unassigned text. 
+    Merges lines.
+    - If Line is Section -> Start new Section object.
+    - If Line is Text -> Append to current Section content.
     """
-    if not classified_items:
+    if not classified_lines:
         return []
 
     merged_elements = []
     current_section = None
 
-    for item in classified_items:
+    for item in classified_lines:
         if item['type'] == 'section':
             if current_section:
                 merged_elements.append(current_section)
             
-            # Start new section
+            # Create new section
             current_section = item
-            # If the header detection extracted run-in content, start with that.
+            
+            # Handle run-in content (content that was on the same line as the header)
             initial_content = item.pop('run_in_content', '')
             current_section['content'] = initial_content
             
-            # Ensure page metadata is top-level
             if 'page' not in current_section:
                 current_section['page'] = item.get('page')
 
@@ -211,10 +279,14 @@ def group_elements(classified_items: List[Dict]) -> List[Dict]:
             text = item.get('content', '')
             if current_section:
                 if current_section['content']:
-                    current_section['content'] += "\n\n" + text
+                    # We are merging lines, so we add a space if it seems continuous, 
+                    # or newline if it was a distinct line. 
+                    # For simplicity in this text-block phase, we use newline to preserve structure.
+                    current_section['content'] += "\n" + text
                 else:
                     current_section['content'] = text
             else:
+                # Text before the first section (Preamble)
                 merged_elements.append(item)
 
     if current_section:
@@ -227,19 +299,19 @@ def run_algorithmic_organization(input_file_path: str, output_path: str):
     sorted_pages = load_single_document(input_file_path)
     if not sorted_pages: return
 
-    # 2. Reconstruct Rich Paragraphs
-    all_rich_paragraphs = []
+    # 2. Reconstruct LINES (Not Paragraphs)
+    all_rich_lines = []
     for page_num, page_dict in sorted_pages:
-        paras = reconstruct_rich_paragraphs(page_dict, page_num)
-        all_rich_paragraphs.extend(paras)
+        lines = reconstruct_lines(page_dict, page_num)
+        all_rich_lines.extend(lines)
 
-    # 3. Get Spatial Baseline
-    doc_stats = get_document_stats(all_rich_paragraphs)
+    # 3. Stats
+    doc_stats = get_document_stats(all_rich_lines)
 
-    # 4. Classify
+    # 4. Classify Lines
     classified_items = []
-    for para in all_rich_paragraphs:
-        is_header_bool, sec_num, topic, run_in_content = check_if_header(para, doc_stats)
+    for line in all_rich_lines:
+        is_header_bool, sec_num, topic, run_in_content = check_if_header_line(line, doc_stats)
 
         if is_header_bool:
             classified_items.append({
@@ -247,29 +319,27 @@ def run_algorithmic_organization(input_file_path: str, output_path: str):
                 "section_number": sec_num,
                 "topic": topic,
                 "run_in_content": run_in_content, 
-                "page": para['page']
+                "page": line['page'],
+                "header_bbox": line['bbox'] # <--- BBOX CAPTURED HERE
             })
         else:
             classified_items.append({
                 "type": "unassigned_text_block",
-                "content": para['text'],
-                "page": para['page']
+                "content": line['text'],
+                "page": line['page'],
+                # "bbox": line['bbox'] # Optional: keep bbox for text blocks if needed later
             })
 
     # 5. Group
-    final_elements = group_elements(classified_items)
+    final_elements = group_lines_into_sections(classified_items)
     save_results_to_json(final_elements, output_path)
 
 if __name__ == '__main__':
     project_root = os.getcwd() 
-    
-    # Updated Configuration
     doc_stem = "S-133-05737AF-SSS"
-    
-    # Updated input directory to 'raw_data_advanced'
     input_file = os.path.join(project_root, "iris_ocr", "CM_Spec_OCR_and_figtab_output", "raw_data_advanced", f"{doc_stem}.json")
     output_file = os.path.join(project_root, "results", f"{doc_stem}_algo_organized.json")
 
-    print(f"--- Processing {doc_stem} ---")
+    print(f"--- Processing {doc_stem} (Line-Based) ---")
     run_algorithmic_organization(input_file, output_file)
-    print("--- Algorithmic Organization Finished ---")
+    print("--- Finished ---")
