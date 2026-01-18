@@ -149,58 +149,104 @@ def reconstruct_lines_with_bbox(page_dict: Dict[str, List]) -> List[Dict]:
     return lines
 
 
-def check_if_paragraph_is_header(line_text: str) -> Tuple[bool, Optional[str], Optional[str]]:
+def split_topic_at_period(text: str) -> Tuple[str, str]:
+    """
+    Splits text at the first period that appears to end a title.
+    
+    Returns (topic, remainder) where:
+    - topic: everything up to and including the first sentence-ending period
+    - remainder: everything after (to be prepended to content)
+    
+    Examples:
+    - "SCOPE. This document..." -> ("SCOPE.", "This document...")
+    - "SCOPE" -> ("SCOPE", "")
+    - "GENERAL REQUIREMENTS. 1.1 Purpose. Text" -> ("GENERAL REQUIREMENTS.", "1.1 Purpose. Text")
+    """
+    if not text:
+        return "", ""
+    
+    # Look for a period followed by a space (sentence end) or end of string
+    # But avoid splitting on periods in abbreviations like "U.S." or numbers like "1.0"
+    
+    # Find the first period that looks like a sentence end
+    # A sentence-ending period is typically followed by a space and uppercase letter, 
+    # or followed by a space and a number (like "1.1"), or is at end of string
+    
+    period_match = re.search(r'\.(?=\s+[A-Z0-9]|$)', text)
+    
+    if period_match:
+        split_pos = period_match.end()
+        topic = text[:split_pos].strip()
+        remainder = text[split_pos:].strip()
+        return topic, remainder
+    
+    # No sentence-ending period found, return whole text as topic
+    return text.strip(), ""
+
+
+def check_if_paragraph_is_header(line_text: str) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
     """
     Checks if a line of text is a section header using regex and heuristics.
+    
+    Returns:
+        (is_header, section_number, topic, remainder)
+        - is_header: True if this is a section header
+        - section_number: The section number (e.g., "1.0", "2.1.3")
+        - topic: The section title up to and including first period
+        - remainder: Text after the topic that should be prepended to content
     """
     match = re.match(r'^\s*([a-zA-Z0-9\.]+)\s+(.+)', line_text)
     match_no_title = re.match(r'^\s*([a-zA-Z0-9\.]+)\s*$', line_text)
     
     if match:
-        potential_num, topic = match.groups()
+        potential_num, full_topic = match.groups()
     elif match_no_title:
         potential_num = match_no_title.group(1)
-        topic = ""
+        full_topic = ""
     else:
-        return False, None, None
+        return False, None, None, None
 
     # Heuristic 1: Reject if the topic looks like a date.
     MONTHS = [
         'january', 'february', 'march', 'april', 'may', 'june', 
         'july', 'august', 'september', 'october', 'november', 'december'
     ]
-    if topic and any(topic.lower().startswith(m) for m in MONTHS):
-        return False, None, None
+    if full_topic and any(full_topic.lower().startswith(m) for m in MONTHS):
+        return False, None, None, None
 
     # Heuristic 2: Must contain at least one digit.
     if not any(c.isdigit() for c in potential_num):
-        return False, None, None
+        return False, None, None, None
 
     # Heuristic 3: Limit alpha characters to avoid matching regular text.
     if sum(c.isalpha() for c in potential_num) > 2:
-        return False, None, None
+        return False, None, None, None
         
     # Heuristic 4: Avoid excessively long "numbers".
     if len(potential_num) > 20:
-        return False, None, None
+        return False, None, None, None
 
     # Heuristic 5: Ensure it's not purely alphabetic.
     if potential_num.isalpha():
-        return False, None, None
+        return False, None, None, None
 
     # Heuristic 6: If it's all digits, limit length to 3. Rejects "1506073".
     if potential_num.isdigit() and len(potential_num) > 3:
-        return False, None, None
+        return False, None, None, None
 
     # Heuristic 7: If it contains both letters and digits, it must contain a dot.
     has_alpha = any(c.isalpha() for c in potential_num)
     has_digit = any(c.isdigit() for c in potential_num)
     has_dot = '.' in potential_num
     if has_alpha and has_digit and not has_dot:
-        return False, None, None
+        return False, None, None, None
 
     section_num = potential_num.strip().rstrip('.')
-    return True, section_num, topic.strip()
+    
+    # Split the topic at the first period
+    topic, remainder = split_topic_at_period(full_topic)
+    
+    return True, section_num, topic.strip(), remainder.strip()
 
 
 def merge_bboxes(bboxes: List[Dict]) -> Optional[Dict]:
@@ -436,7 +482,7 @@ def run_section_processing_on_file(
             
             line_bbox = line_data.get('bbox')
 
-            is_header, section_num, topic = check_if_paragraph_is_header(line_text)
+            is_header, section_num, topic, remainder = check_if_paragraph_is_header(line_text)
 
             if is_header:
                 raw_elements.append({
@@ -447,6 +493,16 @@ def run_section_processing_on_file(
                     "page_number": page_id,
                     "bbox": line_bbox
                 })
+                
+                # If there's remainder text after the title, add it as an unassigned block
+                # It will get merged into the section's content during grouping
+                if remainder:
+                    raw_elements.append({
+                        "type": "unassigned_text_block",
+                        "content": remainder,
+                        "page_number": page_id,
+                        "bbox": line_bbox  # Same bbox since it's from the same line
+                    })
             else:
                 raw_elements.append({
                     "type": "unassigned_text_block",
