@@ -1,16 +1,3 @@
-"""
-section_processor.py - Processes raw OCR into organized sections with bbox metadata.
-
-This module:
-1. Loads raw OCR data preserving original page numbers
-2. Reconstructs lines from word-level data
-3. Captures bounding box metadata (top, left, width, height) for positioning
-4. Detects section headers using regex heuristics
-5. Groups content under sections
-
-The bbox metadata enables proper positioning of elements relative to figures/tables.
-"""
-
 import os
 import json
 import re
@@ -20,21 +7,6 @@ from typing import List, Dict, Tuple, Optional, Any
 def get_line_bbox(page_dict: Dict, word_indices: List[int]) -> Optional[Dict]:
     """
     Calculate the bounding box for a line given the indices of its words.
-    
-    The bbox is computed as:
-    - left: minimum left value of all words
-    - top: minimum top value of all words  
-    - right: maximum (left + width) of all words
-    - bottom: maximum (top + height) of all words
-    - width: right - left
-    - height: bottom - top
-    
-    Args:
-        page_dict: The page dictionary containing 'left', 'top', 'width', 'height' arrays
-        word_indices: List of indices for words in this line
-    
-    Returns:
-        Dict with bbox info, or None if data is missing
     """
     if not word_indices:
         return None
@@ -77,11 +49,6 @@ def get_line_bbox(page_dict: Dict, word_indices: List[int]) -> Optional[Dict]:
 def reconstruct_lines_with_bbox(page_dict: Dict[str, List]) -> List[Dict]:
     """
     Reconstructs lines from word-level OCR data, including bounding box info.
-    
-    Returns a list of dicts, each containing:
-    - text: the line text
-    - bbox: bounding box dict (left, top, width, height, right, bottom)
-    - word_indices: indices of words in this line (for debugging)
     """
     if not page_dict.get('text'):
         return []
@@ -152,25 +119,9 @@ def reconstruct_lines_with_bbox(page_dict: Dict[str, List]) -> List[Dict]:
 def split_topic_at_period(text: str) -> Tuple[str, str]:
     """
     Splits text at the first period that appears to end a title.
-    
-    Returns (topic, remainder) where:
-    - topic: everything up to and including the first sentence-ending period
-    - remainder: everything after (to be prepended to content)
-    
-    Examples:
-    - "SCOPE. This document..." -> ("SCOPE.", "This document...")
-    - "SCOPE" -> ("SCOPE", "")
-    - "GENERAL REQUIREMENTS. 1.1 Purpose. Text" -> ("GENERAL REQUIREMENTS.", "1.1 Purpose. Text")
     """
     if not text:
         return "", ""
-    
-    # Look for a period followed by a space (sentence end) or end of string
-    # But avoid splitting on periods in abbreviations like "U.S." or numbers like "1.0"
-    
-    # Find the first period that looks like a sentence end
-    # A sentence-ending period is typically followed by a space and uppercase letter, 
-    # or followed by a space and a number (like "1.1"), or is at end of string
     
     period_match = re.search(r'\.(?=\s+[A-Z0-9]|$)', text)
     
@@ -180,20 +131,12 @@ def split_topic_at_period(text: str) -> Tuple[str, str]:
         remainder = text[split_pos:].strip()
         return topic, remainder
     
-    # No sentence-ending period found, return whole text as topic
     return text.strip(), ""
 
 
 def check_if_paragraph_is_header(line_text: str) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
     """
     Checks if a line of text is a section header using regex and heuristics.
-    
-    Returns:
-        (is_header, section_number, topic, remainder)
-        - is_header: True if this is a section header
-        - section_number: The section number (e.g., "1.0", "2.1.3")
-        - topic: The section title up to and including first period
-        - remainder: Text after the topic that should be prepended to content
     """
     match = re.match(r'^\s*([a-zA-Z0-9\.]+)\s+(.+)', line_text)
     match_no_title = re.match(r'^\s*([a-zA-Z0-9\.]+)\s*$', line_text)
@@ -206,7 +149,7 @@ def check_if_paragraph_is_header(line_text: str) -> Tuple[bool, Optional[str], O
     else:
         return False, None, None, None
 
-    # Heuristic 1: Reject if the topic looks like a date.
+    # Heuristics
     MONTHS = [
         'january', 'february', 'march', 'april', 'may', 'june', 
         'july', 'august', 'september', 'october', 'november', 'december'
@@ -214,27 +157,21 @@ def check_if_paragraph_is_header(line_text: str) -> Tuple[bool, Optional[str], O
     if full_topic and any(full_topic.lower().startswith(m) for m in MONTHS):
         return False, None, None, None
 
-    # Heuristic 2: Must contain at least one digit.
     if not any(c.isdigit() for c in potential_num):
         return False, None, None, None
 
-    # Heuristic 3: Limit alpha characters to avoid matching regular text.
     if sum(c.isalpha() for c in potential_num) > 2:
         return False, None, None, None
         
-    # Heuristic 4: Avoid excessively long "numbers".
     if len(potential_num) > 20:
         return False, None, None, None
 
-    # Heuristic 5: Ensure it's not purely alphabetic.
     if potential_num.isalpha():
         return False, None, None, None
 
-    # Heuristic 6: If it's all digits, limit length to 3. Rejects "1506073".
     if potential_num.isdigit() and len(potential_num) > 3:
         return False, None, None, None
 
-    # Heuristic 7: If it contains both letters and digits, it must contain a dot.
     has_alpha = any(c.isalpha() for c in potential_num)
     has_digit = any(c.isdigit() for c in potential_num)
     has_dot = '.' in potential_num
@@ -242,8 +179,6 @@ def check_if_paragraph_is_header(line_text: str) -> Tuple[bool, Optional[str], O
         return False, None, None, None
 
     section_num = potential_num.strip().rstrip('.')
-    
-    # Split the topic at the first period
     topic, remainder = split_topic_at_period(full_topic)
     
     return True, section_num, topic.strip(), remainder.strip()
@@ -275,7 +210,6 @@ def merge_bboxes(bboxes: List[Dict]) -> Optional[Dict]:
 def group_elements_with_bbox(elements: List[Dict]) -> List[Dict]:
     """
     Merges consecutive content blocks and attaches them to preceding section headers.
-    Also merges bounding boxes to create an overall bbox for each section.
     """
     if not elements:
         return []
@@ -287,7 +221,7 @@ def group_elements_with_bbox(elements: List[Dict]) -> List[Dict]:
 
         if current_element['type'] == 'section':
             content_pieces = []
-            content_bboxes = [current_element.get('bbox')]  # Start with section header bbox
+            content_bboxes = [current_element.get('bbox')]
             
             j = i + 1
             while j < len(elements) and elements[j]['type'] == 'unassigned_text_block':
@@ -298,7 +232,6 @@ def group_elements_with_bbox(elements: List[Dict]) -> List[Dict]:
             
             current_element['content'] = "\n\n".join(content_pieces)
             
-            # Merge all bboxes for this section
             merged_bbox = merge_bboxes(content_bboxes)
             if merged_bbox:
                 current_element['bbox'] = merged_bbox
@@ -356,12 +289,9 @@ def get_page_dict_from_object(page_obj: Any) -> Optional[Dict]:
 def extract_page_metadata(page_dict: Dict) -> Dict:
     """
     Extract useful metadata from a page_dict for debugging.
-    
-    Returns info about the page dimensions and OCR settings if available.
     """
     metadata = {}
     
-    # Try to infer page dimensions from the max values
     if page_dict.get('left') and page_dict.get('width'):
         try:
             rights = [l + w for l, w in zip(page_dict['left'], page_dict['width'])]
@@ -376,7 +306,6 @@ def extract_page_metadata(page_dict: Dict) -> Dict:
         except:
             pass
     
-    # Check for any DPI or resolution info that might be in the data
     for key in ['dpi', 'resolution', 'scale', 'ppi']:
         if key in page_dict:
             metadata[key] = page_dict[key]
@@ -427,7 +356,8 @@ def load_raw_ocr_pages(input_path: str) -> List[Tuple[int, Dict, Dict]]:
 def run_section_processing_on_file(
     input_path: str, 
     output_path: str, 
-    content_start_page: int = 1
+    content_start_page: int = 1,
+    header_top_threshold: int = 0
 ):
     """
     Main execution function - processes raw OCR file into organized sections with bbox metadata.
@@ -436,9 +366,12 @@ def run_section_processing_on_file(
         input_path: Path to the raw OCR JSON file.
         output_path: Path to save the organized sections JSON.
         content_start_page: The page number where actual content begins (skips ToC).
+        header_top_threshold: Filter out lines where bbox['top'] < this value (0 to disable).
     """
     print(f"  - Loading raw OCR from: {input_path}")
     print(f"  - Content starts at page: {content_start_page}")
+    if header_top_threshold > 0:
+        print(f"  - Filtering headers: Dropping text with Top position < {header_top_threshold}")
     
     pages_to_process = load_raw_ocr_pages(input_path)
     
@@ -449,7 +382,6 @@ def run_section_processing_on_file(
             json.dump([], f)
         return
 
-    # Filter to only pages >= content_start_page
     content_pages = [(pid, pdict, pmeta) for pid, pdict, pmeta in pages_to_process if pid >= content_start_page]
     
     skipped_count = len(pages_to_process) - len(content_pages)
@@ -462,17 +394,14 @@ def run_section_processing_on_file(
             json.dump([], f)
         return
 
-    # Collect page metadata for the output (useful for debugging)
     all_page_metadata = {}
-    
     raw_elements = []
+    dropped_header_lines = 0
     
     for page_id, page_dict, page_meta in content_pages:
-        # Store page metadata
         if page_meta:
             all_page_metadata[page_id] = page_meta
         
-        # Reconstruct lines with bbox info
         lines = reconstruct_lines_with_bbox(page_dict)
         
         for line_data in lines:
@@ -481,6 +410,14 @@ def run_section_processing_on_file(
                 continue
             
             line_bbox = line_data.get('bbox')
+            
+            # --- HEADER FILTER ---
+            # If the user supplied a threshold, filter lines near the top
+            if header_top_threshold > 0 and line_bbox:
+                if line_bbox.get('top', 9999) < header_top_threshold:
+                    dropped_header_lines += 1
+                    continue
+            # ---------------------
 
             is_header, section_num, topic, remainder = check_if_paragraph_is_header(line_text)
 
@@ -494,14 +431,12 @@ def run_section_processing_on_file(
                     "bbox": line_bbox
                 })
                 
-                # If there's remainder text after the title, add it as an unassigned block
-                # It will get merged into the section's content during grouping
                 if remainder:
                     raw_elements.append({
                         "type": "unassigned_text_block",
                         "content": remainder,
                         "page_number": page_id,
-                        "bbox": line_bbox  # Same bbox since it's from the same line
+                        "bbox": line_bbox
                     })
             else:
                 raw_elements.append({
@@ -511,10 +446,8 @@ def run_section_processing_on_file(
                     "bbox": line_bbox
                 })
     
-    # Group elements and merge bboxes
     final_elements = group_elements_with_bbox(raw_elements)
 
-    # Add page metadata to output for debugging
     output_data = {
         "page_metadata": all_page_metadata,
         "elements": final_elements
@@ -529,7 +462,8 @@ def run_section_processing_on_file(
     
     section_count = sum(1 for e in final_elements if e['type'] == 'section')
     print(f"  - Extracted {len(final_elements)} elements ({section_count} sections).")
-    print(f"  - Page metadata captured for {len(all_page_metadata)} pages.")
+    if header_top_threshold > 0:
+        print(f"  - Filtered out {dropped_header_lines} header lines (Top < {header_top_threshold}).")
     print(f"  - Results saved to {output_path}")
 
 
@@ -540,6 +474,7 @@ if __name__ == '__main__':
         input_file = sys.argv[1]
         output_file = sys.argv[2] if len(sys.argv) > 2 else "output_organized.json"
         start_page = int(sys.argv[3]) if len(sys.argv) > 3 else 1
-        run_section_processing_on_file(input_file, output_file, content_start_page=start_page)
+        threshold = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+        run_section_processing_on_file(input_file, output_file, content_start_page=start_page, header_top_threshold=threshold)
     else:
-        print("Usage: python section_processor.py <input.json> [output.json] [content_start_page]")
+        print("Usage: python section_processor.py <input.json> [output.json] [content_start_page] [header_threshold]")

@@ -12,7 +12,7 @@ Pipeline Steps:
 Usage:
     python simple_pipeline.py --step all
     python simple_pipeline.py --step classify
-    python simple_pipeline.py --step structure
+    python simple_pipeline.py --step structure --header-threshold 600
 """
 
 import os
@@ -139,6 +139,12 @@ def main():
         choices=["bbox", "page_end"],
         help="How to position figures/tables: 'bbox' for precise positioning, 'page_end' for simpler approach"
     )
+    parser.add_argument(
+        "--header-threshold",
+        type=int,
+        default=600,
+        help="Vertical (top) coordinate threshold for header filtering. Text above this value (less than) is dropped. Set to 0 to disable."
+    )
     
     args = parser.parse_args()
     os.makedirs(args.results_dir, exist_ok=True)
@@ -190,7 +196,8 @@ def main():
             run_section_processing_on_file(
                 raw_input, 
                 organized_out, 
-                content_start_page=content_start_page
+                content_start_page=content_start_page,
+                header_top_threshold=args.header_threshold
             )
 
         # ========== STEP 4: ASSETS ==========
