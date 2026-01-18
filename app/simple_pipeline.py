@@ -4,13 +4,9 @@ import json
 import logging
 from typing import List
 
-# --- IMPORTS ---
-# 1. Agents we are keeping
 from title_agent import extract_title_page_info
 from table_processor_agent import run_table_processing_on_file
 from docx_writer import run_docx_creation
-
-# 2. The new Section Processor (Make sure section_processor.py is in this folder!)
 from section_processor import run_section_processing_on_file
 
 def get_document_stems(input_dir: str) -> List[str]:
