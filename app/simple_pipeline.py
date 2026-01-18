@@ -28,14 +28,16 @@ def extract_title_from_first_page(raw_input_path: str, output_path: str, llm_con
     with open(raw_input_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
     
-    # Helper to get text from page 1 regardless of format
+    # Robust Page 1 extraction
     page_text = ""
+    # 1. Try List
     if isinstance(data, list) and len(data) > 0:
         data.sort(key=lambda x: int(x.get('page_num', 0) or x.get('page_Id', 0) or 0))
         page_dict = data[0].get('page_dict', data[0])
         page_text = " ".join([str(t) for t in page_dict.get('text', [])])
+    # 2. Try Dict
     elif isinstance(data, dict):
-        # Try to find key '1' or the first key available
+        # Look for "1" or first key
         key = "1" if "1" in data else next(iter(data))
         page_obj = data[key]
         page_dict = page_obj.get('page_dict', page_obj)
@@ -45,7 +47,7 @@ def extract_title_from_first_page(raw_input_path: str, output_path: str, llm_con
         with open(output_path, 'w') as f: json.dump([], f)
         return
 
-    print("  - Extracting title info...")
+    print("  - Extracting title info from Page 1...")
     info = extract_title_page_info(
         page_text, llm_config['model_name'], llm_config['base_url'], 
         llm_config['api_key'], llm_config['provider']
@@ -57,7 +59,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--step", type=str, default="all", choices=["title", "structure", "tables", "write", "all"])
     
-    # --- UPDATED PATH HERE ---
+    # CORRECTED DEFAULT PATH
     default_raw_dir = os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "raw_data_advanced")
     parser.add_argument("--raw_ocr_dir", type=str, default=default_raw_dir)
     
@@ -95,12 +97,12 @@ if __name__ == '__main__':
 
         if args.step in ["tables", "all"]:
             print("  [Step: Tables]")
-            # Prefer using the organized output as input for table processing
+            # Prefer using the organized output
             inp = organized_out if os.path.exists(organized_out) else None
             if inp: 
                 run_table_processing_on_file(inp, tables_out, args.figures_dir, stem, llm_config)
             else:
-                print(f"    [Skipping] Missing input file: {organized_out}")
+                print(f"    [Skipping] Missing organized file: {organized_out}")
 
         if args.step in ["write", "all"]:
             print("  [Step: Write]")
