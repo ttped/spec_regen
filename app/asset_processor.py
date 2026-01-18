@@ -3,12 +3,15 @@ asset_processor.py - Handles loading and positioning of figures and tables.
 
 This module:
 1. Loads figure/table metadata from exported JSON files
-2. Normalizes bbox coordinates accounting for DPI differences
+2. Uses bbox coordinates (top, left, width, height) for positioning
 3. Integrates assets into the document element stream at correct positions
-4. Sorts elements by page and vertical position (y-coordinate)
+4. Sorts elements by page and vertical position (top/y-coordinate)
 
-The bbox is typically [x, y, width, height] or [x1, y1, x2, y2] in PDF units.
-We use the y-coordinate (top of the bbox) to determine vertical ordering within a page.
+Both OCR elements and assets have bbox data:
+- OCR elements: bbox with left, top, width, height (from OCR coordinate space)
+- Assets: bbox.pdf_units with [x, y, width, height] or similar
+
+The key for vertical ordering is the 'top' value - lower top = higher on page.
 """
 
 import os
@@ -16,67 +19,9 @@ import json
 from typing import List, Dict, Tuple, Optional, Any
 
 
-# Common DPI values - adjust these based on your actual extraction settings
-DEFAULT_OCR_DPI = 300      # DPI used for OCR text extraction
-DEFAULT_EXPORT_DPI = 150   # DPI used for figure/table image export
-
-
-def normalize_coordinate(value: float, from_dpi: float, to_dpi: float) -> float:
-    """
-    Normalize a coordinate from one DPI to another.
-    
-    Args:
-        value: The coordinate value to normalize
-        from_dpi: The DPI the value was captured at
-        to_dpi: The target DPI to normalize to
-    
-    Returns:
-        The normalized coordinate value
-    """
-    if from_dpi == to_dpi or from_dpi == 0:
-        return value
-    return value * (to_dpi / from_dpi)
-
-
-def get_bbox_y_position(bbox: List[float], pdf_units: bool = True) -> float:
-    """
-    Extract the Y position (top edge) from a bbox for vertical ordering.
-    
-    Bbox formats supported:
-    - [x, y, width, height] - y is the top position
-    - [x1, y1, x2, y2] - y1 is the top position
-    
-    Args:
-        bbox: The bounding box list
-        pdf_units: Whether the bbox is in PDF coordinate space (origin at bottom-left)
-    
-    Returns:
-        The Y coordinate representing vertical position (lower = higher on page)
-    """
-    if not bbox or len(bbox) < 2:
-        return 9999  # Default to end of page if no bbox
-    
-    # bbox[1] is typically the Y coordinate (top of the box)
-    return bbox[1]
-
-
 def load_asset_metadata(json_path: str) -> Optional[Dict]:
     """
     Load and parse a single asset metadata JSON file.
-    
-    Expected structure:
-    {
-        "asset_id": "Figure 1",
-        "asset_type": "fig" or "tab",
-        "page": 12,
-        "bbox": {
-            "pdf_units": [x, y, width, height]
-        },
-        "export": {
-            "image_file": "figure_1.png",
-            "dpi": 150
-        }
-    }
     """
     try:
         with open(json_path, 'r', encoding='utf-8') as f:
@@ -84,6 +29,70 @@ def load_asset_metadata(json_path: str) -> Optional[Dict]:
     except (json.JSONDecodeError, IOError) as e:
         print(f"    [Warning] Could not load asset metadata: {json_path} - {e}")
         return None
+
+
+def extract_asset_bbox(meta: Dict) -> Optional[Dict]:
+    """
+    Extract and normalize bbox from asset metadata.
+    
+    Assets may have bbox in different formats:
+    - bbox.pdf_units: [x, y, width, height] or [x1, y1, x2, y2]
+    - bbox.pixels: [x, y, width, height]
+    - bbox: [x, y, width, height] directly
+    
+    Returns a normalized dict with left, top, width, height, right, bottom.
+    """
+    bbox_data = meta.get('bbox', {})
+    
+    # Try different bbox formats
+    raw_bbox = None
+    bbox_source = None
+    
+    if isinstance(bbox_data, dict):
+        if 'pdf_units' in bbox_data:
+            raw_bbox = bbox_data['pdf_units']
+            bbox_source = 'pdf_units'
+        elif 'pixels' in bbox_data:
+            raw_bbox = bbox_data['pixels']
+            bbox_source = 'pixels'
+    elif isinstance(bbox_data, list):
+        raw_bbox = bbox_data
+        bbox_source = 'direct'
+    
+    if not raw_bbox or len(raw_bbox) < 4:
+        return None
+    
+    # Interpret as [x, y, width, height] format
+    # (Some systems use [x1, y1, x2, y2] - we may need to detect this)
+    x, y, w, h = raw_bbox[0], raw_bbox[1], raw_bbox[2], raw_bbox[3]
+    
+    # Heuristic: if w and h are larger than x and y, it's probably [x1, y1, x2, y2]
+    # In that case, x2 > x1 and y2 > y1, so w would be x2 and h would be y2
+    if w > x * 2 and h > y * 2 and w > 100 and h > 100:
+        # Likely [x1, y1, x2, y2] format
+        x1, y1, x2, y2 = x, y, w, h
+        return {
+            "left": x1,
+            "top": y1,
+            "width": x2 - x1,
+            "height": y2 - y1,
+            "right": x2,
+            "bottom": y2,
+            "_source": bbox_source,
+            "_format": "x1y1x2y2"
+        }
+    else:
+        # Standard [x, y, width, height] format
+        return {
+            "left": x,
+            "top": y,
+            "width": w,
+            "height": h,
+            "right": x + w,
+            "bottom": y + h,
+            "_source": bbox_source,
+            "_format": "xywh"
+        }
 
 
 def load_all_assets(exports_dir: str, doc_stem: str) -> List[Dict]:
@@ -95,7 +104,7 @@ def load_all_assets(exports_dir: str, doc_stem: str) -> List[Dict]:
         doc_stem: Document stem name (subdirectory name)
     
     Returns:
-        List of asset dictionaries with normalized structure
+        List of asset dictionaries with normalized bbox
     """
     assets = []
     asset_dir = os.path.join(exports_dir, doc_stem)
@@ -121,169 +130,99 @@ def load_all_assets(exports_dir: str, doc_stem: str) -> List[Dict]:
         elif asset_type == "tab":
             meta['type'] = 'table'
         else:
-            # Default to figure if unclear
-            meta['type'] = 'figure'
+            meta['type'] = 'figure'  # Default
         
-        # Extract positioning info
+        # Extract and normalize bbox
+        bbox = extract_asset_bbox(meta)
+        if bbox:
+            meta['bbox'] = bbox
+        
+        # Get page number
         page = meta.get('page', 9999)
-        bbox_data = meta.get('bbox', {})
+        meta['page_number'] = page  # Normalize key name
         
-        # Handle different bbox formats
-        if isinstance(bbox_data, dict):
-            bbox = bbox_data.get('pdf_units', bbox_data.get('pixels', []))
-        elif isinstance(bbox_data, list):
-            bbox = bbox_data
-        else:
-            bbox = []
-        
-        # Get export DPI for potential normalization
+        # Store export DPI for reference
         export_info = meta.get('export', {})
-        export_dpi = export_info.get('dpi', DEFAULT_EXPORT_DPI)
-        
-        # Calculate sort position (y-coordinate within page)
-        y_position = get_bbox_y_position(bbox)
-        
-        # Store normalized positioning data
-        meta['page'] = page
-        meta['_bbox'] = bbox
-        meta['_y_position'] = y_position
-        meta['_export_dpi'] = export_dpi
+        meta['_export_dpi'] = export_info.get('dpi')
         
         assets.append(meta)
     
-    print(f"    Loaded {len(assets)} assets ({sum(1 for a in assets if a['type'] == 'figure')} figures, {sum(1 for a in assets if a['type'] == 'table')} tables)")
+    fig_count = sum(1 for a in assets if a['type'] == 'figure')
+    tab_count = sum(1 for a in assets if a['type'] == 'table')
+    print(f"    Loaded {len(assets)} assets ({fig_count} figures, {tab_count} tables)")
+    
     return assets
 
 
-def calculate_element_position(element: Dict, ocr_page_height: float = 1000) -> Tuple[int, float]:
+def get_element_sort_key(element: Dict) -> Tuple[int, float]:
     """
-    Calculate the sort position for any element (section, text block, or asset).
+    Get sort key for an element based on page and vertical position.
     
-    Returns:
-        Tuple of (page_number, y_position) for sorting
+    Returns (page_number, top_position) tuple.
+    Lower top = higher on page = should come first.
     """
-    page = element.get('page', element.get('page_number', 9999))
+    # Get page number (handle both key names)
+    page = element.get('page_number', element.get('page', 9999))
+    if isinstance(page, str):
+        try:
+            page = int(page)
+        except:
+            page = 9999
     
-    # For assets with bbox
-    if '_y_position' in element:
-        return (page, element['_y_position'])
+    # Get top position from bbox
+    bbox = element.get('bbox')
+    if bbox and isinstance(bbox, dict):
+        top = bbox.get('top', 9999)
+    else:
+        top = 9999
     
-    # For sections/text blocks, we don't have precise y-position
-    # Use a default that places them in document order
-    # chunk_index can help preserve original order
-    chunk_idx = element.get('chunk_index', 0)
-    sub_chunk = element.get('sub_chunk_index', 0)
-    
-    # Create a synthetic y-position based on chunk ordering
-    # This keeps text elements in their original order
-    y_pos = chunk_idx * 100 + sub_chunk
-    
-    return (page, y_pos)
+    return (page, top)
 
 
-def integrate_assets_with_sections(
-    sections: List[Dict], 
+def integrate_assets_with_elements(
+    elements: List[Dict], 
     assets: List[Dict],
-    ocr_dpi: float = DEFAULT_OCR_DPI
+    page_metadata: Optional[Dict] = None
 ) -> List[Dict]:
     """
-    Merge assets into the section stream, positioning them correctly by page and bbox.
-    
-    This function interleaves figures/tables with sections based on their
-    vertical position on each page.
+    Merge assets into the element stream, positioning them by page and bbox.top.
     
     Args:
-        sections: List of section/text block elements from section_processor
-        assets: List of figure/table assets from load_all_assets
-        ocr_dpi: The DPI used for OCR (for coordinate normalization)
+        elements: List of section/text block elements from section_processor
+        assets: List of figure/table assets
+        page_metadata: Optional dict of page-level metadata (for debugging)
     
     Returns:
         Combined list of elements sorted by page and vertical position
     """
     if not assets:
-        return sections
+        return elements
     
-    # Normalize asset coordinates if DPI differs
-    for asset in assets:
-        export_dpi = asset.get('_export_dpi', DEFAULT_EXPORT_DPI)
-        if export_dpi != ocr_dpi and asset.get('_y_position', 0) < 9999:
-            asset['_y_position'] = normalize_coordinate(
-                asset['_y_position'], 
-                export_dpi, 
-                ocr_dpi
-            )
+    # Log some debug info
+    if page_metadata:
+        print(f"    Page metadata available for {len(page_metadata)} pages")
+        # Sample one page's metadata
+        sample_page = next(iter(page_metadata.keys()), None)
+        if sample_page:
+            print(f"    Sample page {sample_page} metadata: {page_metadata[sample_page]}")
     
-    # Combine all elements
-    all_elements = sections + assets
+    # Log bbox info for debugging
+    elements_with_bbox = sum(1 for e in elements if e.get('bbox'))
+    assets_with_bbox = sum(1 for a in assets if a.get('bbox'))
+    print(f"    Elements with bbox: {elements_with_bbox}/{len(elements)}")
+    print(f"    Assets with bbox: {assets_with_bbox}/{len(assets)}")
     
-    # Sort by page first, then by y-position within page
-    def sort_key(elem):
-        page, y_pos = calculate_element_position(elem)
-        return (page, y_pos)
+    # Sample bbox values for debugging
+    if elements and elements[0].get('bbox'):
+        print(f"    Sample element bbox: {elements[0]['bbox']}")
+    if assets and assets[0].get('bbox'):
+        print(f"    Sample asset bbox: {assets[0]['bbox']}")
     
-    all_elements.sort(key=sort_key)
+    # Combine and sort
+    all_items = elements + assets
+    all_items.sort(key=get_element_sort_key)
     
-    return all_elements
-
-
-def integrate_assets_by_page_end(
-    sections: List[Dict], 
-    assets: List[Dict]
-) -> List[Dict]:
-    """
-    Alternative integration strategy: place all assets at the end of their respective pages.
-    
-    This is simpler but less precise than bbox-based positioning.
-    Use this if bbox coordinates are unreliable.
-    
-    Args:
-        sections: List of section/text block elements
-        assets: List of figure/table assets
-    
-    Returns:
-        Combined list with assets placed at page ends
-    """
-    if not assets:
-        return sections
-    
-    # Group assets by page
-    assets_by_page = {}
-    for asset in assets:
-        page = asset.get('page', 9999)
-        if page not in assets_by_page:
-            assets_by_page[page] = []
-        assets_by_page[page].append(asset)
-    
-    # Sort assets within each page by y-position
-    for page in assets_by_page:
-        assets_by_page[page].sort(key=lambda a: a.get('_y_position', 9999))
-    
-    # Build result by inserting assets after each page's sections
-    result = []
-    current_page = None
-    
-    for section in sections:
-        section_page = section.get('page', section.get('page_number', 9999))
-        
-        # If we've moved to a new page, insert assets from the previous page
-        if current_page is not None and section_page != current_page:
-            if current_page in assets_by_page:
-                result.extend(assets_by_page[current_page])
-                del assets_by_page[current_page]
-        
-        result.append(section)
-        current_page = section_page
-    
-    # Don't forget assets from the last page
-    if current_page in assets_by_page:
-        result.extend(assets_by_page[current_page])
-        del assets_by_page[current_page]
-    
-    # Add any remaining assets (from pages with no sections)
-    for page in sorted(assets_by_page.keys()):
-        result.extend(assets_by_page[page])
-    
-    return result
+    return all_items
 
 
 def run_asset_integration(
@@ -291,7 +230,7 @@ def run_asset_integration(
     output_path: str,
     exports_dir: str,
     doc_stem: str,
-    positioning_mode: str = "bbox"  # "bbox" or "page_end"
+    positioning_mode: str = "bbox"
 ):
     """
     Main function to load sections and integrate assets.
@@ -301,7 +240,7 @@ def run_asset_integration(
         output_path: Path to save integrated output
         exports_dir: Base directory for exported figures/tables
         doc_stem: Document stem name
-        positioning_mode: "bbox" for precise positioning, "page_end" for simpler approach
+        positioning_mode: "bbox" for positioning by coordinates (only mode now)
     """
     print(f"  - Loading sections from: {input_path}")
     
@@ -310,26 +249,37 @@ def run_asset_integration(
         return
     
     with open(input_path, 'r', encoding='utf-8') as f:
-        sections = json.load(f)
+        data = json.load(f)
     
-    print(f"  - Found {len(sections)} section elements")
+    # Handle new output format with page_metadata and elements
+    if isinstance(data, dict) and 'elements' in data:
+        elements = data.get('elements', [])
+        page_metadata = data.get('page_metadata', {})
+        print(f"  - Found {len(elements)} section elements")
+    else:
+        # Old format - just a list of elements
+        elements = data if isinstance(data, list) else []
+        page_metadata = {}
+        print(f"  - Found {len(elements)} section elements (legacy format)")
     
     # Load assets
     print(f"  - Loading assets from: {exports_dir}/{doc_stem}")
     assets = load_all_assets(exports_dir, doc_stem)
     
-    # Integrate based on positioning mode
-    if positioning_mode == "bbox":
-        print(f"  - Integrating assets using bbox positioning")
-        integrated = integrate_assets_with_sections(sections, assets)
-    else:
-        print(f"  - Integrating assets at page ends")
-        integrated = integrate_assets_by_page_end(sections, assets)
+    # Integrate
+    print(f"  - Integrating assets by bbox position")
+    integrated = integrate_assets_with_elements(elements, assets, page_metadata)
+    
+    # Prepare output - preserve page_metadata for downstream use
+    output_data = {
+        "page_metadata": page_metadata,
+        "elements": integrated
+    }
     
     # Save result
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(integrated, f, indent=4)
+        json.dump(output_data, f, indent=4)
     
     asset_count = sum(1 for e in integrated if e.get('type') in ('figure', 'table'))
     print(f"  - Saved {len(integrated)} elements ({asset_count} assets integrated)")
@@ -344,8 +294,7 @@ if __name__ == '__main__':
         output_file = sys.argv[2]
         exports_dir = sys.argv[3]
         doc_stem = sys.argv[4] if len(sys.argv) > 4 else os.path.splitext(os.path.basename(input_file))[0].replace('_organized', '')
-        mode = sys.argv[5] if len(sys.argv) > 5 else "bbox"
         
-        run_asset_integration(input_file, output_file, exports_dir, doc_stem, mode)
+        run_asset_integration(input_file, output_file, exports_dir, doc_stem)
     else:
-        print("Usage: python asset_processor.py <input.json> <output.json> <exports_dir> [doc_stem] [bbox|page_end]")
+        print("Usage: python asset_processor.py <input.json> <output.json> <exports_dir> [doc_stem]")

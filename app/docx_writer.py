@@ -12,7 +12,6 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 def add_docx_table_from_data(doc, table_data: Dict):
     """
     Adds a table to the docx document from structured data.
-    (This function is unchanged)
     """
     columns = table_data.get('columns', [])
     rows_data = table_data.get('rows', [])
@@ -38,19 +37,10 @@ def add_docx_table_from_data(doc, table_data: Dict):
 def add_figure_caption(doc, text: str):
     """
     Adds a true Word caption for a FIGURE, which can be used for a Table of Figures.
-    This function constructs the necessary XML for a 'SEQ Figure' field.
-
-    Args:
-        doc: The document object.
-        text: The caption text (e.g., "My Figure Name").
     """
-    # Create a new paragraph for the caption with the 'Caption' style
     p = doc.add_paragraph(style='Caption')
-    
-    # Add the "Figure " prefix
     p.add_run("Figure ")
 
-    # --- Create the SEQ field for automatic numbering ---
     run = p.add_run()
     fldChar_begin = OxmlElement('w:fldChar')
     fldChar_begin.set(qn('w:fldCharType'), 'begin')
@@ -58,33 +48,23 @@ def add_figure_caption(doc, text: str):
 
     instrText = OxmlElement('w:instrText')
     instrText.set(qn('xml:space'), 'preserve')
-    instrText.text = 'SEQ Figure \\* ARABIC'  # Field for figures
+    instrText.text = 'SEQ Figure \\* ARABIC'
     run._r.append(instrText)
 
     fldChar_end = OxmlElement('w:fldChar')
     fldChar_end.set(qn('w:fldCharType'), 'end')
     run._r.append(fldChar_end)
 
-    # Add the rest of the caption text
     p.add_run(f": {text}")
 
 
 def add_table_caption(doc, text: str):
     """
     Adds a true Word caption for a TABLE, which can be used for a Table of Tables.
-    This function constructs the necessary XML for a 'SEQ Table' field.
-
-    Args:
-        doc: The document object.
-        text: The caption text (e.g., "My Table Name").
     """
-    # Create a new paragraph for the caption with the 'Caption' style
     p = doc.add_paragraph(style='Caption')
-    
-    # Add the "Table " prefix
     p.add_run("Table ")
 
-    # --- Create the SEQ field for automatic numbering ---
     run = p.add_run()
     fldChar_begin = OxmlElement('w:fldChar')
     fldChar_begin.set(qn('w:fldCharType'), 'begin')
@@ -92,33 +72,30 @@ def add_table_caption(doc, text: str):
 
     instrText = OxmlElement('w:instrText')
     instrText.set(qn('xml:space'), 'preserve')
-    instrText.text = 'SEQ Table \\* ARABIC'  # Field for tables
+    instrText.text = 'SEQ Table \\* ARABIC'
     run._r.append(instrText)
 
     fldChar_end = OxmlElement('w:fldChar')
     fldChar_end.set(qn('w:fldCharType'), 'end')
     run._r.append(fldChar_end)
 
-    # Add the rest of the caption text
     p.add_run(f": {text}")
 
 
 def add_bordered_paragraph(doc, text: str):
     """
     Adds a paragraph with a single-line border around it.
-    This is used to create the "box" effect for distribution statements.
     """
     p = doc.add_paragraph(text)
     pPr = p._p.get_or_add_pPr()
     pBdr = OxmlElement('w:pBdr')
     
-    # Define the border style for all four sides
     for border_name in ['top', 'left', 'bottom', 'right']:
         border_el = OxmlElement(f'w:{border_name}')
-        border_el.set(qn('w:val'), 'single')  # Style: single line
-        border_el.set(qn('w:sz'), '4')         # Width: 1/4 pt
-        border_el.set(qn('w:space'), '1')      # Spacing from text
-        border_el.set(qn('w:color'), 'auto')   # Color
+        border_el.set(qn('w:val'), 'single')
+        border_el.set(qn('w:sz'), '4')
+        border_el.set(qn('w:space'), '1')
+        border_el.set(qn('w:color'), 'auto')
         pBdr.append(border_el)
     
     pPr.append(pBdr)
@@ -127,21 +104,16 @@ def add_title_page(doc, title_data: Dict):
     """
     Adds a formatted title page to the document using the extracted data.
     """
-    # 1. Add the Document Title (Bold and Centered)
-    # Add vertical spacing to push the title down the page
     p_title = doc.add_paragraph()
     p_title.add_run('\n\n\n\n') 
     
-    # Add the title text, bolded and centered
     run = p_title.add_run(title_data.get('document_title', ''))
     run.bold = True
     run.font.size = Pt(18)
     p_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     
-    # Add more spacing after the title
     p_title.add_run('\n\n\n\n\n')
 
-    # 2. Add the Distribution Statements in a single box
     boxed_content = []
     if title_data.get('distribution_statement'):
         boxed_content.append(title_data.get('distribution_statement'))
@@ -153,8 +125,7 @@ def add_title_page(doc, title_data: Dict):
     if boxed_content:
         add_bordered_paragraph(doc, '\n\n'.join(boxed_content))
 
-    # 3. Add the Control Statements as normal text
-    doc.add_paragraph() # Add a space
+    doc.add_paragraph()
     if title_data.get('approval_status'):
         doc.add_paragraph(title_data.get('approval_status'))
     if title_data.get('controlled_by'):
@@ -167,71 +138,50 @@ def add_title_page(doc, title_data: Dict):
 def add_field(paragraph, field_text: str):
     """
     Adds a Word field (like PAGE or SEQ) to a paragraph.
-
-    Args:
-        paragraph: The paragraph object to which the field will be added.
-        field_text: The field code string (e.g., "PAGE").
     """
     run = paragraph.add_run()
     
-    # Create the fldChar element and set it to 'begin'
     fldChar_begin = OxmlElement('w:fldChar')
     fldChar_begin.set(qn('w:fldCharType'), 'begin')
     run._r.append(fldChar_begin)
 
-    # Create the instrText element with the field code
     instrText = OxmlElement('w:instrText')
     instrText.set(qn('xml:space'), 'preserve')
     instrText.text = field_text
     run._r.append(instrText)
 
-    # Create the fldChar element and set it to 'end'
     fldChar_end = OxmlElement('w:fldChar')
     fldChar_end.set(qn('w:fldCharType'), 'end')
     run._r.append(fldChar_end)
 
 def add_caption(doc, text: str):
     """
-    Adds a true Word caption to the document, which can be used for a Table of Figures.
-    This function constructs the necessary XML for a SEQ (Sequence) field.
-
-    Args:
-        doc: The document object.
-        text: The caption text (e.g., "My Figure Name").
+    Adds a true Word caption to the document.
     """
-    # Create a new paragraph for the caption with the 'Caption' style
     p = doc.add_paragraph(style='Caption')
-    
-    # Add the "Figure " prefix
     p.add_run("Figure ")
 
-    # --- Create the SEQ field for automatic numbering ---
-    # 1. Create the run that will contain the field
     run = p.add_run()
     
-    # 2. Create the fldChar element and set it to 'begin'
     fldChar = OxmlElement('w:fldChar')
     fldChar.set(qn('w:fldCharType'), 'begin')
     run._r.append(fldChar)
 
-    # 3. Create the instrText element with the SEQ field code
     instrText = OxmlElement('w:instrText')
     instrText.set(qn('xml:space'), 'preserve')
     instrText.text = 'SEQ Figure \\* ARABIC'
     run._r.append(instrText)
 
-    # 4. Create the fldChar element and set it to 'end'
     fldChar = OxmlElement('w:fldChar')
     fldChar.set(qn('w:fldCharType'), 'end')
     run._r.append(fldChar)
 
-    # Add the rest of the caption text (e.g., ": My Figure Name")
     p.add_run(f": {text}")
 
 def create_docx_from_elements(elements: List[Dict], output_filename: str, figures_image_folder: str, part_number: str, title_data: Optional[Dict]):
     """
-    Creates a .docx file. It now handles 'unassigned_text_block' by writing
-    its content as a plain paragraph.
+    Creates a .docx file from document elements.
+    Handles 'section', 'unassigned_text_block', 'figure', and 'table' element types.
     """
     doc = docx.Document()
     style = doc.styles['Normal']
@@ -289,11 +239,9 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
             if content:
                 doc.add_paragraph(content)
         
-        # --- NEW: Handle unassigned text blocks ---
         elif element_type == "unassigned_text_block":
             content = element.get("content", "")
             if content:
-                # Simply add the content as a plain paragraph
                 doc.add_paragraph(content)
 
         elif element_type == "figure":
@@ -310,7 +258,7 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
         
         elif element_type == "table":
             caption_name = element.get('asset_id', 'Untitled Table')
-            table_data = element.get("table_data") # Check for pre-processed data
+            table_data = element.get("table_data")
 
             if table_data:
                 add_docx_table_from_data(doc, table_data)
@@ -335,14 +283,26 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
 def run_docx_creation(input_path: str, output_path: str, figures_base_path: str, doc_stem: str, title_data_path: str):
     """
     Loads final elements and title data to generate a DOCX file.
-    No longer requires llm_config.
+    
+    Handles both old format (list of elements) and new format (dict with page_metadata and elements).
     """
     if not os.path.exists(input_path):
         print(f"Error: Input file not found at {input_path}. Skipping DOCX creation for {doc_stem}.")
         return
 
     with open(input_path, 'r', encoding='utf-8') as f:
-        elements = json.load(f)
+        data = json.load(f)
+    
+    # Handle both old and new data formats
+    if isinstance(data, dict) and 'elements' in data:
+        elements = data.get('elements', [])
+        page_metadata = data.get('page_metadata', {})
+        print(f"  - Loaded {len(elements)} elements (new format)")
+        if page_metadata:
+            print(f"  - Page metadata available for {len(page_metadata)} pages")
+    else:
+        elements = data if isinstance(data, list) else []
+        print(f"  - Loaded {len(elements)} elements (legacy format)")
     
     title_data = None
     if os.path.exists(title_data_path):
@@ -351,21 +311,19 @@ def run_docx_creation(input_path: str, output_path: str, figures_base_path: str,
             if title_data_list:
                 title_data = title_data_list[0]
     else:
-        print(f"Warning: Title data file not found at {title_data_path}. Proceeding without a title page.")
+        print(f"  - Warning: Title data file not found at {title_data_path}. Proceeding without a title page.")
 
     figure_image_folder = os.path.join(figures_base_path, doc_stem)
 
     create_docx_from_elements(elements, output_path, figure_image_folder, doc_stem, title_data)
-    print(f"DOCX document successfully created at {output_path}")
+    print(f"  - DOCX document successfully created at {output_path}")
 
 
 if __name__ == '__main__':
-    # Example of how to run this module standalone
     doc_stem = ""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
     input_file = os.path.join(script_dir, "..", "results", f"{doc_stem}_repaired.json")
-    # I've changed the output name to avoid confusion with previous versions
     output_file = os.path.join(script_dir, "..", "results", f"{doc_stem}_final_oss.docx")
     figures_path = os.path.join(script_dir, "..", "iris_ocr", "CM_Spec_OCR_and_figtab_output", "exports")
 
