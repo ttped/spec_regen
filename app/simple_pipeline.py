@@ -3,10 +3,11 @@ simple_pipeline.py - Streamlined document processing pipeline.
 
 Pipeline Steps:
 1. classify  - Determine where content starts (skip ToC)
-2. title     - Extract title page information
+2. title     - Extract title page information  
 3. structure - Parse sections from content pages (preserving original page numbers)
-4. tables    - OCR any table images
-5. write     - Generate final DOCX
+4. assets    - Integrate figures/tables at correct positions based on bbox
+5. tables    - OCR any table images into structured data
+6. write     - Generate final DOCX
 
 Usage:
     python simple_pipeline.py --step all
@@ -23,6 +24,7 @@ from typing import List, Optional
 try:
     from classify_agent import run_classification_on_file, load_content_start_page
     from title_agent import extract_title_page_info
+    from asset_processor import run_asset_integration
     from table_processor_agent import run_table_processing_on_file
     from docx_writer import run_docx_creation
     from section_processor import run_section_processing_on_file
@@ -103,7 +105,7 @@ def main():
         "--step", 
         type=str, 
         default="all", 
-        choices=["classify", "title", "structure", "tables", "write", "all"],
+        choices=["classify", "title", "structure", "assets", "tables", "write", "all"],
         help="Pipeline step to execute"
     )
     parser.add_argument(
@@ -130,6 +132,13 @@ def main():
         default=4,
         help="Number of parallel workers for LLM tasks"
     )
+    parser.add_argument(
+        "--asset-positioning",
+        type=str,
+        default="bbox",
+        choices=["bbox", "page_end"],
+        help="How to position figures/tables: 'bbox' for precise positioning, 'page_end' for simpler approach"
+    )
     
     args = parser.parse_args()
     os.makedirs(args.results_dir, exist_ok=True)
@@ -155,6 +164,7 @@ def main():
         classify_out = os.path.join(args.results_dir, f"{stem}_classification.json")
         title_out = os.path.join(args.results_dir, f"{stem}_title.json")
         organized_out = os.path.join(args.results_dir, f"{stem}_organized.json")
+        with_assets_out = os.path.join(args.results_dir, f"{stem}_with_assets.json")
         tables_out = os.path.join(args.results_dir, f"{stem}_with_tables.json")
         final_docx = os.path.join(args.results_dir, f"{stem}.docx")
 
@@ -183,30 +193,55 @@ def main():
                 content_start_page=content_start_page
             )
 
-        # ========== STEP 4: TABLES ==========
-        if args.step in ["tables", "all"]:
-            print("\n[Step 4: Table Processing]")
+        # ========== STEP 4: ASSETS ==========
+        if args.step in ["assets", "all"]:
+            print("\n[Step 4: Asset Integration (Figures/Tables)]")
             if os.path.exists(organized_out):
+                run_asset_integration(
+                    organized_out,
+                    with_assets_out,
+                    args.figures_dir,
+                    stem,
+                    positioning_mode=args.asset_positioning
+                )
+            else:
+                print(f"  [Skipping] Missing organized file: {organized_out}")
+
+        # ========== STEP 5: TABLES ==========
+        if args.step in ["tables", "all"]:
+            print("\n[Step 5: Table OCR Processing]")
+            # Prefer file with assets, fall back to organized
+            if os.path.exists(with_assets_out):
+                input_for_tables = with_assets_out
+            elif os.path.exists(organized_out):
+                input_for_tables = organized_out
+                print("  [Note] Using organized file (no asset integration)")
+            else:
+                print(f"  [Skipping] No input file available")
+                input_for_tables = None
+            
+            if input_for_tables:
                 run_table_processing_on_file(
-                    organized_out, 
+                    input_for_tables, 
                     tables_out, 
                     args.figures_dir, 
                     stem, 
                     llm_config
                 )
-            else:
-                print(f"  [Skipping] Missing organized file: {organized_out}")
 
-        # ========== STEP 5: WRITE DOCX ==========
+        # ========== STEP 6: WRITE DOCX ==========
         if args.step in ["write", "all"]:
-            print("\n[Step 5: Write DOCX]")
+            print("\n[Step 6: Write DOCX]")
             
-            # Prefer table-processed file, fallback to organized
+            # Prefer most processed file, with fallbacks
             if os.path.exists(tables_out):
                 input_for_docx = tables_out
+            elif os.path.exists(with_assets_out):
+                input_for_docx = with_assets_out
+                print("  [Note] Using file with assets (no table OCR)")
             elif os.path.exists(organized_out):
                 input_for_docx = organized_out
-                print("  [Note] Using organized file (no table processing)")
+                print("  [Note] Using organized file (no assets or table OCR)")
             else:
                 print("  [Error] No input file for DOCX creation")
                 continue
