@@ -4,12 +4,13 @@ import json
 import logging
 from typing import List
 
-# Import specific functional agents
+# --- IMPORTS ---
+# 1. Agents we are keeping
 from title_agent import extract_title_page_info
 from table_processor_agent import run_table_processing_on_file
 from docx_writer import run_docx_creation
 
-# Import our adapted algorithm
+# 2. The new Section Processor (Make sure section_processor.py is in this folder!)
 from section_processor import run_section_processing_on_file
 
 def get_document_stems(input_dir: str) -> List[str]:
@@ -26,7 +27,8 @@ def get_document_stems(input_dir: str) -> List[str]:
 
 def extract_title_from_first_page(raw_input_path: str, output_path: str, llm_config: dict):
     """
-    simplified title extraction that just looks at the first page of the raw OCR.
+    Simplified title extraction: loads the raw JSON, finds Page 1 text, 
+    and sends it to the Title Agent.
     """
     if not os.path.exists(raw_input_path):
         return
@@ -34,21 +36,25 @@ def extract_title_from_first_page(raw_input_path: str, output_path: str, llm_con
     with open(raw_input_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
     
-    # Locate page 1 text
+    # Locate page 1 text robustly
     page_text = ""
+    
     # Case 1: List of pages
     if isinstance(data, list) and len(data) > 0:
-        # Sort just in case, though usually 0 index is page 1
         data.sort(key=lambda x: int(x.get('page_num', 0) or x.get('page_Id', 0)))
         page_dict = data[0].get('page_dict', data[0])
         text_list = page_dict.get('text', [])
         page_text = " ".join([str(t) for t in text_list])
         
-    # Case 2: Dict of pages
+    # Case 2: Dict of pages (e.g. {"1": {...}, "2": {...}})
     elif isinstance(data, dict):
-        # Try to find key '1' or the first key
+        # Try to find key '1', or just take the first one available
         first_key = next(iter(data))
-        page_obj = data.get('1', data[first_key])
+        if '1' in data:
+            page_obj = data['1']
+        else:
+            page_obj = data[first_key]
+            
         page_dict = page_obj.get('page_dict', page_obj)
         text_list = page_dict.get('text', [])
         page_text = " ".join([str(t) for t in text_list])
@@ -74,17 +80,18 @@ def extract_title_from_first_page(raw_input_path: str, output_path: str, llm_con
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run the simplified document processing pipeline.")
     parser.add_argument("--step", type=str, default="all", choices=["title", "structure", "tables", "write", "all"])
+    # Adjust this path to where your RAW OCR files live
     parser.add_argument("--raw_ocr_dir", type=str, default=os.path.join("iris_ocr", "new_baseline"))
+    # Adjust this path to where your figure exports live
     parser.add_argument("--figures_dir", type=str, default=os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "exports"))
     parser.add_argument("--results_dir", type=str, default="results_simple")
     
     args = parser.parse_args()
     os.makedirs(args.results_dir, exist_ok=True)
 
-    # LLM Config (Only used for Title Extraction and Table OCR now)
     llm_config = {
         "provider": "mission_assist",
-        "model_name": "gemma3", # or gptoss
+        "model_name": "gemma3", 
         "base_url": "http://devmissionassist.api.us.baesystems.com",
         "api_key": "aTOIT9hJM3DBYMQbEY"
     }
@@ -105,7 +112,7 @@ if __name__ == '__main__':
         if args.step in ["title", "all"]:
             extract_title_from_first_page(raw_input, title_output, llm_config)
 
-        # 2. Algorithmic Structure (The "Good" Algo)
+        # 2. Algorithmic Structure (Uses section_processor.py)
         if args.step in ["structure", "all"]:
             print("  - Running Algorithmic Section Detection...")
             run_section_processing_on_file(raw_input, organized_output)
