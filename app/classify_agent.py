@@ -62,22 +62,34 @@ Page Text:
 Example Output:
 {{"page_type": "TABLE_OF_CONTENTS"}}
 """
-    llm_response = call_llm(
-        prompt,
-        llm_config['model_name'],
-        llm_config['base_url'],
-        llm_config['api_key'],
-        llm_config['provider']
-    )
-    
-    json_string = _extract_json_from_llm_string(llm_response)
-    if not json_string:
+    try:
+        llm_response = call_llm(
+            prompt,
+            llm_config['model_name'],
+            llm_config['base_url'],
+            llm_config['api_key'],
+            llm_config['provider']
+        )
+    except Exception as e:
+        print(f"    [Error] LLM Call failed: {e}")
         return "AMBIGUOUS"
+    
+    if not llm_response:
+        return "AMBIGUOUS"
+
+    # Try to extract JSON from the response
+    json_string = _extract_json_from_llm_string(llm_response)
+    
+    # If extraction returned nothing, try the raw response (sometimes models output just JSON)
+    if not json_string:
+        json_string = llm_response
 
     try:
         response_data = json.loads(json_string)
         return response_data.get("page_type", "AMBIGUOUS")
-    except json.JSONDecodeError:
+    except Exception as e:
+        # Log the error but don't crash the thread
+        # print(f"    [Warning] JSON Parse Error: {e} | Raw: {json_string[:50]}...")
         return "AMBIGUOUS"
 
 
@@ -98,8 +110,13 @@ def load_pages_for_classification(input_path: str) -> List[Tuple[int, str]]:
     if not os.path.exists(input_path):
         return []
     
-    with open(input_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+    try:
+        with open(input_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"  - [Error] Failed to load input file {input_path}: {e}")
+        print(f"  - [Action] Skipping classification for this file.")
+        return []
     
     pages = []
     
@@ -140,15 +157,6 @@ def find_content_start_page(
 ) -> int:
     """
     Analyzes the first N pages to find where main content begins.
-    
-    Args:
-        input_path: Path to raw OCR JSON file.
-        llm_config: LLM configuration dictionary.
-        max_workers: Number of parallel threads for classification.
-        max_pages_to_check: Maximum number of pages to classify (default 20).
-    
-    Returns:
-        The page number where content begins. Returns 2 if no clear transition found.
     """
     pages = load_pages_for_classification(input_path)
     
@@ -214,17 +222,6 @@ def run_classification_on_file(
 ) -> int:
     """
     Runs classification and saves a simple result file with the content start page.
-    
-    This is a compatibility wrapper that also saves the result to a file.
-    
-    Args:
-        input_path: Path to raw OCR JSON.
-        output_path: Path to save classification result.
-        llm_config: LLM configuration.
-        max_workers: Parallel workers for classification.
-    
-    Returns:
-        The content start page number.
     """
     content_start_page = find_content_start_page(input_path, llm_config, max_workers)
     
@@ -245,13 +242,6 @@ def run_classification_on_file(
 def load_content_start_page(classification_path: str, default: int = 2) -> int:
     """
     Loads the content start page from a classification result file.
-    
-    Args:
-        classification_path: Path to the classification JSON file.
-        default: Default value if file doesn't exist or is invalid.
-    
-    Returns:
-        The content start page number.
     """
     if not os.path.exists(classification_path):
         return default
