@@ -1,17 +1,49 @@
+"""
+classify_agent.py - Determines where main content begins in a document.
+
+This agent classifies the first N pages to find the transition from 
+Table of Contents to actual Content. It returns the content start page number.
+
+The flattened text is only used internally for LLM classification - the raw
+OCR structure is preserved for downstream processing.
+"""
+
 import os
 import json
-from typing import Dict, List, Tuple
+import re
+from typing import Dict, List, Tuple, Optional, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
-    from .utils import _extract_json_from_llm_string, call_llm, load_pages_from_json, save_results_to_json
+    from .utils import _extract_json_from_llm_string, call_llm, save_results_to_json
 except ImportError:
-    from utils import _extract_json_from_llm_string, call_llm, load_pages_from_json, save_results_to_json
+    from utils import _extract_json_from_llm_string, call_llm, save_results_to_json
+
+
+def flatten_page_text(page_dict: Dict) -> str:
+    """
+    Flattens a page_dict into a single text string for LLM classification.
+    This is ONLY used for classification - not for downstream processing.
+    """
+    if not page_dict:
+        return ""
+    
+    # Handle wrapped structure
+    if 'page_dict' in page_dict and isinstance(page_dict['page_dict'], dict):
+        page_dict = page_dict['page_dict']
+    
+    text_list = page_dict.get('text', [])
+    if isinstance(text_list, list):
+        return " ".join(str(t) for t in text_list)
+    return str(text_list) if text_list else ""
+
 
 def get_page_type_with_llm(page_text: str, llm_config: Dict) -> str:
     """
-    Uses a simple LLM prompt to classify a single page into one of three types.
-    (This function remains unchanged)
+    Uses an LLM to classify a single page into one of three types:
+    - TABLE_OF_CONTENTS
+    - CONTENT_BODY  
+    - AMBIGUOUS
     """
     prompt = f"""
 You are a document page classifier. Your job is to classify the following page text into one of three specific types:
@@ -24,7 +56,7 @@ Analyze the text and respond with a single JSON object containing one key, "page
 
 Page Text:
 ---
-{page_text}
+{page_text[:3000]}
 ---
 
 Example Output:
@@ -48,105 +80,189 @@ Example Output:
     except json.JSONDecodeError:
         return "AMBIGUOUS"
 
-# --- NEW: Wrapper function for parallel execution ---
+
 def classify_page_wrapper(args: Tuple[int, str, Dict]) -> Dict:
     """
-    A wrapper to call get_page_type_with_llm and return a structured dictionary.
-    
-    Args:
-        args: A tuple containing (page_num, page_text, llm_config).
-        
-    Returns:
-        A dictionary {'page': page_num, 'type': page_type}.
+    Wrapper for parallel execution of page classification.
     """
     page_num, page_text, llm_config = args
     page_type = get_page_type_with_llm(page_text, llm_config)
     return {'page': page_num, 'type': page_type}
 
-def run_classification_on_file(input_path: str, output_path: str, llm_config: Dict, max_workers: int = 4):
+
+def load_pages_for_classification(input_path: str) -> List[Tuple[int, str]]:
     """
-    Finds the content start page by classifying pages in parallel and then
-    programmatically finding the transition from ToC to Content.
-    This version ensures an output file is always created.
+    Loads raw OCR and returns a list of (page_id, flattened_text) for classification.
+    Only the first ~20 pages are needed for finding the ToC->Content transition.
     """
-    pages = load_pages_from_json(input_path)
+    if not os.path.exists(input_path):
+        return []
+    
+    with open(input_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    pages = []
+    
+    if isinstance(data, dict):
+        for key, val in data.items():
+            try:
+                page_id = int(key)
+            except ValueError:
+                digits = re.findall(r'\d+', str(key))
+                page_id = int(digits[0]) if digits else 0
+            
+            # Get page_dict if wrapped
+            page_dict = val.get('page_dict', val) if isinstance(val, dict) else val
+            flat_text = flatten_page_text(page_dict) if isinstance(page_dict, dict) else ""
+            pages.append((page_id, flat_text))
+            
+    elif isinstance(data, list):
+        for idx, item in enumerate(data):
+            page_id = item.get('page_Id') or item.get('page_num') or (idx + 1)
+            try:
+                page_id = int(page_id)
+            except (ValueError, TypeError):
+                page_id = idx + 1
+            
+            page_dict = item.get('page_dict', item) if isinstance(item, dict) else item
+            flat_text = flatten_page_text(page_dict) if isinstance(page_dict, dict) else ""
+            pages.append((page_id, flat_text))
+    
+    pages.sort(key=lambda x: x[0])
+    return pages
+
+
+def find_content_start_page(
+    input_path: str, 
+    llm_config: Dict, 
+    max_workers: int = 4,
+    max_pages_to_check: int = 20
+) -> int:
+    """
+    Analyzes the first N pages to find where main content begins.
+    
+    Args:
+        input_path: Path to raw OCR JSON file.
+        llm_config: LLM configuration dictionary.
+        max_workers: Number of parallel threads for classification.
+        max_pages_to_check: Maximum number of pages to classify (default 20).
+    
+    Returns:
+        The page number where content begins. Returns 2 if no clear transition found.
+    """
+    pages = load_pages_for_classification(input_path)
+    
     if not pages:
-        print(f"No pages found in {input_path}. Saving empty classification file.")
-        # Ensure the output file is created, even if it's empty.
-        save_results_to_json([], output_path)
-        return
-
-    sorted_pages = sorted(pages.keys(), key=int)
+        print(f"  - [Warning] No pages found in {input_path}")
+        return 2
     
-    print(f"Classifying initial pages with {max_workers} parallel workers...")
+    # Skip page 1 (title page) and check next N pages
+    pages_to_classify = pages[1:max_pages_to_check]
     
-    # Step 1: Classify the first 20 pages in parallel.
-    tasks = []
-    # Slicing up to the 20th page, or fewer if the document is short.
-    for page_num_str in sorted_pages[1:20]: 
-        page_num = int(page_num_str)
-        tasks.append((page_num, pages[page_num_str], llm_config))
-
+    if not pages_to_classify:
+        print(f"  - [Warning] Only 1 page in document, defaulting to page 2")
+        return 2
+    
+    print(f"  - Classifying pages 2-{min(len(pages), max_pages_to_check)} with {max_workers} workers...")
+    
+    # Build tasks for parallel execution
+    tasks = [(page_id, page_text, llm_config) for page_id, page_text in pages_to_classify]
+    
     page_classifications = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Create a map of futures to their original task to handle results
         future_to_task = {executor.submit(classify_page_wrapper, task): task for task in tasks}
         
         for future in as_completed(future_to_task):
             try:
                 result = future.result()
                 page_classifications.append(result)
-                print(f"  - Page {result['page']} classified as: {result['type']}")
+                print(f"    Page {result['page']}: {result['type']}")
             except Exception as exc:
                 page_num = future_to_task[future][0]
-                print(f"  - Page {page_num} generated an exception: {exc}")
+                print(f"    Page {page_num}: ERROR - {exc}")
                 page_classifications.append({'page': page_num, 'type': 'AMBIGUOUS'})
-
-    # CRITICAL: Sort results by page number as they may complete out of order.
+    
+    # Sort by page number (results may arrive out of order)
     page_classifications.sort(key=lambda x: x['page'])
-
-    # Step 2: Programmatically find the start page (this logic remains the same).
-    start_page = len(pages) + 1
+    
+    # Find the ToC -> Content transition
     for i in range(1, len(page_classifications)):
-        prev_page_type = page_classifications[i-1]['type']
-        curr_page_type = page_classifications[i]['type']
+        prev_type = page_classifications[i-1]['type']
+        curr_type = page_classifications[i]['type']
         
-        if prev_page_type == 'TABLE_OF_CONTENTS' and curr_page_type == 'CONTENT_BODY':
+        if prev_type == 'TABLE_OF_CONTENTS' and curr_type == 'CONTENT_BODY':
             start_page = page_classifications[i]['page']
-            print(f"\nTransition found! Main content starts on page {start_page}.\n")
-            break
+            print(f"  - Transition found! Content starts on page {start_page}")
+            return start_page
     
-    if start_page > len(pages):
-        # If no transition is found, default to page 2 to avoid classifying everything as ToC.
-        print("\nWarning: Could not find a clear ToC -> Content transition. Defaulting content start to page 2.\n")
-        start_page = 2
-
-    # Step 3: Apply final classifications (this logic remains the same).
-    results = []
-    for page_num_str in sorted_pages:
-        page_num = int(page_num_str)
-        page_content = pages.get(page_num_str, '')
-        
-        subject, reasoning = "", ""
-        if page_num == 1:
-            subject = "Title Page"
-            reasoning = "This is the first page of the document."
-        elif page_num < start_page:
-            subject = "Table of Contents"
-            reasoning = f"This page appears before the main content, which starts on page {start_page}."
-        else:
-            subject = "Contents"
-            reasoning = f"This page is part of the main document body, starting from page {start_page}."
-
-        classification_json = json.dumps({"subject": subject, "reasoning": reasoning})
-        results.append({
-            'page': page_num,
-            'classification': classification_json,
-            'text': page_content,
-        })
+    # Fallback: if first classified page is CONTENT_BODY, start there
+    if page_classifications and page_classifications[0]['type'] == 'CONTENT_BODY':
+        start_page = page_classifications[0]['page']
+        print(f"  - First page is content. Starting on page {start_page}")
+        return start_page
     
-    save_results_to_json(results, output_path)
-    print(f"Final classification results saved to {output_path}")
+    # Default fallback
+    print(f"  - [Warning] No clear ToC->Content transition. Defaulting to page 2.")
+    return 2
+
+
+def run_classification_on_file(
+    input_path: str, 
+    output_path: str, 
+    llm_config: Dict, 
+    max_workers: int = 4
+) -> int:
+    """
+    Runs classification and saves a simple result file with the content start page.
+    
+    This is a compatibility wrapper that also saves the result to a file.
+    
+    Args:
+        input_path: Path to raw OCR JSON.
+        output_path: Path to save classification result.
+        llm_config: LLM configuration.
+        max_workers: Parallel workers for classification.
+    
+    Returns:
+        The content start page number.
+    """
+    content_start_page = find_content_start_page(input_path, llm_config, max_workers)
+    
+    # Save a simple result file
+    result = {
+        "content_start_page": content_start_page,
+        "source_file": os.path.basename(input_path)
+    }
+    
+    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(result, f, indent=4)
+    
+    print(f"  - Classification saved to {output_path}")
+    return content_start_page
+
+
+def load_content_start_page(classification_path: str, default: int = 2) -> int:
+    """
+    Loads the content start page from a classification result file.
+    
+    Args:
+        classification_path: Path to the classification JSON file.
+        default: Default value if file doesn't exist or is invalid.
+    
+    Returns:
+        The content start page number.
+    """
+    if not os.path.exists(classification_path):
+        return default
+    
+    try:
+        with open(classification_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data.get('content_start_page', default)
+    except (json.JSONDecodeError, KeyError):
+        return default
+
 
 if __name__ == '__main__':
     llm_config = {
@@ -156,10 +272,10 @@ if __name__ == '__main__':
         "api_key": "aTOIT9hJM3DBYMQbEY"
     }
     
-    input_file = os.path.join("..", "iris_ocr", "CM_Spec_OCR_and_figtab_output", 'raw_data', "S-133-06923_A_CUI.json")
-    output_file = os.path.join("..", "results", "S-133-06923_A_CUI_classified.json")
-    
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-
-    # Example of calling with the new max_workers parameter
-    run_classification_on_file(input_file, output_file, llm_config, max_workers=4)
+    import sys
+    if len(sys.argv) > 1:
+        input_file = sys.argv[1]
+        output_file = sys.argv[2] if len(sys.argv) > 2 else "classification_result.json"
+        run_classification_on_file(input_file, output_file, llm_config)
+    else:
+        print("Usage: python classify_agent.py <input.json> [output.json]")
