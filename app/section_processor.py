@@ -7,6 +7,7 @@ from typing import List, Dict, Tuple, Optional, Any
 def get_line_bbox(page_dict: Dict, word_indices: List[int]) -> Optional[Dict]:
     """
     Calculate the bounding box for a line given the indices of its words.
+    Returns the raw OCR bbox without any modifications.
     """
     if not word_indices:
         return None
@@ -184,32 +185,13 @@ def check_if_paragraph_is_header(line_text: str) -> Tuple[bool, Optional[str], O
     return True, section_num, topic.strip(), remainder.strip()
 
 
-def merge_bboxes(bboxes: List[Dict]) -> Optional[Dict]:
-    """
-    Merge multiple bounding boxes into one encompassing bbox.
-    """
-    valid_bboxes = [b for b in bboxes if b is not None]
-    if not valid_bboxes:
-        return None
-    
-    left = min(b['left'] for b in valid_bboxes)
-    top = min(b['top'] for b in valid_bboxes)
-    right = max(b['right'] for b in valid_bboxes)
-    bottom = max(b['bottom'] for b in valid_bboxes)
-    
-    return {
-        "left": left,
-        "top": top,
-        "width": right - left,
-        "height": bottom - top,
-        "right": right,
-        "bottom": bottom
-    }
-
-
 def group_elements_with_bbox(elements: List[Dict]) -> List[Dict]:
     """
     Merges consecutive content blocks and attaches them to preceding section headers.
+    
+    IMPORTANT: Preserves the ORIGINAL bbox of the section header line.
+    Does NOT merge bboxes from content blocks into the section bbox.
+    This ensures accurate positioning based on where the section header actually appears.
     """
     if not elements:
         return []
@@ -221,20 +203,20 @@ def group_elements_with_bbox(elements: List[Dict]) -> List[Dict]:
 
         if current_element['type'] == 'section':
             content_pieces = []
-            content_bboxes = [current_element.get('bbox')]
+            
+            # PRESERVE the original section header bbox - do NOT merge with content
+            # The bbox should represent where the section HEADER is, not the entire section content
+            original_bbox = current_element.get('bbox')
             
             j = i + 1
             while j < len(elements) and elements[j]['type'] == 'unassigned_text_block':
                 content_pieces.append(elements[j]['content'])
-                if elements[j].get('bbox'):
-                    content_bboxes.append(elements[j]['bbox'])
                 j += 1
             
             current_element['content'] = "\n\n".join(content_pieces)
             
-            merged_bbox = merge_bboxes(content_bboxes)
-            if merged_bbox:
-                current_element['bbox'] = merged_bbox
+            # Keep the original bbox unchanged
+            current_element['bbox'] = original_bbox
             
             merged_elements.append(current_element)
             i = j
