@@ -316,13 +316,19 @@ def extract_page_metadata(page_dict: Dict) -> Dict:
 def load_raw_ocr_pages(input_path: str) -> List[Tuple[int, Dict, Dict]]:
     """
     Loads raw OCR data and returns a sorted list of (page_id, page_dict, page_metadata) tuples.
+    Handles malformed JSON files gracefully.
     """
     if not os.path.exists(input_path):
         print(f"  - [Error] File not found: {input_path}")
         return []
 
-    with open(input_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+    # Defensive loading for malformed JSON
+    try:
+        with open(input_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"  - [Error] Failed to load JSON from {input_path}: {e}")
+        return []
 
     pages_to_process = []
 
@@ -376,7 +382,7 @@ def run_section_processing_on_file(
     pages_to_process = load_raw_ocr_pages(input_path)
     
     if not pages_to_process:
-        print("  - [Warning] No valid pages found.")
+        print("  - [Warning] No valid pages found (or file was corrupt).")
         os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
         with open(output_path, 'w') as f:
             json.dump([], f)
@@ -412,7 +418,6 @@ def run_section_processing_on_file(
             line_bbox = line_data.get('bbox')
             
             # --- HEADER FILTER ---
-            # If the user supplied a threshold, filter lines near the top
             if header_top_threshold > 0 and line_bbox:
                 if line_bbox.get('top', 9999) < header_top_threshold:
                     dropped_header_lines += 1
