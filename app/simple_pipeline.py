@@ -5,14 +5,16 @@ Pipeline Steps:
 1. classify  - Determine where content starts (skip ToC)
 2. title     - Extract title page information  
 3. structure - Parse sections from content pages (preserving original page numbers)
-4. assets    - Integrate figures/tables at correct positions based on bbox
-5. tables    - OCR any table images into structured data
-6. write     - Generate final DOCX
+4. repair    - Validate section numbering and demote false positives (lists, tables)
+5. assets    - Integrate figures/tables at correct positions based on bbox
+6. tables    - OCR any table images into structured data
+7. write     - Generate final DOCX
 
 Usage:
     python simple_pipeline.py --step all
     python simple_pipeline.py --step classify
     python simple_pipeline.py --step structure --header-threshold 600
+    python simple_pipeline.py --step repair --repair-confidence 0.7
 """
 
 import os
@@ -25,6 +27,7 @@ from typing import List, Optional
 try:
     from classify_agent import run_classification_on_file, load_content_start_page
     from title_agent import extract_title_page_info
+    from section_repair_agent import run_section_repair
     from asset_processor import run_asset_integration
     from table_processor_agent import run_table_processing_on_file
     from docx_writer import run_docx_creation
@@ -120,7 +123,7 @@ def main():
         "--step", 
         type=str, 
         default="all", 
-        choices=["classify", "title", "structure", "assets", "tables", "write", "all"],
+        choices=["classify", "title", "structure", "repair", "assets", "tables", "write", "all"],
         help="Pipeline step to execute"
     )
     parser.add_argument(
@@ -160,6 +163,17 @@ def main():
         default=600,
         help="Vertical (top) coordinate threshold for header filtering. Text above this value (less than) is dropped. Set to 0 to disable."
     )
+    parser.add_argument(
+        "--repair-confidence",
+        type=float,
+        default=0.7,
+        help="Confidence threshold for section repair. Only violations with confidence >= this value are fixed. (default: 0.7)"
+    )
+    parser.add_argument(
+        "--skip-repair",
+        action="store_true",
+        help="Skip the section repair step (useful for debugging)"
+    )
     
     args = parser.parse_args()
     os.makedirs(args.results_dir, exist_ok=True)
@@ -185,6 +199,7 @@ def main():
         classify_out = os.path.join(args.results_dir, f"{stem}_classification.json")
         title_out = os.path.join(args.results_dir, f"{stem}_title.json")
         organized_out = os.path.join(args.results_dir, f"{stem}_organized.json")
+        repaired_out = os.path.join(args.results_dir, f"{stem}_repaired.json")
         with_assets_out = os.path.join(args.results_dir, f"{stem}_with_assets.json")
         tables_out = os.path.join(args.results_dir, f"{stem}_with_tables.json")
         final_docx = os.path.join(args.results_dir, f"{stem}.docx")
@@ -215,29 +230,59 @@ def main():
                 header_top_threshold=args.header_threshold
             )
 
-        # ========== STEP 4: ASSETS ==========
-        if args.step in ["assets", "all"]:
-            print("\n[Step 4: Asset Integration (Figures/Tables)]")
+        # ========== STEP 4: REPAIR ==========
+        if args.step in ["repair", "all"] and not args.skip_repair:
+            print("\n[Step 4: Section Repair]")
             if os.path.exists(organized_out):
-                run_asset_integration(
+                run_section_repair(
                     organized_out,
+                    repaired_out,
+                    confidence_threshold=args.repair_confidence
+                )
+            else:
+                print(f"  [Skipping] Missing organized file: {organized_out}")
+        elif args.skip_repair and args.step == "all":
+            print("\n[Step 4: Section Repair] SKIPPED (--skip-repair flag)")
+            # Copy organized to repaired so downstream steps work
+            if os.path.exists(organized_out):
+                import shutil
+                shutil.copy(organized_out, repaired_out)
+                print(f"  - Copied {organized_out} to {repaired_out}")
+
+        # ========== STEP 5: ASSETS ==========
+        if args.step in ["assets", "all"]:
+            print("\n[Step 5: Asset Integration (Figures/Tables)]")
+            # Prefer repaired file, fall back to organized
+            if os.path.exists(repaired_out):
+                input_for_assets = repaired_out
+            elif os.path.exists(organized_out):
+                input_for_assets = organized_out
+                print("  [Note] Using organized file (no repair step)")
+            else:
+                print(f"  [Skipping] Missing input file")
+                input_for_assets = None
+            
+            if input_for_assets:
+                run_asset_integration(
+                    input_for_assets,
                     with_assets_out,
                     args.figures_dir,
                     stem,
                     positioning_mode=args.asset_positioning
                 )
-            else:
-                print(f"  [Skipping] Missing organized file: {organized_out}")
 
-        # ========== STEP 5: TABLES ==========
+        # ========== STEP 6: TABLES ==========
         if args.step in ["tables", "all"]:
-            print("\n[Step 5: Table OCR Processing]")
-            # Prefer file with assets, fall back to organized
+            print("\n[Step 6: Table OCR Processing]")
+            # Prefer file with assets, fall back through the chain
             if os.path.exists(with_assets_out):
                 input_for_tables = with_assets_out
+            elif os.path.exists(repaired_out):
+                input_for_tables = repaired_out
+                print("  [Note] Using repaired file (no asset integration)")
             elif os.path.exists(organized_out):
                 input_for_tables = organized_out
-                print("  [Note] Using organized file (no asset integration)")
+                print("  [Note] Using organized file (no repair or asset integration)")
             else:
                 print(f"  [Skipping] No input file available")
                 input_for_tables = None
@@ -251,9 +296,9 @@ def main():
                     llm_config
                 )
 
-        # ========== STEP 6: WRITE DOCX ==========
+        # ========== STEP 7: WRITE DOCX ==========
         if args.step in ["write", "all"]:
-            print("\n[Step 6: Write DOCX]")
+            print("\n[Step 7: Write DOCX]")
             
             # Prefer most processed file, with fallbacks
             if os.path.exists(tables_out):
@@ -261,9 +306,12 @@ def main():
             elif os.path.exists(with_assets_out):
                 input_for_docx = with_assets_out
                 print("  [Note] Using file with assets (no table OCR)")
+            elif os.path.exists(repaired_out):
+                input_for_docx = repaired_out
+                print("  [Note] Using repaired file (no assets or table OCR)")
             elif os.path.exists(organized_out):
                 input_for_docx = organized_out
-                print("  [Note] Using organized file (no assets or table OCR)")
+                print("  [Note] Using organized file (no repair, assets, or table OCR)")
             else:
                 print("  [Error] No input file for DOCX creation")
                 continue
