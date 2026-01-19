@@ -12,10 +12,14 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 def configure_heading_styles(doc):
     """
-    Configure the built-in Heading styles to be bold + underlined.
+    Configure the built-in Heading styles for base formatting.
     
     This preserves ToC functionality since Word's Table of Contents
     is based on these built-in Heading styles.
+    
+    Note: We set bold here but NOT underline - underline is applied
+    selectively to just the title portion (not section number) in
+    add_section_heading().
     
     Font sizes by level:
     - Heading 1: 14pt
@@ -39,9 +43,9 @@ def configure_heading_styles(doc):
         try:
             style = doc.styles[style_name]
             
-            # Set font properties
+            # Set font properties (bold but NOT underline - that's applied per-run)
             style.font.bold = True
-            style.font.underline = True
+            style.font.underline = False
             style.font.size = font_size
             style.font.name = 'Calibri'
             
@@ -55,6 +59,47 @@ def configure_heading_styles(doc):
         except KeyError:
             # Style doesn't exist in this document
             pass
+
+
+def add_section_heading(doc, section_number: str, topic: str, level: int = 1):
+    """
+    Adds a section heading with the section number bold (not underlined)
+    and the topic bold + underlined.
+    
+    Uses Word's built-in Heading styles to preserve ToC functionality.
+    
+    Args:
+        doc: The document object
+        section_number: The section number (e.g., "3.1.1") - bold only
+        topic: The section title (e.g., "System Requirements") - bold + underlined
+        level: Heading level 1-9
+    """
+    # Determine the heading style name
+    heading_level = max(1, min(level, 9))
+    style_name = f'Heading {heading_level}'
+    
+    # Create paragraph with heading style (for ToC compatibility)
+    p = doc.add_paragraph(style=style_name)
+    
+    # Add section number run (bold, no underline)
+    if section_number:
+        run_number = p.add_run(section_number)
+        run_number.bold = True
+        run_number.underline = False
+        
+        # Add space between number and topic
+        if topic:
+            run_space = p.add_run(" ")
+            run_space.bold = True
+            run_space.underline = False
+    
+    # Add topic run (bold + underlined)
+    if topic:
+        run_topic = p.add_run(topic)
+        run_topic.bold = True
+        run_topic.underline = True
+    
+    return p
 
 
 def add_docx_table_from_data(doc, table_data: Dict):
@@ -297,13 +342,9 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
             level = len(section_number.split('.')) if section_number else 1
             heading_level = max(1, min(level, 9))  # Word supports Heading 1-9
             
-            # Build heading text
-            heading_text = f"{section_number} {topic}".strip()
-            
-            if heading_text:
-                # Use built-in heading styles (configured to be bold + underlined)
-                # This preserves Table of Contents functionality
-                doc.add_heading(heading_text, level=heading_level)
+            # Add heading with section number (bold) and topic (bold + underlined)
+            if section_number or topic:
+                add_section_heading(doc, section_number, topic, level=heading_level)
             
             if content:
                 doc.add_paragraph(content)
