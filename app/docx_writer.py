@@ -198,37 +198,123 @@ def add_bordered_paragraph(doc, text: str):
 def add_title_page(doc, title_data: Dict):
     """
     Adds a formatted title page to the document using the extracted data.
+    
+    Layout order:
+    1. Document title (centered, bold, large)
+    2. Approval status with date (date in red if DRAFT)
+    3. Distribution statement box (bordered)
+    4. Export warning (in the box)
+    5. Destruction notice (in the box)
+    6. CONTROLLED BY entries
+    7. CUI CATEGORY
+    8. POC
     """
+    from docx.shared import RGBColor
+    
+    # --- 1. Document Title ---
     p_title = doc.add_paragraph()
-    p_title.add_run('\n\n\n\n') 
-    
-    run = p_title.add_run(title_data.get('document_title', ''))
-    run.bold = True
-    run.font.size = Pt(18)
     p_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p_title.add_run('\n\n\n')  # Top spacing
     
-    p_title.add_run('\n\n\n\n\n')
-
+    title_text = title_data.get('document_title', '')
+    if title_text:
+        run = p_title.add_run(title_text)
+        run.bold = True
+        run.font.size = Pt(16)
+    
+    doc.add_paragraph()  # Spacing after title
+    
+    # --- 2. Approval Status (with date potentially in red) ---
+    approval_status = title_data.get('approval_status', '')
+    approval_date = title_data.get('approval_date', '')
+    
+    if approval_status:
+        p_approval = doc.add_paragraph()
+        p_approval.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        
+        # Check if we need to highlight the date in red
+        if approval_date and approval_date in approval_status:
+            # Split the approval status around the date
+            parts = approval_status.split(approval_date)
+            
+            # Add text before date
+            if parts[0]:
+                run_before = p_approval.add_run(parts[0])
+            
+            # Add date in red (especially for DRAFT)
+            run_date = p_approval.add_run(approval_date)
+            if 'DRAFT' in approval_date.upper() or 'TBD' in approval_date.upper():
+                run_date.font.color.rgb = RGBColor(255, 0, 0)  # Red
+                run_date.bold = True
+            
+            # Add text after date
+            if len(parts) > 1 and parts[1]:
+                run_after = p_approval.add_run(parts[1])
+        else:
+            # No date to highlight, just add the whole thing
+            p_approval.add_run(approval_status)
+    
+    doc.add_paragraph()  # Spacing
+    
+    # --- 3-5. Boxed Content (Distribution, Export Warning, Destruction) ---
     boxed_content = []
-    if title_data.get('distribution_statement'):
-        boxed_content.append(title_data.get('distribution_statement'))
-    if title_data.get('export_warning'):
-        boxed_content.append(title_data.get('export_warning'))
-    if title_data.get('destruction_notice'):
-        boxed_content.append(title_data.get('destruction_notice'))
-
+    
+    distribution = title_data.get('distribution_statement', '')
+    if distribution:
+        boxed_content.append(distribution)
+    
+    export_warning = title_data.get('export_warning', '')
+    if export_warning:
+        boxed_content.append(export_warning)
+    
+    destruction = title_data.get('destruction_notice', '')
+    if destruction:
+        boxed_content.append(destruction)
+    
     if boxed_content:
         add_bordered_paragraph(doc, '\n\n'.join(boxed_content))
-
-    doc.add_paragraph()
-    if title_data.get('approval_status'):
-        doc.add_paragraph(title_data.get('approval_status'))
-    if title_data.get('controlled_by'):
-        doc.add_paragraph(f"CONTROLLED BY: {title_data.get('controlled_by')}")
-    if title_data.get('cui_category'):
-        doc.add_paragraph(f"CUI CATEGORY: {title_data.get('cui_category')}")
-    if title_data.get('point_of_contact'):
-        doc.add_paragraph(f"POC: {title_data.get('point_of_contact')}")
+    
+    doc.add_paragraph()  # Spacing after box
+    
+    # --- 6. CONTROLLED BY entries ---
+    controlled_by = title_data.get('controlled_by', [])
+    
+    # Handle both list and string formats
+    if isinstance(controlled_by, str) and controlled_by:
+        controlled_by = [controlled_by]
+    elif not isinstance(controlled_by, list):
+        controlled_by = []
+    
+    for entry in controlled_by:
+        if entry:
+            p = doc.add_paragraph()
+            run_label = p.add_run("CONTROLLED BY: ")
+            run_label.bold = True
+            p.add_run(str(entry))
+    
+    # --- 7. CUI Category ---
+    cui_category = title_data.get('cui_category', '')
+    if cui_category:
+        p = doc.add_paragraph()
+        run_label = p.add_run("CUI CATEGORY: ")
+        run_label.bold = True
+        p.add_run(cui_category)
+    
+    # --- 8. Point of Contact ---
+    poc = title_data.get('point_of_contact', '')
+    if poc:
+        p = doc.add_paragraph()
+        run_label = p.add_run("POC: ")
+        run_label.bold = True
+        p.add_run(poc)
+    
+    # --- Optional: Document date if present ---
+    doc_date = title_data.get('document_date', '')
+    if doc_date:
+        p = doc.add_paragraph()
+        run_label = p.add_run("DATE: ")
+        run_label.bold = True
+        p.add_run(doc_date)
 
 
 def add_field(paragraph, field_text: str):
