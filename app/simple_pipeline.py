@@ -18,6 +18,7 @@ Usage:
 import os
 import argparse
 import json
+from json import JSONDecodeError
 from typing import List, Optional
 
 # Import pipeline components
@@ -57,8 +58,15 @@ def extract_title_from_first_page(raw_input_path: str, output_path: str, llm_con
             json.dump([], f)
         return
     
-    with open(raw_input_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+    # 1. Load Raw Data (Defensive)
+    try:
+        with open(raw_input_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except JSONDecodeError as e:
+        print(f"    [Error] Failed to parse raw OCR file: {e}")
+        with open(output_path, 'w') as f:
+            json.dump([], f)
+        return
     
     page_text = ""
     
@@ -86,13 +94,20 @@ def extract_title_from_first_page(raw_input_path: str, output_path: str, llm_con
         return
 
     print("    Extracting title info from Page 1...")
-    info = extract_title_page_info(
-        page_text, 
-        llm_config['model_name'], 
-        llm_config['base_url'], 
-        llm_config['api_key'], 
-        llm_config['provider']
-    )
+    
+    # 2. Call Title Agent (Defensive)
+    info = None
+    try:
+        info = extract_title_page_info(
+            page_text, 
+            llm_config['model_name'], 
+            llm_config['base_url'], 
+            llm_config['api_key'], 
+            llm_config['provider']
+        )
+    except Exception as e:
+        print(f"    [Error] Title extraction failed (LLM or JSON error): {e}")
+        # Continue without title info rather than crashing pipeline
     
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     with open(output_path, 'w', encoding='utf-8') as f:
