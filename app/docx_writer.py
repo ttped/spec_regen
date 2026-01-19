@@ -9,6 +9,54 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
+
+def configure_heading_styles(doc):
+    """
+    Configure the built-in Heading styles to be bold + underlined.
+    
+    This preserves ToC functionality since Word's Table of Contents
+    is based on these built-in Heading styles.
+    
+    Font sizes by level:
+    - Heading 1: 14pt
+    - Heading 2: 13pt
+    - Heading 3: 12pt
+    - Heading 4+: 11pt
+    """
+    font_sizes = {
+        'Heading 1': Pt(14),
+        'Heading 2': Pt(13),
+        'Heading 3': Pt(12),
+        'Heading 4': Pt(11),
+        'Heading 5': Pt(11),
+        'Heading 6': Pt(11),
+        'Heading 7': Pt(11),
+        'Heading 8': Pt(11),
+        'Heading 9': Pt(11),
+    }
+    
+    for style_name, font_size in font_sizes.items():
+        try:
+            style = doc.styles[style_name]
+            
+            # Set font properties
+            style.font.bold = True
+            style.font.underline = True
+            style.font.size = font_size
+            style.font.name = 'Calibri'
+            
+            # Set color to black (remove default blue color that some templates use)
+            style.font.color.rgb = None  # Inherit/auto color
+            
+            # Adjust paragraph spacing
+            style.paragraph_format.space_before = Pt(12) if style_name == 'Heading 1' else Pt(8)
+            style.paragraph_format.space_after = Pt(6)
+            
+        except KeyError:
+            # Style doesn't exist in this document
+            pass
+
+
 def add_docx_table_from_data(doc, table_data: Dict):
     """
     Adds a table to the docx document from structured data.
@@ -33,6 +81,7 @@ def add_docx_table_from_data(doc, table_data: Dict):
         for i, value in enumerate(row_values):
             if i < len(row_cells):
                 row_cells[i].text = str(value)
+
 
 def add_figure_caption(doc, text: str):
     """
@@ -100,6 +149,7 @@ def add_bordered_paragraph(doc, text: str):
     
     pPr.append(pBdr)
 
+
 def add_title_page(doc, title_data: Dict):
     """
     Adds a formatted title page to the document using the extracted data.
@@ -135,6 +185,7 @@ def add_title_page(doc, title_data: Dict):
     if title_data.get('point_of_contact'):
         doc.add_paragraph(f"POC: {title_data.get('point_of_contact')}")
 
+
 def add_field(paragraph, field_text: str):
     """
     Adds a Word field (like PAGE or SEQ) to a paragraph.
@@ -153,6 +204,7 @@ def add_field(paragraph, field_text: str):
     fldChar_end = OxmlElement('w:fldChar')
     fldChar_end.set(qn('w:fldCharType'), 'end')
     run._r.append(fldChar_end)
+
 
 def add_caption(doc, text: str):
     """
@@ -178,16 +230,25 @@ def add_caption(doc, text: str):
 
     p.add_run(f": {text}")
 
+
 def create_docx_from_elements(elements: List[Dict], output_filename: str, figures_image_folder: str, part_number: str, title_data: Optional[Dict]):
     """
     Creates a .docx file from document elements.
     Handles 'section', 'unassigned_text_block', 'figure', and 'table' element types.
+    
+    Section headings use Word's built-in Heading styles (for ToC support)
+    but are configured to be bold + underlined.
     """
     doc = docx.Document()
+    
+    # Configure base Normal style
     style = doc.styles['Normal']
     font = style.font
     font.name = 'Calibri'
     font.size = Pt(11)
+    
+    # Configure Heading styles to be bold + underlined (preserves ToC functionality)
+    configure_heading_styles(doc)
 
     if title_data:
         add_title_page(doc, title_data)
@@ -231,11 +292,19 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
             section_number = element.get("section_number", "")
             topic = element.get("topic", "")
             content = element.get("content", "")
+            
+            # Calculate heading level from section number depth
             level = len(section_number.split('.')) if section_number else 1
-            heading_level = max(1, min(level, 9))
+            heading_level = max(1, min(level, 9))  # Word supports Heading 1-9
+            
+            # Build heading text
             heading_text = f"{section_number} {topic}".strip()
+            
             if heading_text:
+                # Use built-in heading styles (configured to be bold + underlined)
+                # This preserves Table of Contents functionality
                 doc.add_heading(heading_text, level=heading_level)
+            
             if content:
                 doc.add_paragraph(content)
         
@@ -277,7 +346,6 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
             add_table_caption(doc, caption_name)
 
     doc.save(output_filename)
-
 
 
 def run_docx_creation(input_path: str, output_path: str, figures_base_path: str, doc_stem: str, title_data_path: str):
