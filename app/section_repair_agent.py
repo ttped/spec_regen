@@ -2,20 +2,16 @@
 section_repair_agent.py - Validates and repairs section numbering sequences.
 
 This module detects when section numbers break the expected hierarchical pattern,
-which often indicates false positives (e.g., list items detected as sections).
+which often indicates false positives (e.g., list items or table rows detected as sections).
 
-Key concepts:
-- Section numbers follow a hierarchical pattern: 1, 1.1, 1.2, 2, 2.1, 2.1.1, etc.
-- A valid transition must follow logical rules (can't jump from 1.2.3 to 1 and back)
-- OCR errors are tolerated (3.A instead of 3.4) but structural violations are flagged
-- False positives are demoted back to content (merged with previous section)
+Key principles:
+1. HIGH-DEPTH sections (with dots like 3.1.2) are almost always VALID - trust them
+2. SIMPLE numbers (no dots like "8" or "12") are the source of most errors
+3. Use "position tracking" - we know roughly where we are in the document
+4. A simple number is valid if it's the logical next major section (current_major + 1)
+5. A simple number is suspicious if it's far from our current position
 
-Detection strategies:
-- Track "high water mark" - the highest valid major section seen
-- Single digits (no periods) that jump significantly are suspicious
-- Avoid cascade deletions by validating against last VALID section, not last seen
-
-The repair is conservative: when in doubt, leave it alone to avoid error propagation.
+The repair is conservative: when in doubt, leave it alone.
 All text is preserved - demoted sections become regular content blocks.
 """
 
@@ -44,7 +40,6 @@ class SectionNumber:
         """Parse '3.1.2' into ['3', '1', '2'], handling OCR errors like '3.A'"""
         if not raw:
             return []
-        # Split on dots, filter empty parts
         parts = [p.strip() for p in raw.split('.') if p.strip()]
         return parts
     
@@ -55,8 +50,6 @@ class SectionNumber:
             try:
                 result.append(int(part))
             except ValueError:
-                # Could be OCR error like 'A' instead of '4'
-                # Try to extract any digits
                 digits = re.findall(r'\d+', part)
                 if digits:
                     result.append(int(digits[0]))
@@ -73,6 +66,10 @@ class SectionNumber:
         """Check if this is a simple number with no dots (like '8' or '10')"""
         return self.depth == 1
     
+    def has_dots(self) -> bool:
+        """Check if this has hierarchical structure (dots)"""
+        return self.depth >= 2
+    
     def __repr__(self):
         return f"SectionNumber('{self.raw}' -> {self.parts})"
 
@@ -84,358 +81,251 @@ class TransitionAnalysis:
     to_section: SectionNumber
     is_valid: bool = True
     violation_type: Optional[str] = None
-    confidence: float = 1.0  # 0.0 to 1.0, lower = less certain it's a violation
-    reason: str = ""  # Human-readable explanation
+    confidence: float = 1.0
+    reason: str = ""
     
     def __repr__(self):
         status = "VALID" if self.is_valid else f"INVALID ({self.violation_type})"
         return f"Transition({self.from_section.raw} -> {self.to_section.raw}): {status}"
 
 
-def analyze_transition(
-    prev: SectionNumber, 
+@dataclass
+class DocumentPosition:
+    """
+    Tracks our current "position" in the document structure.
+    Like a Kalman filter - we know roughly where we are.
+    """
+    current_major: int = 0  # The major section we're currently in (e.g., 3 for 3.1.2)
+    max_major_seen: int = 0  # Highest major section we've confidently seen
+    last_valid_section: Optional[SectionNumber] = None
+    
+    def update(self, section: SectionNumber):
+        """Update position based on a validated section."""
+        major = section.get_major()
+        if major is not None:
+            self.current_major = major
+            self.max_major_seen = max(self.max_major_seen, major)
+        self.last_valid_section = section
+    
+    def is_reasonable_next_major(self, major: int) -> bool:
+        """
+        Check if a simple number is a reasonable next major section.
+        
+        Valid: current_major + 1 (the logical next section)
+        Also valid: current_major (staying in same major, e.g., after subsections)
+        """
+        if major == self.current_major + 1:
+            return True  # Perfect: 3.x.x -> 4
+        if major == self.current_major:
+            return True  # Okay: back to major after subsections
+        return False
+    
+    def distance_from_current(self, major: int) -> int:
+        """How far is this major section from where we currently are?"""
+        return abs(major - self.current_major)
+
+
+def analyze_simple_number(
     curr: SectionNumber,
-    high_water_major: int = 0,
-    context_depth: int = 0
+    position: DocumentPosition
 ) -> TransitionAnalysis:
     """
-    Analyze if the transition from prev to curr section number is valid.
+    Analyze a simple number (no dots) against our current position.
     
-    Args:
-        prev: Previous section number
-        curr: Current section number being evaluated
-        high_water_major: Highest major section number seen so far (e.g., 3 if we've seen 3.x.x)
-        context_depth: Deepest nesting level we've seen recently
-    
-    Valid transitions:
-    - Same depth, increment last part: 1.1 -> 1.2
-    - Go deeper by 1: 1.1 -> 1.1.1  
-    - Go shallower and increment: 1.1.1 -> 1.2, or 1.1.1 -> 2
-    - Next major section: 1.x.y -> 2, 2.x.y -> 3
-    
-    Invalid transitions (likely false positives):
-    - Sudden reset to 1 in middle of document: 3.1.2 -> 1 (when we're past section 1)
-    - Simple number that skips too many: 3.1 -> 8 (skipping 4, 5, 6, 7)
-    - Jump backwards: 3.1 -> 2.1
-    - Massive depth change: 1.1 -> 1.1.1.1.1 (skipped 2 levels)
+    Simple numbers are the main source of false positives (list items, table rows).
+    They're valid if they're the logical next major section.
     """
-    analysis = TransitionAnalysis(prev, curr)
+    analysis = TransitionAnalysis(
+        from_section=position.last_valid_section or SectionNumber(""),
+        to_section=curr
+    )
     
-    prev_parts = prev.get_numeric_parts()
-    curr_parts = curr.get_numeric_parts()
+    curr_major = curr.get_major()
+    if curr_major is None:
+        return analysis  # Can't analyze, assume valid
     
-    # Handle None values (OCR errors) - be lenient
-    prev_clean = [p for p in prev_parts if p is not None]
-    curr_clean = [p for p in curr_parts if p is not None]
+    # Check if this is a reasonable progression
+    if position.is_reasonable_next_major(curr_major):
+        return analysis  # Valid
     
-    if not prev_clean or not curr_clean:
-        # Can't analyze if we don't have numbers - assume valid
-        return analysis
+    # Calculate how far off we are
+    distance = position.distance_from_current(curr_major)
     
-    prev_depth = len(prev_clean)
-    curr_depth = len(curr_clean)
-    prev_major = prev_clean[0]  # First number (e.g., 3 in 3.1.2)
-    curr_major = curr_clean[0]
-    
-    # Use high water mark if provided
-    effective_high_water = max(high_water_major, prev_major)
-    
-    # ==========================================================================
-    # Rule 1: Check for valid major section progression
-    # Going from any X.y.z to (X+1) is always valid (next major section)
-    # ==========================================================================
-    if curr_depth == 1 and curr_major == prev_major + 1:
-        return analysis  # Valid: 1.x.y -> 2, 2.x.y -> 3
-    
-    # ==========================================================================
-    # Rule 2: Simple numbers (no dots) that jump too far are suspicious
-    # e.g., 3.1 -> 8 or 3.1.2 -> 10
-    # ==========================================================================
-    if curr.is_simple_number():
-        # How big is the jump from the current context?
-        jump_size = curr_major - effective_high_water
-        
-        # If we're jumping more than 1 ahead of our high water mark, suspicious
-        if jump_size > 1:
-            # The further the jump, the more confident we are it's wrong
-            if jump_size >= 5:
-                analysis.is_valid = False
-                analysis.violation_type = "large_jump"
-                analysis.confidence = 0.95
-                analysis.reason = f"Simple number {curr_major} jumps {jump_size} sections ahead of high water {effective_high_water}"
-                return analysis
-            elif jump_size >= 3:
-                analysis.is_valid = False
-                analysis.violation_type = "medium_jump"
-                analysis.confidence = 0.85
-                analysis.reason = f"Simple number {curr_major} jumps {jump_size} sections ahead"
-                return analysis
-            elif jump_size == 2 and prev_depth >= 2:
-                # Smaller jump but we're in a subsection - more suspicious
-                analysis.is_valid = False
-                analysis.violation_type = "skip_in_subsection"
-                analysis.confidence = 0.75
-                analysis.reason = f"Simple number {curr_major} skips from {prev.raw} (expected {effective_high_water + 1})"
-                return analysis
-    
-    # ==========================================================================
-    # Rule 3: Check for suspicious reset - going BACKWARDS in major section
-    # e.g., 3.1.2 -> 1 or 3.1.2 -> 2 (when we're in section 3)
-    # ==========================================================================
-    if curr_depth == 1 and curr_major < effective_high_water:
-        # Going from section 3.x.y back to section 1 or 2? Very suspicious.
-        # This is almost certainly a list item or table row number
-        gap = effective_high_water - curr_major
-        
-        if gap >= 2:
-            # Big gap - very confident this is wrong
-            analysis.is_valid = False
-            analysis.violation_type = "suspicious_reset"
-            analysis.confidence = 0.95
-            analysis.reason = f"Reset to {curr_major} after reaching section {effective_high_water}"
-            return analysis
-        elif gap == 1 and prev_depth >= 2:
-            # Smaller gap but we're in a subsection
-            analysis.is_valid = False
-            analysis.violation_type = "suspicious_reset"
-            analysis.confidence = 0.85
-            analysis.reason = f"Reset to {curr_major} from {prev.raw} (high water: {effective_high_water})"
-            return analysis
-    
-    # ==========================================================================
-    # Rule 4: Check depth jumps (going too deep too fast)
-    # BUT: Sections with high depth (like 4.2.2.2.1) are almost certainly real
-    # because people don't accidentally type multiple dots
-    # ==========================================================================
-    depth_change = curr_depth - prev_depth
-    
-    if depth_change > 1:
-        # Jumping more than one level deeper is suspicious
-        # e.g., 1.1 -> 1.1.1.1 (skipped 1.1.1)
-        
-        # EXCEPTION: High-depth sections are almost always real
-        # Nobody accidentally types "4.2.2.2.1" - that's intentional
-        if curr_depth >= 3:
-            # Check if the major section is progressing logically
-            if curr_major == prev_major or curr_major == prev_major + 1:
-                # This looks valid - don't flag it
-                # e.g., 4.6 -> 5.1.1 or 5 -> 5.1.1 (after 5.1 was OCR'd as $.1)
-                pass
-            elif curr_depth >= 4:
-                # Very deep sections (depth 4+) like 4.2.2.2 are almost always valid
-                # Even if there's a major section change, trust it
-                pass
-            else:
-                # Major section jump AND depth jump, but only depth 3
-                # Still somewhat suspicious but lower confidence
-                analysis.is_valid = False
-                analysis.violation_type = "depth_jump"
-                analysis.confidence = 0.5  # Low confidence - likely still valid
-                analysis.reason = f"Depth jump of {depth_change} levels with major section change"
-                return analysis
-        else:
-            # Shallow section (depth 1-2) with depth jump - more suspicious
-            analysis.is_valid = False
-            analysis.violation_type = "depth_jump"
-            analysis.confidence = 0.7
-            analysis.reason = f"Depth jump of {depth_change} levels"
-            return analysis
-    
-    # ==========================================================================
-    # Rule 5: Check for backwards progression at same depth
-    # e.g., 3.2 -> 3.1 or 2.1.4 -> 2.1.2
-    # ==========================================================================
-    if curr_depth == prev_depth and curr_depth >= 2:
-        # Compare the prefix (all but last)
-        if curr_clean[:-1] == prev_clean[:-1]:
-            # Same prefix, check last number
-            if curr_clean[-1] < prev_clean[-1]:
-                # Going backwards: 3.1.4 -> 3.1.2
-                analysis.is_valid = False
-                analysis.violation_type = "backwards_subsection"
-                analysis.confidence = 0.85
-                analysis.reason = f"Backwards: {curr.raw} < {prev.raw}"
-                return analysis
-    
-    # ==========================================================================
-    # Rule 6: Check for backwards major section at depth > 1
-    # e.g., 2.3.1 -> 1.1.2 
-    # ==========================================================================
-    if curr_depth >= 2 and curr_major < prev_major:
+    # Unrealistically large numbers (like 300, 502) are almost always wrong
+    if curr_major > 50:
         analysis.is_valid = False
-        analysis.violation_type = "backwards_major_section"
-        analysis.confidence = 0.9
-        analysis.reason = f"Major section went backwards: {curr_major} < {prev_major}"
+        analysis.violation_type = "unrealistic_number"
+        analysis.confidence = 0.95
+        analysis.reason = f"Section {curr_major} is unrealistically large"
         return analysis
     
-    return analysis
+    # Going backwards significantly is suspicious
+    if curr_major < position.current_major:
+        # How far back?
+        if curr_major <= 3 and position.current_major >= 3:
+            # Small number (1, 2, 3) appearing after we're past section 3
+            # This is likely a list item
+            analysis.is_valid = False
+            analysis.violation_type = "suspicious_reset"
+            analysis.confidence = 0.90
+            analysis.reason = f"Reset to {curr_major} after reaching section {position.current_major}"
+            return analysis
+        elif distance >= 3:
+            # Going back 3+ sections is suspicious
+            analysis.is_valid = False
+            analysis.violation_type = "backwards_jump"
+            analysis.confidence = 0.85
+            analysis.reason = f"Jump backwards from {position.current_major} to {curr_major}"
+            return analysis
+    
+    # Jumping forward too much is suspicious
+    if curr_major > position.current_major + 1:
+        skip_count = curr_major - position.current_major - 1
+        
+        if skip_count >= 5:
+            # Skipping 5+ sections (e.g., 3 -> 9)
+            analysis.is_valid = False
+            analysis.violation_type = "large_forward_jump"
+            analysis.confidence = 0.90
+            analysis.reason = f"Skipped {skip_count} sections: {position.current_major} to {curr_major}"
+            return analysis
+        elif skip_count >= 2:
+            # Skipping 2-4 sections - suspicious but not certain
+            analysis.is_valid = False
+            analysis.violation_type = "forward_jump"
+            analysis.confidence = 0.75
+            analysis.reason = f"Skipped {skip_count} sections: {position.current_major} to {curr_major}"
+            return analysis
+    
+    return analysis  # Valid
 
 
-def find_violations(
-    elements: List[Dict],
-    high_water_tracking: bool = True,
-    max_realistic_section: int = 50
-) -> Tuple[List[Tuple[int, TransitionAnalysis]], Dict[int, int]]:
+def analyze_hierarchical_section(
+    curr: SectionNumber,
+    position: DocumentPosition
+) -> TransitionAnalysis:
     """
-    Scan through sections and identify potentially invalid transitions.
+    Analyze a hierarchical section (has dots, like 3.1.2).
     
-    Uses high water mark tracking to catch jumps like 3.1 -> 8.
-    Compares against the LAST VALID section to prevent cascade errors.
+    These are almost always valid because people don't accidentally type dots.
+    We only flag obvious problems.
+    """
+    analysis = TransitionAnalysis(
+        from_section=position.last_valid_section or SectionNumber(""),
+        to_section=curr
+    )
     
-    Args:
-        elements: List of document elements
-        high_water_tracking: If True, track the highest major section seen
-        max_realistic_section: Maximum realistic major section number (default 50).
-                               Numbers above this are almost certainly not real sections.
+    curr_major = curr.get_major()
+    if curr_major is None:
+        return analysis  # Can't analyze, assume valid
     
-    Returns:
-        Tuple of (violations list, high_water_at_index dict)
+    # Hierarchical sections are trusted, but check for obvious issues
+    
+    # Unrealistically large major section
+    if curr_major > 50:
+        analysis.is_valid = False
+        analysis.violation_type = "unrealistic_number"
+        analysis.confidence = 0.90
+        analysis.reason = f"Major section {curr_major} is unrealistically large"
+        return analysis
+    
+    # Major section going backwards significantly
+    if curr_major < position.current_major - 1 and position.current_major >= 3:
+        # e.g., we're in section 5, and see 2.1.1
+        # This could be valid (document reorganization) but is suspicious
+        analysis.is_valid = False
+        analysis.violation_type = "backwards_major"
+        analysis.confidence = 0.70  # Lower confidence - might be valid
+        analysis.reason = f"Major section {curr_major} after reaching {position.current_major}"
+        return analysis
+    
+    return analysis  # Valid - trust hierarchical sections
+
+
+def find_violations(elements: List[Dict]) -> List[Tuple[int, TransitionAnalysis]]:
+    """
+    Scan through sections and identify potentially invalid ones.
+    
+    Uses position tracking to determine if sections make sense in context.
+    Compares against the last VALID section, not just the previous one.
     """
     violations = []
-    violation_indices = set()  # Track which indices are violations
-    high_water_at_index = {}  # Track high water mark at each index
+    position = DocumentPosition()
     
-    # Filter to just section elements
     section_elements = [(i, s) for i, s in enumerate(elements) if s.get('type') == 'section']
     
-    if len(section_elements) < 2:
-        return violations, high_water_at_index
+    if not section_elements:
+        return violations
     
-    # Track state
-    high_water_major = 0
-    max_depth_seen = 0
-    last_valid_idx = None  # Track the last section that wasn't flagged as a violation
-    last_valid_num = None
-    
-    for i in range(len(section_elements)):
-        curr_idx, curr_section = section_elements[i]
-        curr_num = SectionNumber(curr_section.get('section_number', ''))
+    for i, (idx, section) in enumerate(section_elements):
+        curr_num = SectionNumber(section.get('section_number', ''))
         
         if not curr_num.is_valid:
             continue
         
-        curr_major = curr_num.get_major()
-        
-        # Record high water at this index (before potential update)
-        high_water_at_index[curr_idx] = high_water_major
-        
-        # =======================================================================
-        # Pre-check: Unrealistically large section numbers are almost always wrong
-        # Documents rarely go past 20-30 sections, let alone 100+
-        # =======================================================================
-        if curr_major is not None and curr_major > max_realistic_section:
-            analysis = TransitionAnalysis(
-                from_section=last_valid_num or SectionNumber(""),
-                to_section=curr_num,
-                is_valid=False,
-                violation_type="unrealistic_section_number",
-                confidence=0.95,
-                reason=f"Section {curr_major} exceeds realistic maximum ({max_realistic_section})"
-            )
-            violations.append((curr_idx, analysis))
-            violation_indices.add(curr_idx)
-            continue  # Don't update any state for this
-        
         if i == 0:
             # First section - establish baseline
-            if curr_major is not None:
-                high_water_major = curr_major
-                max_depth_seen = curr_num.depth
-            last_valid_idx = i
-            last_valid_num = curr_num
+            position.update(curr_num)
             continue
         
-        # =======================================================================
-        # Compare against LAST VALID section, not just the previous one
-        # This prevents cascade errors where a bad section causes good ones to fail
-        # =======================================================================
-        if last_valid_num is None:
-            # No valid section yet - use the immediate previous for comparison
-            prev_idx, prev_section = section_elements[i - 1]
-            prev_num = SectionNumber(prev_section.get('section_number', ''))
+        # Analyze based on whether it has dots or not
+        if curr_num.is_simple_number():
+            analysis = analyze_simple_number(curr_num, position)
         else:
-            prev_num = last_valid_num
-        
-        if not prev_num.is_valid:
-            # Still no valid previous - just accept this one
-            last_valid_idx = i
-            last_valid_num = curr_num
-            if curr_major is not None and curr_major > high_water_major:
-                high_water_major = curr_major
-            max_depth_seen = max(max_depth_seen, curr_num.depth)
-            continue
-        
-        # Analyze transition with context
-        analysis = analyze_transition(
-            prev_num, 
-            curr_num,
-            high_water_major=high_water_major,
-            context_depth=max_depth_seen
-        )
+            analysis = analyze_hierarchical_section(curr_num, position)
         
         if not analysis.is_valid:
-            violations.append((curr_idx, analysis))
-            violation_indices.add(curr_idx)
-            # Don't update last_valid - keep using the previous valid one
+            violations.append((idx, analysis))
+            # Don't update position - this section is suspect
         else:
-            # This section is valid - update tracking state
-            last_valid_idx = i
-            last_valid_num = curr_num
-            if curr_major is not None and curr_major > high_water_major:
-                high_water_major = curr_major
-            max_depth_seen = max(max_depth_seen, curr_num.depth)
+            # Valid section - update our position
+            position.update(curr_num)
     
-    return violations, high_water_at_index
+    return violations
 
 
 def detect_list_sequences(elements: List[Dict]) -> List[List[int]]:
     """
-    Detect sequences that look like lists (1, 2, 3 or a, b, c patterns)
+    Detect sequences that look like lists (1, 2, 3 patterns)
     occurring in the middle of document sections.
-    
-    Returns list of index sequences that appear to be list items.
     """
     list_sequences = []
-    
-    # Get section elements with their positions
     section_elements = [(i, s) for i, s in enumerate(elements) if s.get('type') == 'section']
     
     if len(section_elements) < 3:
         return list_sequences
     
-    # Track the "expected" context - what major section are we in?
+    # Track context
     context_major = 0
     
     i = 0
     while i < len(section_elements):
         idx, section = section_elements[i]
         num = SectionNumber(section.get('section_number', ''))
-        parts = num.get_numeric_parts()
-        clean_parts = [p for p in parts if p is not None]
         
-        if not clean_parts:
+        if not num.is_valid:
             i += 1
             continue
         
-        curr_major = clean_parts[0]
-        curr_depth = len(clean_parts)
+        curr_major = num.get_major()
+        if curr_major is None:
+            i += 1
+            continue
         
-        # If this looks like a legitimate section (has depth or progresses normally), track it
-        if curr_depth >= 2:
+        # Hierarchical sections update context
+        if num.has_dots():
             context_major = max(context_major, curr_major)
             i += 1
             continue
         
-        # Simple numbers that progress normally update context
-        if curr_depth == 1 and curr_major == context_major + 1:
+        # Simple number that progresses normally
+        if curr_major == context_major + 1:
             context_major = curr_major
             i += 1
             continue
         
-        # Check if this starts a suspicious sequence (1, 2, 3... in middle of doc)
-        if curr_depth == 1 and curr_major <= 3 and context_major > curr_major:
-            # This looks like a small number appearing after we've established higher sections
-            # Look ahead to see if there's a sequence
+        # Check for list sequence: small numbers (1, 2, 3...) after we're past them
+        if curr_major <= 3 and context_major > curr_major:
             sequence = [idx]
             j = i + 1
             expected_next = curr_major + 1
@@ -443,33 +333,30 @@ def detect_list_sequences(elements: List[Dict]) -> List[List[int]]:
             while j < len(section_elements):
                 next_idx, next_section = section_elements[j]
                 next_num = SectionNumber(next_section.get('section_number', ''))
-                next_parts = next_num.get_numeric_parts()
-                next_clean = [p for p in next_parts if p is not None]
                 
-                if not next_clean:
+                if not next_num.is_valid:
                     j += 1
                     continue
                 
-                next_major = next_clean[0]
-                next_depth = len(next_clean)
+                next_major = next_num.get_major()
+                if next_major is None:
+                    j += 1
+                    continue
                 
-                # Does this continue the list sequence?
-                if next_depth == 1 and next_major == expected_next:
+                # Continues the sequence?
+                if next_num.is_simple_number() and next_major == expected_next:
                     sequence.append(next_idx)
                     expected_next += 1
                     j += 1
-                # Does this return to normal section numbering?
-                elif next_depth >= 2 or next_major > context_major:
-                    # End of list sequence - this looks like we're back to real sections
+                elif next_num.has_dots() or next_major > context_major:
+                    # Back to real sections
                     break
                 else:
-                    # Ambiguous - stop here
                     break
             
             if len(sequence) >= 2:
-                # Found a list sequence
                 list_sequences.append(sequence)
-                i = j  # Skip past the sequence
+                i = j
                 continue
         
         i += 1
@@ -477,94 +364,15 @@ def detect_list_sequences(elements: List[Dict]) -> List[List[int]]:
     return list_sequences
 
 
-def detect_isolated_simple_numbers(
-    elements: List[Dict],
-    violations: List[Tuple[int, TransitionAnalysis]],
-    high_water_at_index: Dict[int, int]
-) -> Set[int]:
-    """
-    Find isolated simple numbers (like 8, 10, 100) that don't fit the context.
-    
-    These are often table row numbers or list items that weren't caught by
-    the sequence detector.
-    """
-    isolated = set()
-    violation_indices = {idx for idx, _ in violations}
-    
-    section_elements = [(i, s) for i, s in enumerate(elements) if s.get('type') == 'section']
-    
-    for idx, section in section_elements:
-        num = SectionNumber(section.get('section_number', ''))
-        
-        if not num.is_simple_number():
-            continue
-        
-        major = num.get_major()
-        if major is None:
-            continue
-        
-        # Get the high water mark at this point
-        high_water = high_water_at_index.get(idx, 0)
-        
-        # If this simple number is way beyond or way below expectations, flag it
-        if major > high_water + 2:
-            # e.g., we're at section 3 and see "10" - that's 7 sections ahead
-            isolated.add(idx)
-        elif major < high_water - 1 and high_water >= 3:
-            # e.g., we're at section 5 and see "2" - already flagged by transition analysis
-            # but double-check it's in violations
-            if idx not in violation_indices:
-                isolated.add(idx)
-    
-    return isolated
-
-
-def find_violation_runs(violations: List[Tuple[int, TransitionAnalysis]], elements: List[Dict]) -> List[List[int]]:
-    """
-    Group consecutive violations into runs.
-    
-    A run of violations (like 1, 2, 3 appearing in sequence) is more likely
-    to be a list than a single violation.
-    """
-    if not violations:
-        return []
-    
-    runs = []
-    current_run = [violations[0][0]]
-    
-    for i in range(1, len(violations)):
-        prev_idx = violations[i - 1][0]
-        curr_idx = violations[i][0]
-        
-        # Check if these violations are close together in the element list
-        # (allowing for some content blocks in between)
-        gap = curr_idx - prev_idx
-        
-        if gap <= 3:  # Violations within 3 elements of each other
-            current_run.append(curr_idx)
-        else:
-            if len(current_run) >= 1:
-                runs.append(current_run)
-            current_run = [curr_idx]
-    
-    if current_run:
-        runs.append(current_run)
-    
-    return runs
-
-
 def demote_section_to_content(section: Dict) -> Dict:
     """
     Convert a section element back to an unassigned_text_block.
-    
-    The section number and topic become part of the content.
     ALL TEXT IS PRESERVED - nothing is deleted.
     """
     section_num = section.get('section_number', '')
     topic = section.get('topic', '')
     content = section.get('content', '')
     
-    # Reconstruct the original line
     text_parts = []
     if section_num:
         text_parts.append(section_num)
@@ -583,7 +391,7 @@ def demote_section_to_content(section: Dict) -> Dict:
         "content": full_content.strip(),
         "page_number": section.get('page_number'),
         "bbox": section.get('bbox'),
-        "_demoted_from_section": section_num,  # Track for debugging
+        "_demoted_from_section": section_num,
         "_original_topic": topic
     }
 
@@ -612,8 +420,7 @@ def merge_bboxes(bboxes: List[Dict]) -> Optional[Dict]:
 def attach_content_to_previous_section(elements: List[Dict]) -> List[Dict]:
     """
     Attach unassigned_text_blocks to the preceding section as content.
-    
-    This preserves the original section bbox (header position only).
+    Preserves the original section bbox.
     """
     if not elements:
         return elements
@@ -625,12 +432,10 @@ def attach_content_to_previous_section(elements: List[Dict]) -> List[Dict]:
         current = elements[i]
         
         if current.get('type') == 'section':
-            # Collect any following content blocks
             content_parts = []
             if current.get('content'):
                 content_parts.append(current['content'])
             
-            # Preserve original section bbox - don't merge with content
             original_bbox = current.get('bbox')
             
             j = i + 1
@@ -638,10 +443,9 @@ def attach_content_to_previous_section(elements: List[Dict]) -> List[Dict]:
                 content_parts.append(elements[j].get('content', ''))
                 j += 1
             
-            # Update section with merged content but keep original bbox
             section_copy = current.copy()
             section_copy['content'] = '\n\n'.join(p for p in content_parts if p)
-            section_copy['bbox'] = original_bbox  # Keep original header bbox
+            section_copy['bbox'] = original_bbox
             
             result.append(section_copy)
             i = j
@@ -656,14 +460,14 @@ def repair_sections(elements: List[Dict], confidence_threshold: float = 0.7) -> 
     """
     Main repair function: detect and fix section numbering violations.
     
-    Uses multiple strategies:
-    1. Transition analysis with high water mark tracking
-    2. List sequence detection (1, 2, 3 patterns)
-    3. Isolated simple number detection
-    4. Violation run grouping
+    Strategy:
+    1. Trust hierarchical sections (with dots) - they're almost always valid
+    2. Scrutinize simple numbers (no dots) - they're the source of errors
+    3. Track position in document to determine what's reasonable
+    4. Compare against last VALID section, not last seen
     
     Args:
-        elements: List of document elements (sections, text blocks, figures, tables)
+        elements: List of document elements
         confidence_threshold: Only repair violations with confidence >= this value
     
     Returns:
@@ -673,24 +477,19 @@ def repair_sections(elements: List[Dict], confidence_threshold: float = 0.7) -> 
         "total_sections_before": sum(1 for e in elements if e.get('type') == 'section'),
         "violations_found": 0,
         "list_sequences_found": 0,
-        "isolated_numbers_found": 0,
         "sections_demoted": 0,
         "violation_details": [],
         "list_sequences": []
     }
     
-    # Find individual violations using transition analysis with high water tracking
-    violations, high_water_at_index = find_violations(elements)
+    # Find violations using position tracking
+    violations = find_violations(elements)
     report["violations_found"] = len(violations)
     
-    # Find list sequences (1, 2, 3 patterns)
+    # Find list sequences
     list_sequences = detect_list_sequences(elements)
     report["list_sequences_found"] = len(list_sequences)
     report["list_sequences"] = list_sequences
-    
-    # Find isolated simple numbers that don't fit
-    isolated_numbers = detect_isolated_simple_numbers(elements, violations, high_water_at_index)
-    report["isolated_numbers_found"] = len(isolated_numbers)
     
     # Determine which indices to demote
     indices_to_demote = set()
@@ -699,7 +498,7 @@ def repair_sections(elements: List[Dict], confidence_threshold: float = 0.7) -> 
     for idx, analysis in violations:
         report["violation_details"].append({
             "index": idx,
-            "from": analysis.from_section.raw,
+            "from": analysis.from_section.raw if analysis.from_section else "",
             "to": analysis.to_section.raw,
             "type": analysis.violation_type,
             "confidence": analysis.confidence,
@@ -709,24 +508,14 @@ def repair_sections(elements: List[Dict], confidence_threshold: float = 0.7) -> 
         if analysis.confidence >= confidence_threshold:
             indices_to_demote.add(idx)
     
-    # Add all items from detected list sequences
+    # Add list sequences
     for sequence in list_sequences:
         for idx in sequence:
             indices_to_demote.add(idx)
     
-    # Add isolated simple numbers
-    indices_to_demote.update(isolated_numbers)
-    
-    # Also find runs of violations (adjacent violations are likely related)
-    runs = find_violation_runs(violations, elements)
-    for run in runs:
-        if len(run) >= 2:  # A run of 2+ violations is almost certainly related
-            for idx in run:
-                indices_to_demote.add(idx)
-    
     report["sections_demoted"] = len(indices_to_demote)
     
-    # Apply demotions - ALL TEXT IS PRESERVED
+    # Apply demotions
     repaired = []
     for i, element in enumerate(elements):
         if i in indices_to_demote:
@@ -735,7 +524,7 @@ def repair_sections(elements: List[Dict], confidence_threshold: float = 0.7) -> 
         else:
             repaired.append(element)
     
-    # Re-attach content to sections (preserving original bbox)
+    # Re-attach content to sections
     repaired = attach_content_to_previous_section(repaired)
     
     report["total_sections_after"] = sum(1 for e in repaired if e.get('type') == 'section')
@@ -756,7 +545,6 @@ def run_section_repair(input_path: str, output_path: str, confidence_threshold: 
     with open(input_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
     
-    # Handle both old and new format
     if isinstance(data, dict) and 'elements' in data:
         elements = data.get('elements', [])
         page_metadata = data.get('page_metadata', {})
@@ -768,26 +556,21 @@ def run_section_repair(input_path: str, output_path: str, confidence_threshold: 
     
     print(f"  - Found {len(elements)} elements")
     
-    # Run repair
     repaired_elements, report = repair_sections(elements, confidence_threshold)
     
-    # Report results
     print(f"  - Sections before repair: {report['total_sections_before']}")
     print(f"  - Violations found: {report['violations_found']}")
     print(f"  - List sequences found: {report['list_sequences_found']}")
-    print(f"  - Isolated numbers found: {report['isolated_numbers_found']}")
     print(f"  - Sections demoted: {report['sections_demoted']}")
     print(f"  - Sections after repair: {report['total_sections_after']}")
     
     if report['violation_details']:
         print(f"  - Violation details:")
-        for v in report['violation_details'][:10]:  # Show first 10
-            reason = v.get('reason', v['type'])
-            print(f"      {v['from']} -> {v['to']}: {reason} (confidence: {v['confidence']:.2f})")
+        for v in report['violation_details'][:10]:
+            print(f"      {v['to']}: {v['type']} (conf: {v['confidence']:.2f}) - {v['reason']}")
         if len(report['violation_details']) > 10:
             print(f"      ... and {len(report['violation_details']) - 10} more")
     
-    # Save results
     if is_new_format:
         output_data = {
             "page_metadata": page_metadata,
@@ -815,10 +598,5 @@ if __name__ == '__main__':
     else:
         print("Usage: python section_repair_agent.py <input.json> <output.json> [confidence_threshold]")
         print("")
-        print("This tool validates section numbering and demotes false positives (like list items)")
+        print("This tool validates section numbering and demotes false positives")
         print("back to content blocks. All text is preserved - nothing is deleted.")
-        print("")
-        print("Arguments:")
-        print("  input.json           - File with organized sections (from section_processor)")
-        print("  output.json          - Output file with repaired sections")
-        print("  confidence_threshold - Only fix violations with confidence >= this (default: 0.7)")
