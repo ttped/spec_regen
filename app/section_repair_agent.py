@@ -204,7 +204,7 @@ def analyze_transition(
     
     # ==========================================================================
     # Rule 4: Check depth jumps (going too deep too fast)
-    # BUT: Sections with depth >= 3 (like 5.1.1) are almost certainly real
+    # BUT: Sections with high depth (like 4.2.2.2.1) are almost certainly real
     # because people don't accidentally type multiple dots
     # ==========================================================================
     depth_change = curr_depth - prev_depth
@@ -213,23 +213,28 @@ def analyze_transition(
         # Jumping more than one level deeper is suspicious
         # e.g., 1.1 -> 1.1.1.1 (skipped 1.1.1)
         
-        # EXCEPTION: If the current section has depth >= 3, it's likely real
-        # Nobody accidentally types "5.1.1" - that's intentional
+        # EXCEPTION: High-depth sections are almost always real
+        # Nobody accidentally types "4.2.2.2.1" - that's intentional
         if curr_depth >= 3:
             # Check if the major section is progressing logically
             if curr_major == prev_major or curr_major == prev_major + 1:
-                # This looks valid: 4.6 -> 5.1.1 or 5 -> 5.1.1 after 5 was missed
-                # Don't flag it
+                # This looks valid - don't flag it
+                # e.g., 4.6 -> 5.1.1 or 5 -> 5.1.1 (after 5.1 was OCR'd as $.1)
+                pass
+            elif curr_depth >= 4:
+                # Very deep sections (depth 4+) like 4.2.2.2 are almost always valid
+                # Even if there's a major section change, trust it
                 pass
             else:
-                # Major section jump AND depth jump - more suspicious
+                # Major section jump AND depth jump, but only depth 3
+                # Still somewhat suspicious but lower confidence
                 analysis.is_valid = False
                 analysis.violation_type = "depth_jump"
-                analysis.confidence = 0.6  # Lower confidence since deep sections are usually real
+                analysis.confidence = 0.5  # Low confidence - likely still valid
                 analysis.reason = f"Depth jump of {depth_change} levels with major section change"
                 return analysis
         else:
-            # Shallow section with depth jump - more suspicious
+            # Shallow section (depth 1-2) with depth jump - more suspicious
             analysis.is_valid = False
             analysis.violation_type = "depth_jump"
             analysis.confidence = 0.7
@@ -268,21 +273,26 @@ def analyze_transition(
 
 def find_violations(
     elements: List[Dict],
-    high_water_tracking: bool = True
+    high_water_tracking: bool = True,
+    max_realistic_section: int = 50
 ) -> Tuple[List[Tuple[int, TransitionAnalysis]], Dict[int, int]]:
     """
     Scan through sections and identify potentially invalid transitions.
     
     Uses high water mark tracking to catch jumps like 3.1 -> 8.
+    Compares against the LAST VALID section to prevent cascade errors.
     
     Args:
         elements: List of document elements
         high_water_tracking: If True, track the highest major section seen
+        max_realistic_section: Maximum realistic major section number (default 50).
+                               Numbers above this are almost certainly not real sections.
     
     Returns:
         Tuple of (violations list, high_water_at_index dict)
     """
     violations = []
+    violation_indices = set()  # Track which indices are violations
     high_water_at_index = {}  # Track high water mark at each index
     
     # Filter to just section elements
@@ -294,6 +304,8 @@ def find_violations(
     # Track state
     high_water_major = 0
     max_depth_seen = 0
+    last_valid_idx = None  # Track the last section that wasn't flagged as a violation
+    last_valid_num = None
     
     for i in range(len(section_elements)):
         curr_idx, curr_section = section_elements[i]
@@ -307,17 +319,50 @@ def find_violations(
         # Record high water at this index (before potential update)
         high_water_at_index[curr_idx] = high_water_major
         
+        # =======================================================================
+        # Pre-check: Unrealistically large section numbers are almost always wrong
+        # Documents rarely go past 20-30 sections, let alone 100+
+        # =======================================================================
+        if curr_major is not None and curr_major > max_realistic_section:
+            analysis = TransitionAnalysis(
+                from_section=last_valid_num or SectionNumber(""),
+                to_section=curr_num,
+                is_valid=False,
+                violation_type="unrealistic_section_number",
+                confidence=0.95,
+                reason=f"Section {curr_major} exceeds realistic maximum ({max_realistic_section})"
+            )
+            violations.append((curr_idx, analysis))
+            violation_indices.add(curr_idx)
+            continue  # Don't update any state for this
+        
         if i == 0:
             # First section - establish baseline
             if curr_major is not None:
                 high_water_major = curr_major
                 max_depth_seen = curr_num.depth
+            last_valid_idx = i
+            last_valid_num = curr_num
             continue
         
-        prev_idx, prev_section = section_elements[i - 1]
-        prev_num = SectionNumber(prev_section.get('section_number', ''))
+        # =======================================================================
+        # Compare against LAST VALID section, not just the previous one
+        # This prevents cascade errors where a bad section causes good ones to fail
+        # =======================================================================
+        if last_valid_num is None:
+            # No valid section yet - use the immediate previous for comparison
+            prev_idx, prev_section = section_elements[i - 1]
+            prev_num = SectionNumber(prev_section.get('section_number', ''))
+        else:
+            prev_num = last_valid_num
         
         if not prev_num.is_valid:
+            # Still no valid previous - just accept this one
+            last_valid_idx = i
+            last_valid_num = curr_num
+            if curr_major is not None and curr_major > high_water_major:
+                high_water_major = curr_major
+            max_depth_seen = max(max_depth_seen, curr_num.depth)
             continue
         
         # Analyze transition with context
@@ -330,9 +375,12 @@ def find_violations(
         
         if not analysis.is_valid:
             violations.append((curr_idx, analysis))
+            violation_indices.add(curr_idx)
+            # Don't update last_valid - keep using the previous valid one
         else:
-            # Only update high water mark for VALID sections
-            # This prevents cascade errors
+            # This section is valid - update tracking state
+            last_valid_idx = i
+            last_valid_num = curr_num
             if curr_major is not None and curr_major > high_water_major:
                 high_water_major = curr_major
             max_depth_seen = max(max_depth_seen, curr_num.depth)
