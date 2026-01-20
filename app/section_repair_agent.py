@@ -7,12 +7,19 @@ which often indicates false positives (e.g., list items or table rows detected a
 Key principles:
 1. HIGH-DEPTH sections (with dots like 3.1.2) are almost always VALID - trust them
 2. SIMPLE numbers (no dots like "8" or "12") are the source of most errors
-3. Use "position tracking" - we know roughly where we are in the document
-4. A simple number is valid if it's the logical next major section (current_major + 1)
-5. A simple number is suspicious if it's far from our current position
+3. Use observation history to detect when position state has been corrupted
+4. A simple number alone should NOT update major section state with high confidence
+5. Multiple corroborating observations are needed to confirm a major section change
 
 The repair is conservative: when in doubt, leave it alone.
 All text is preserved - demoted sections become regular content blocks.
+
+IMPROVED APPROACH (v2):
+- Track observation history, not just current position
+- Single-digit sections have LOW confidence for updating major section
+- Hierarchical sections (3.1.2) have HIGH confidence
+- When many high-confidence sections contradict the position, reset position
+- Implements a "soft Kalman filter" where observations are weighted by confidence
 """
 
 import os
@@ -20,6 +27,7 @@ import json
 import re
 from typing import List, Dict, Tuple, Optional, Any, Set
 from dataclasses import dataclass, field
+from collections import deque
 
 
 @dataclass
@@ -90,22 +98,116 @@ class TransitionAnalysis:
 
 
 @dataclass
-class DocumentPosition:
-    """
-    Tracks our current "position" in the document structure.
-    Like a Kalman filter - we know roughly where we are.
-    """
-    current_major: int = 0  # The major section we're currently in (e.g., 3 for 3.1.2)
-    max_major_seen: int = 0  # Highest major section we've confidently seen
-    last_valid_section: Optional[SectionNumber] = None
+class Observation:
+    """A single observation of a section number with its confidence."""
+    section: SectionNumber
+    element_index: int
+    confidence: float  # How confident we are this is a real section
+    major: Optional[int] = None
     
-    def update(self, section: SectionNumber):
-        """Update position based on a validated section."""
-        major = section.get_major()
-        if major is not None:
-            self.current_major = major
-            self.max_major_seen = max(self.max_major_seen, major)
-        self.last_valid_section = section
+    def __post_init__(self):
+        self.major = self.section.get_major()
+
+
+@dataclass
+class DocumentPositionTracker:
+    """
+    Improved position tracker that uses observation history.
+    
+    Key insight: Position should be updated based on WEIGHTED observations,
+    not just the most recent one. A single "4" shouldn't override many "3.x.x" sections.
+    """
+    # History of ACCEPTED observations (not rejected ones)
+    observation_history: List[Observation] = field(default_factory=list)
+    
+    # Current estimated major section (weighted by observation confidence)
+    current_major: int = 0
+    
+    # Track what we've confidently seen
+    max_confident_major: int = 0
+    
+    # Recent observations for detecting contradictions
+    recent_window: int = 10  # Look at last N observations
+    
+    def add_observation(self, obs: Observation):
+        """Add an observation and update position estimate."""
+        self.observation_history.append(obs)
+        
+        if obs.major is None:
+            return
+            
+        # High-confidence observations (hierarchical sections) update position strongly
+        if obs.confidence >= 0.8:
+            self.current_major = obs.major
+            self.max_confident_major = max(self.max_confident_major, obs.major)
+        elif obs.confidence >= 0.5:
+            # Medium confidence: only update if it's a reasonable progression
+            if obs.major == self.current_major + 1 or obs.major == self.current_major:
+                self.current_major = obs.major
+                self.max_confident_major = max(self.max_confident_major, obs.major)
+        # Low confidence observations don't update position
+    
+    def get_recent_major_distribution(self) -> Dict[int, float]:
+        """
+        Get weighted distribution of major sections from recent observations.
+        This helps detect when we've strayed from the true position.
+        """
+        recent = self.observation_history[-self.recent_window:] if self.observation_history else []
+        
+        distribution = {}
+        for obs in recent:
+            if obs.major is not None:
+                if obs.major not in distribution:
+                    distribution[obs.major] = 0.0
+                distribution[obs.major] += obs.confidence
+        
+        return distribution
+    
+    def get_most_likely_major(self) -> int:
+        """
+        Get the most likely current major section based on recent observations.
+        Weighted by confidence.
+        """
+        dist = self.get_recent_major_distribution()
+        if not dist:
+            return self.current_major
+        
+        # Find the major with highest weighted count
+        return max(dist.items(), key=lambda x: x[1])[0]
+    
+    def detect_position_corruption(self) -> bool:
+        """
+        Detect if the current position seems corrupted.
+        
+        Signs of corruption:
+        - Many high-confidence observations at a different major than current_major
+        - Recent observations strongly disagree with current_major
+        """
+        dist = self.get_recent_major_distribution()
+        if not dist:
+            return False
+        
+        # If current_major has very low weight compared to another major
+        current_weight = dist.get(self.current_major, 0)
+        total_weight = sum(dist.values())
+        
+        if total_weight > 2:  # Need enough observations
+            # Find the dominant major
+            dominant_major = max(dist.items(), key=lambda x: x[1])[0]
+            dominant_weight = dist[dominant_major]
+            
+            # If dominant is different and much stronger
+            if dominant_major != self.current_major:
+                if dominant_weight > current_weight * 2 and dominant_weight > 1.5:
+                    return True
+        
+        return False
+    
+    def reset_to_likely_position(self):
+        """Reset position to the most likely major based on observations."""
+        likely = self.get_most_likely_major()
+        print(f"      [Position Reset] {self.current_major} -> {likely} (based on observation history)")
+        self.current_major = likely
     
     def is_reasonable_next_major(self, major: int) -> bool:
         """
@@ -125,9 +227,52 @@ class DocumentPosition:
         return abs(major - self.current_major)
 
 
+def calculate_section_confidence(section: SectionNumber) -> float:
+    """
+    Calculate how confident we are that this is a real section header.
+    
+    High confidence:
+    - Deep hierarchical numbers (3.1.2.1) - very unlikely to be list items
+    - Medium depth (3.1.2) - quite likely real
+    
+    Medium confidence:
+    - Shallow hierarchical (3.1) - could be outline or real
+    
+    Low confidence:
+    - Simple numbers (4) - could easily be list items
+    """
+    if not section.is_valid:
+        return 0.0
+    
+    major = section.get_major()
+    if major is None:
+        return 0.0
+    
+    depth = section.depth
+    
+    # Depth-based confidence
+    if depth >= 4:
+        return 0.95  # 3.1.2.1 - almost certainly real
+    elif depth == 3:
+        return 0.90  # 3.1.2 - very likely real
+    elif depth == 2:
+        return 0.80  # 3.1 - likely real
+    else:  # depth == 1 (simple number)
+        # Simple numbers are suspicious
+        # Smaller numbers are more suspicious (1, 2, 3 are common list items)
+        if major <= 3:
+            return 0.30  # Very suspicious
+        elif major <= 10:
+            return 0.40  # Suspicious
+        elif major <= 20:
+            return 0.35  # Suspicious (could be table row)
+        else:
+            return 0.20  # Very suspicious (large numbers are rarely real sections)
+
+
 def analyze_simple_number(
     curr: SectionNumber,
-    position: DocumentPosition
+    tracker: DocumentPositionTracker
 ) -> TransitionAnalysis:
     """
     Analyze a simple number (no dots) against our current position.
@@ -135,8 +280,10 @@ def analyze_simple_number(
     Simple numbers are the main source of false positives (list items, table rows).
     They're valid if they're the logical next major section.
     """
+    from_section = tracker.observation_history[-1].section if tracker.observation_history else SectionNumber("")
+    
     analysis = TransitionAnalysis(
-        from_section=position.last_valid_section or SectionNumber(""),
+        from_section=from_section,
         to_section=curr
     )
     
@@ -144,12 +291,16 @@ def analyze_simple_number(
     if curr_major is None:
         return analysis  # Can't analyze, assume valid
     
+    # Check for position corruption first
+    if tracker.detect_position_corruption():
+        tracker.reset_to_likely_position()
+    
     # Check if this is a reasonable progression
-    if position.is_reasonable_next_major(curr_major):
+    if tracker.is_reasonable_next_major(curr_major):
         return analysis  # Valid
     
     # Calculate how far off we are
-    distance = position.distance_from_current(curr_major)
+    distance = tracker.distance_from_current(curr_major)
     
     # Unrealistically large numbers (like 300, 502) are almost always wrong
     if curr_major > 50:
@@ -160,41 +311,51 @@ def analyze_simple_number(
         return analysis
     
     # Going backwards significantly is suspicious
-    if curr_major < position.current_major:
+    if curr_major < tracker.current_major:
+        # Check observation history - if we've seen many sections at the lower major,
+        # this might actually be valid
+        dist = tracker.get_recent_major_distribution()
+        lower_weight = dist.get(curr_major, 0)
+        
+        # If there's strong evidence we're actually at this lower major
+        if lower_weight > 1.5:
+            # This is probably valid - position was corrupted
+            return analysis
+        
         # How far back?
-        if curr_major <= 3 and position.current_major >= 3:
+        if curr_major <= 3 and tracker.current_major >= 3:
             # Small number (1, 2, 3) appearing after we're past section 3
             # This is likely a list item
             analysis.is_valid = False
             analysis.violation_type = "suspicious_reset"
             analysis.confidence = 0.90
-            analysis.reason = f"Reset to {curr_major} after reaching section {position.current_major}"
+            analysis.reason = f"Reset to {curr_major} after reaching section {tracker.current_major}"
             return analysis
         elif distance >= 3:
             # Going back 3+ sections is suspicious
             analysis.is_valid = False
             analysis.violation_type = "backwards_jump"
             analysis.confidence = 0.85
-            analysis.reason = f"Jump backwards from {position.current_major} to {curr_major}"
+            analysis.reason = f"Jump backwards from {tracker.current_major} to {curr_major}"
             return analysis
     
     # Jumping forward too much is suspicious
-    if curr_major > position.current_major + 1:
-        skip_count = curr_major - position.current_major - 1
+    if curr_major > tracker.current_major + 1:
+        skip_count = curr_major - tracker.current_major - 1
         
         if skip_count >= 5:
             # Skipping 5+ sections (e.g., 3 -> 9)
             analysis.is_valid = False
             analysis.violation_type = "large_forward_jump"
             analysis.confidence = 0.90
-            analysis.reason = f"Skipped {skip_count} sections: {position.current_major} to {curr_major}"
+            analysis.reason = f"Skipped {skip_count} sections: {tracker.current_major} to {curr_major}"
             return analysis
         elif skip_count >= 2:
             # Skipping 2-4 sections - suspicious but not certain
             analysis.is_valid = False
             analysis.violation_type = "forward_jump"
             analysis.confidence = 0.75
-            analysis.reason = f"Skipped {skip_count} sections: {position.current_major} to {curr_major}"
+            analysis.reason = f"Skipped {skip_count} sections: {tracker.current_major} to {curr_major}"
             return analysis
     
     return analysis  # Valid
@@ -202,16 +363,21 @@ def analyze_simple_number(
 
 def analyze_hierarchical_section(
     curr: SectionNumber,
-    position: DocumentPosition
+    tracker: DocumentPositionTracker
 ) -> TransitionAnalysis:
     """
     Analyze a hierarchical section (has dots, like 3.1.2).
     
     These are almost always valid because people don't accidentally type dots.
     We only flag obvious problems.
+    
+    IMPORTANT CHANGE: Hierarchical sections can CORRECT a corrupted position.
+    If we see many 3.x.x sections after "6", the 6 was probably wrong.
     """
+    from_section = tracker.observation_history[-1].section if tracker.observation_history else SectionNumber("")
+    
     analysis = TransitionAnalysis(
-        from_section=position.last_valid_section or SectionNumber(""),
+        from_section=from_section,
         to_section=curr
     )
     
@@ -229,33 +395,47 @@ def analyze_hierarchical_section(
         analysis.reason = f"Major section {curr_major} is unrealistically large"
         return analysis
     
+    # Check for position corruption BEFORE rejecting backwards sections
+    if tracker.detect_position_corruption():
+        tracker.reset_to_likely_position()
+    
     # Major section going backwards significantly
-    if curr_major < position.current_major - 1 and position.current_major >= 3:
-        # e.g., we're in section 5, and see 2.1.1
-        # This could be valid (document reorganization) but is suspicious
+    # BUT: be more lenient if this hierarchical section matches recent observations
+    if curr_major < tracker.current_major - 1 and tracker.current_major >= 3:
+        # Check if we have evidence that we're actually at this major
+        dist = tracker.get_recent_major_distribution()
+        curr_major_weight = dist.get(curr_major, 0)
+        current_weight = dist.get(tracker.current_major, 0)
+        
+        # If more evidence supports curr_major than current position
+        if curr_major_weight >= current_weight:
+            # This is probably valid - position was corrupted by false positives
+            return analysis  # Valid
+        
+        # Otherwise, this is suspicious
         analysis.is_valid = False
         analysis.violation_type = "backwards_major"
         analysis.confidence = 0.70  # Lower confidence - might be valid
-        analysis.reason = f"Major section {curr_major} after reaching {position.current_major}"
+        analysis.reason = f"Major section {curr_major} after reaching {tracker.current_major}"
         return analysis
     
     return analysis  # Valid - trust hierarchical sections
 
 
-def find_violations(elements: List[Dict]) -> List[Tuple[int, TransitionAnalysis]]:
+def find_violations(elements: List[Dict]) -> Tuple[List[Tuple[int, TransitionAnalysis]], DocumentPositionTracker]:
     """
     Scan through sections and identify potentially invalid ones.
     
-    Uses position tracking to determine if sections make sense in context.
-    Compares against the last VALID section, not just the previous one.
+    Uses position tracking with observation history to determine if sections make sense.
+    Returns both violations and the tracker for debugging.
     """
     violations = []
-    position = DocumentPosition()
+    tracker = DocumentPositionTracker()
     
     section_elements = [(i, s) for i, s in enumerate(elements) if s.get('type') == 'section']
     
     if not section_elements:
-        return violations
+        return violations, tracker
     
     for i, (idx, section) in enumerate(section_elements):
         curr_num = SectionNumber(section.get('section_number', ''))
@@ -263,25 +443,33 @@ def find_violations(elements: List[Dict]) -> List[Tuple[int, TransitionAnalysis]
         if not curr_num.is_valid:
             continue
         
+        # Calculate confidence for this section
+        confidence = calculate_section_confidence(curr_num)
+        
         if i == 0:
             # First section - establish baseline
-            position.update(curr_num)
+            obs = Observation(curr_num, idx, confidence)
+            tracker.add_observation(obs)
             continue
         
         # Analyze based on whether it has dots or not
         if curr_num.is_simple_number():
-            analysis = analyze_simple_number(curr_num, position)
+            analysis = analyze_simple_number(curr_num, tracker)
         else:
-            analysis = analyze_hierarchical_section(curr_num, position)
+            analysis = analyze_hierarchical_section(curr_num, tracker)
         
         if not analysis.is_valid:
             violations.append((idx, analysis))
-            # Don't update position - this section is suspect
+            # Don't add to observation history - this section is suspect
+            # BUT we do create a low-confidence observation for tracking purposes
+            obs = Observation(curr_num, idx, confidence * 0.1)  # Very low confidence
+            tracker.add_observation(obs)
         else:
-            # Valid section - update our position
-            position.update(curr_num)
+            # Valid section - add to observation history
+            obs = Observation(curr_num, idx, confidence)
+            tracker.add_observation(obs)
     
-    return violations
+    return violations, tracker
 
 
 def detect_list_sequences(elements: List[Dict]) -> List[List[int]]:
@@ -362,6 +550,116 @@ def detect_list_sequences(elements: List[Dict]) -> List[List[int]]:
         i += 1
     
     return list_sequences
+
+
+def detect_false_positive_chains(elements: List[Dict], tracker: DocumentPositionTracker) -> Set[int]:
+    """
+    Detect chains of false positive simple numbers that corrupted the position.
+    
+    Pattern: Section 3.2.1 -> [4] -> [5] -> [6] -> 3.2.3 (valid!)
+    The [4], [5], [6] are likely false positives that should be demoted.
+    
+    Strategy: 
+    1. Find sequences of consecutive simple numbers that "jump ahead"
+    2. Check if hierarchical sections continue at the previous major after the jump
+    3. If so, the simple numbers are likely false positives
+    
+    Key insight: If after 3.2.1 we see 4, 5, 6 then 3.2.3, the 4, 5, 6 are false positives
+    because real section 4 wouldn't be followed by 3.2.3.
+    """
+    false_positives = set()
+    
+    section_elements = [(i, s) for i, s in enumerate(elements) if s.get('type') == 'section']
+    
+    if len(section_elements) < 5:
+        return false_positives
+    
+    # Pass 1: Find the "established" major section before any suspicious jumps
+    # by looking at hierarchical sections
+    established_majors = []  # List of (position_in_list, major, is_hierarchical)
+    
+    for i, (idx, section) in enumerate(section_elements):
+        num = SectionNumber(section.get('section_number', ''))
+        if not num.is_valid:
+            continue
+        
+        major = num.get_major()
+        if major is None:
+            continue
+        
+        established_majors.append((i, major, num.has_dots(), idx))
+    
+    # Pass 2: Look for pattern: hierarchical at major N, then simple numbers > N, then hierarchical at N again
+    i = 0
+    while i < len(established_majors) - 2:
+        pos_i, major_i, is_hier_i, idx_i = established_majors[i]
+        
+        if not is_hier_i:
+            i += 1
+            continue
+        
+        # Found a hierarchical section at major N
+        # Look for simple numbers that jump ahead
+        suspicious_simples = []
+        j = i + 1
+        
+        while j < len(established_majors):
+            pos_j, major_j, is_hier_j, idx_j = established_majors[j]
+            
+            if not is_hier_j and major_j > major_i:
+                # Simple number that jumped ahead of our established major
+                suspicious_simples.append((j, major_j, idx_j))
+                j += 1
+            elif is_hier_j and major_j == major_i:
+                # Found a hierarchical section back at our established major!
+                # The simple numbers between are likely false positives
+                if len(suspicious_simples) >= 1:
+                    # Mark all the suspicious simples as false positives
+                    for _, _, simple_idx in suspicious_simples:
+                        false_positives.add(simple_idx)
+                break
+            elif is_hier_j:
+                # Hierarchical at different major - reset
+                break
+            else:
+                j += 1
+        
+        i += 1
+    
+    # Pass 3: Additional heuristic - sequences of 3+ consecutive simple numbers
+    # that span multiple major sections are suspicious
+    consecutive_simples = []
+    
+    for i, (idx, section) in enumerate(section_elements):
+        num = SectionNumber(section.get('section_number', ''))
+        if not num.is_valid:
+            continue
+        
+        if num.is_simple_number():
+            consecutive_simples.append((idx, num.get_major()))
+        else:
+            # Check the consecutive sequence
+            if len(consecutive_simples) >= 3:
+                majors = [m for _, m in consecutive_simples]
+                # If they span 3+ different values (like 4, 5, 6), mark as suspicious
+                if max(majors) - min(majors) >= 2:
+                    # Check if context suggests these are false positives
+                    # Look at what comes after
+                    next_hier_major = None
+                    for k in range(i, min(i + 5, len(section_elements))):
+                        next_num = SectionNumber(section_elements[k][1].get('section_number', ''))
+                        if next_num.has_dots():
+                            next_hier_major = next_num.get_major()
+                            break
+                    
+                    # If next hierarchical is at a lower major, these are false positives
+                    if next_hier_major is not None and next_hier_major < max(majors):
+                        for simple_idx, _ in consecutive_simples:
+                            false_positives.add(simple_idx)
+            
+            consecutive_simples = []
+    
+    return false_positives
 
 
 def demote_section_to_content(section: Dict) -> Dict:
@@ -460,11 +758,12 @@ def repair_sections(elements: List[Dict], confidence_threshold: float = 0.7) -> 
     """
     Main repair function: detect and fix section numbering violations.
     
-    Strategy:
+    IMPROVED STRATEGY (v2):
     1. Trust hierarchical sections (with dots) - they're almost always valid
     2. Scrutinize simple numbers (no dots) - they're the source of errors
-    3. Track position in document to determine what's reasonable
-    4. Compare against last VALID section, not last seen
+    3. Track position with OBSERVATION HISTORY, not just current state
+    4. Detect when simple numbers have corrupted position and recover
+    5. Use confidence-weighted position updates
     
     Args:
         elements: List of document elements
@@ -477,19 +776,25 @@ def repair_sections(elements: List[Dict], confidence_threshold: float = 0.7) -> 
         "total_sections_before": sum(1 for e in elements if e.get('type') == 'section'),
         "violations_found": 0,
         "list_sequences_found": 0,
+        "false_positive_chains_found": 0,
         "sections_demoted": 0,
         "violation_details": [],
-        "list_sequences": []
+        "list_sequences": [],
+        "position_resets": 0
     }
     
-    # Find violations using position tracking
-    violations = find_violations(elements)
+    # Find violations using improved position tracking
+    violations, tracker = find_violations(elements)
     report["violations_found"] = len(violations)
     
     # Find list sequences
     list_sequences = detect_list_sequences(elements)
     report["list_sequences_found"] = len(list_sequences)
     report["list_sequences"] = list_sequences
+    
+    # Find false positive chains (simple numbers that corrupted position)
+    false_positive_chains = detect_false_positive_chains(elements, tracker)
+    report["false_positive_chains_found"] = len(false_positive_chains)
     
     # Determine which indices to demote
     indices_to_demote = set()
@@ -512,6 +817,10 @@ def repair_sections(elements: List[Dict], confidence_threshold: float = 0.7) -> 
     for sequence in list_sequences:
         for idx in sequence:
             indices_to_demote.add(idx)
+    
+    # Add false positive chains
+    for idx in false_positive_chains:
+        indices_to_demote.add(idx)
     
     report["sections_demoted"] = len(indices_to_demote)
     
@@ -561,6 +870,7 @@ def run_section_repair(input_path: str, output_path: str, confidence_threshold: 
     print(f"  - Sections before repair: {report['total_sections_before']}")
     print(f"  - Violations found: {report['violations_found']}")
     print(f"  - List sequences found: {report['list_sequences_found']}")
+    print(f"  - False positive chains found: {report['false_positive_chains_found']}")
     print(f"  - Sections demoted: {report['sections_demoted']}")
     print(f"  - Sections after repair: {report['total_sections_after']}")
     
@@ -600,3 +910,10 @@ if __name__ == '__main__':
         print("")
         print("This tool validates section numbering and demotes false positives")
         print("back to content blocks. All text is preserved - nothing is deleted.")
+        print("")
+        print("IMPROVEMENTS in v2:")
+        print("  - Uses observation history instead of just current position")
+        print("  - Simple numbers (4, 5, 6) have LOW confidence for position updates")
+        print("  - Hierarchical sections (3.1.2) have HIGH confidence")
+        print("  - Detects when position has been corrupted by false positives")
+        print("  - Can recover from corrupted position state")
