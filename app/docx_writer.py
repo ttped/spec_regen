@@ -155,6 +155,11 @@ def add_figure_caption(doc, text: str):
 def add_table_caption(doc, text: str):
     """
     Adds a true Word caption for a TABLE, which can be used for a Table of Tables.
+    
+    This uses the 'Table' SEQ field, which is separate from the 'Figure' SEQ field.
+    Word will track these separately, allowing you to generate both:
+    - Table of Figures (from Figure captions)
+    - Table of Tables (from Table captions)
     """
     p = doc.add_paragraph(style='Caption')
     p.add_run("Table ")
@@ -233,60 +238,49 @@ def add_title_page(doc, title_data: Dict):
         p_approval.alignment = WD_ALIGN_PARAGRAPH.CENTER
         
         # Check if we need to highlight the date in red
+        is_draft = 'DRAFT' in approval_date.upper() if approval_date else False
+        
         if approval_date and approval_date in approval_status:
-            # Split the approval status around the date
-            parts = approval_status.split(approval_date)
-            
-            # Add text before date
-            if parts[0]:
-                run_before = p_approval.add_run(parts[0])
-            
-            # Add date in red (especially for DRAFT)
-            run_date = p_approval.add_run(approval_date)
-            if 'DRAFT' in approval_date.upper() or 'TBD' in approval_date.upper():
-                run_date.font.color.rgb = RGBColor(255, 0, 0)  # Red
-                run_date.bold = True
-            
-            # Add text after date
-            if len(parts) > 1 and parts[1]:
-                run_after = p_approval.add_run(parts[1])
+            # Split the text around the date
+            parts = approval_status.split(approval_date, 1)
+            if len(parts) == 2:
+                p_approval.add_run(parts[0])
+                date_run = p_approval.add_run(approval_date)
+                if is_draft:
+                    date_run.font.color.rgb = RGBColor(255, 0, 0)
+                p_approval.add_run(parts[1])
+            else:
+                p_approval.add_run(approval_status)
         else:
-            # No date to highlight, just add the whole thing
             p_approval.add_run(approval_status)
     
     doc.add_paragraph()  # Spacing
     
-    # --- 3-5. Boxed Content (Distribution, Export Warning, Destruction) ---
-    boxed_content = []
-    
+    # --- 3-5. Distribution Statement Box ---
     distribution = title_data.get('distribution_statement', '')
-    if distribution:
-        boxed_content.append(distribution)
-    
     export_warning = title_data.get('export_warning', '')
-    if export_warning:
-        boxed_content.append(export_warning)
-    
     destruction = title_data.get('destruction_notice', '')
+    
+    box_content = []
+    if distribution:
+        box_content.append(distribution)
+    if export_warning:
+        box_content.append(export_warning)
     if destruction:
-        boxed_content.append(destruction)
+        box_content.append(destruction)
     
-    if boxed_content:
-        add_bordered_paragraph(doc, '\n\n'.join(boxed_content))
+    if box_content:
+        for text in box_content:
+            add_bordered_paragraph(doc, text)
     
-    doc.add_paragraph()  # Spacing after box
+    doc.add_paragraph()  # Spacing
     
     # --- 6. CONTROLLED BY entries ---
     controlled_by = title_data.get('controlled_by', [])
-    
-    # Handle both list and string formats
-    if isinstance(controlled_by, str) and controlled_by:
-        controlled_by = [controlled_by]
-    elif not isinstance(controlled_by, list):
-        controlled_by = []
-    
-    for entry in controlled_by:
-        if entry:
+    if controlled_by:
+        if isinstance(controlled_by, str):
+            controlled_by = [controlled_by]
+        for entry in controlled_by:
             p = doc.add_paragraph()
             run_label = p.add_run("CONTROLLED BY: ")
             run_label.bold = True
@@ -340,6 +334,7 @@ def add_field(paragraph, field_text: str):
 def add_caption(doc, text: str):
     """
     Adds a true Word caption to the document.
+    DEPRECATED: Use add_figure_caption() or add_table_caption() instead.
     """
     p = doc.add_paragraph(style='Caption')
     p.add_run("Figure ")
@@ -366,6 +361,10 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
     """
     Creates a .docx file from document elements.
     Handles 'section', 'unassigned_text_block', 'figure', and 'table' element types.
+    
+    Tables can be rendered either as:
+    - Structured Word tables (if table_data is present from LLM OCR)
+    - Images with Table captions (if no table_data, allowing Table of Tables)
     
     Section headings use Word's built-in Heading styles (for ToC support)
     but are configured to be bold + underlined.
@@ -442,35 +441,46 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
 
         elif element_type == "figure":
             image_filename = element.get("export", {}).get("image_file")
+            caption_name = element.get('asset_id', 'Untitled Figure')
+            
             if image_filename:
                 image_path = os.path.join(figures_image_folder, image_filename)
                 if os.path.exists(image_path):
                     doc.add_picture(image_path, width=Inches(6.0))
-                    caption_name = element.get('asset_id', 'Untitled Figure')
                     add_figure_caption(doc, caption_name)
                 else:
                     p_error = doc.add_paragraph()
-                    p_error.add_run(f"[Image not found: {image_filename}]").italic = True
+                    p_error.add_run(f"[Figure image not found: {image_filename}]").italic = True
+                    add_figure_caption(doc, caption_name)
+            else:
+                p_error = doc.add_paragraph()
+                p_error.add_run(f"[Figure has no image file]").italic = True
+                add_figure_caption(doc, caption_name)
         
         elif element_type == "table":
             caption_name = element.get('asset_id', 'Untitled Table')
             table_data = element.get("table_data")
+            image_filename = element.get("export", {}).get("image_file")
 
             if table_data:
+                # Render as structured Word table
                 add_docx_table_from_data(doc, table_data)
+                add_table_caption(doc, caption_name)
+            elif image_filename:
+                # Render as image with Table caption (for Table of Tables)
+                image_path = os.path.join(figures_image_folder, image_filename)
+                if os.path.exists(image_path):
+                    doc.add_picture(image_path, width=Inches(6.0))
+                    add_table_caption(doc, caption_name)
+                else:
+                    p_error = doc.add_paragraph()
+                    p_error.add_run(f"[Table image not found: {image_filename}]").italic = True
+                    add_table_caption(doc, caption_name)
             else:
-                image_filename = element.get("export", {}).get("image_file")
+                # No table_data and no image - just add caption as placeholder
                 p_placeholder = doc.add_paragraph()
-                run = p_placeholder.add_run(
-                    f"[Table '{caption_name}' inserted as image. Structured data not found.]"
-                )
-                run.italic = True
-                if image_filename:
-                    image_path = os.path.join(figures_image_folder, image_filename)
-                    if os.path.exists(image_path):
-                        doc.add_picture(image_path, width=Inches(6.0))
-            
-            add_table_caption(doc, caption_name)
+                p_placeholder.add_run(f"[Table content not available]").italic = True
+                add_table_caption(doc, caption_name)
 
     doc.save(output_filename)
 

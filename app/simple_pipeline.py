@@ -7,7 +7,7 @@ Pipeline Steps:
 3. structure - Parse sections from content pages (preserving original page numbers)
 4. repair    - Validate section numbering and demote false positives (lists, tables)
 5. assets    - Integrate figures/tables at correct positions based on bbox
-6. tables    - OCR any table images into structured data
+6. tables    - OCR any table images into structured data (or skip with --no-table-ocr)
 7. write     - Generate final DOCX
 
 Usage:
@@ -15,6 +15,7 @@ Usage:
     python simple_pipeline.py --step classify
     python simple_pipeline.py --step structure --header-threshold 600
     python simple_pipeline.py --step repair --repair-confidence 0.7
+    python simple_pipeline.py --step all --no-table-ocr  # Skip LLM table OCR, use images
 """
 
 import os
@@ -25,7 +26,7 @@ from typing import List, Optional
 
 # Import pipeline components
 try:
-    from classify_agent import run_classification_on_file, load_content_start_page
+    from classify_agent import run_classification_on_file, load_content_start_page, load_classification_result
     from title_agent import extract_title_page_info
     from section_repair_agent import run_section_repair
     from asset_processor import run_asset_integration
@@ -174,6 +175,12 @@ def main():
         action="store_true",
         help="Skip the section repair step (useful for debugging)"
     )
+    parser.add_argument(
+        "--no-table-ocr",
+        action="store_true",
+        help="Skip LLM OCR for tables. Tables will be rendered as images in the final document. "
+             "This still preserves Table captions (separate from Figure captions) for Table of Tables support."
+    )
     
     args = parser.parse_args()
     os.makedirs(args.results_dir, exist_ok=True)
@@ -208,18 +215,37 @@ def main():
         if args.step in ["classify", "all"]:
             print("\n[Step 1: Classify]")
             run_classification_on_file(raw_input, classify_out, llm_config, max_workers=args.max_workers)
+            
+            # Check for stub documents
+            classification_result = load_classification_result(classify_out)
+            if classification_result and classification_result.get('is_stub'):
+                print(f"  - STUB DOCUMENT: Redirects to '{classification_result.get('stub_redirect')}'")
+                print(f"  - Skipping remaining steps for this document.")
+                continue
 
         # ========== STEP 2: TITLE ==========
         if args.step in ["title", "all"]:
             print("\n[Step 2: Title Extraction]")
-            extract_title_from_first_page(raw_input, title_out, llm_config)
+            
+            # Check document type - skip title extraction if no title page
+            classification_result = load_classification_result(classify_out)
+            doc_type = classification_result.get('document_type', 'unknown') if classification_result else 'unknown'
+            
+            if doc_type == 'no_title':
+                print(f"  - Document has no title page (content starts on page 1). Skipping title extraction.")
+                # Create empty title file
+                os.makedirs(os.path.dirname(title_out) or '.', exist_ok=True)
+                with open(title_out, 'w') as f:
+                    json.dump([], f)
+            else:
+                extract_title_from_first_page(raw_input, title_out, llm_config)
 
         # ========== STEP 3: STRUCTURE ==========
         if args.step in ["structure", "all"]:
             print("\n[Step 3: Structure/Section Detection]")
             
             # Load content start page from classification result
-            content_start_page = load_content_start_page(classify_out, default=2)
+            content_start_page = load_content_start_page(classify_out, default=1)
             print(f"  - Using content start page: {content_start_page}")
             
             # Process sections, skipping ToC pages
@@ -274,6 +300,10 @@ def main():
         # ========== STEP 6: TABLES ==========
         if args.step in ["tables", "all"]:
             print("\n[Step 6: Table OCR Processing]")
+            
+            if args.no_table_ocr:
+                print("  - LLM table OCR disabled (--no-table-ocr). Tables will render as images.")
+            
             # Prefer file with assets, fall back through the chain
             if os.path.exists(with_assets_out):
                 input_for_tables = with_assets_out
@@ -293,7 +323,8 @@ def main():
                     tables_out, 
                     args.figures_dir, 
                     stem, 
-                    llm_config
+                    llm_config,
+                    use_llm_ocr=not args.no_table_ocr  # Pass the flag
                 )
 
         # ========== STEP 7: WRITE DOCX ==========
