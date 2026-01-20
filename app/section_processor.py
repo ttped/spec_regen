@@ -135,11 +135,20 @@ def split_topic_at_period(text: str) -> Tuple[str, str]:
     return text.strip(), ""
 
 
-def check_if_paragraph_is_header(line_text: str) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
+def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
     """
     Checks if a line of text is a section header using regex and heuristics.
+    
+    Args:
+        line_text: The text line to check
+        debug: If True, print why a line was rejected
+    
+    Returns:
+        Tuple of (is_header, section_number, topic, remainder)
     """
+    # Primary regex: number followed by space and text
     match = re.match(r'^\s*([a-zA-Z0-9\.]+)\s+(.+)', line_text)
+    # Secondary regex: just a number alone on the line
     match_no_title = re.match(r'^\s*([a-zA-Z0-9\.]+)\s*$', line_text)
     
     if match:
@@ -148,39 +157,66 @@ def check_if_paragraph_is_header(line_text: str) -> Tuple[bool, Optional[str], O
         potential_num = match_no_title.group(1)
         full_topic = ""
     else:
+        if debug:
+            print(f"      [DEBUG] Rejected (no regex match): '{line_text[:50]}...'")
         return False, None, None, None
 
-    # Heuristics
+    # Heuristics to filter out false positives
+    
+    # 1. Reject if topic starts with a month (likely a date)
     MONTHS = [
         'january', 'february', 'march', 'april', 'may', 'june', 
         'july', 'august', 'september', 'october', 'november', 'december'
     ]
     if full_topic and any(full_topic.lower().startswith(m) for m in MONTHS):
+        if debug:
+            print(f"      [DEBUG] Rejected (month name): '{potential_num}' '{full_topic[:30]}'")
         return False, None, None, None
 
+    # 2. Must contain at least one digit
     if not any(c.isdigit() for c in potential_num):
+        if debug:
+            print(f"      [DEBUG] Rejected (no digits): '{potential_num}'")
         return False, None, None, None
 
+    # 3. Too many alpha characters (likely a word, not a section number)
     if sum(c.isalpha() for c in potential_num) > 2:
+        if debug:
+            print(f"      [DEBUG] Rejected (too many alpha chars): '{potential_num}'")
         return False, None, None, None
         
+    # 4. Too long to be a section number
     if len(potential_num) > 20:
+        if debug:
+            print(f"      [DEBUG] Rejected (too long): '{potential_num}'")
         return False, None, None, None
 
+    # 5. Pure alpha (no digits) - already caught by rule 2, but explicit
     if potential_num.isalpha():
+        if debug:
+            print(f"      [DEBUG] Rejected (pure alpha): '{potential_num}'")
         return False, None, None, None
 
+    # 6. Pure digits but too many (like a year or ID number)
     if potential_num.isdigit() and len(potential_num) > 3:
+        if debug:
+            print(f"      [DEBUG] Rejected (pure digits > 3 chars): '{potential_num}'")
         return False, None, None, None
 
+    # 7. Mixed alpha+digit without dots (like "A1" or "B2" - not section numbers)
     has_alpha = any(c.isalpha() for c in potential_num)
     has_digit = any(c.isdigit() for c in potential_num)
     has_dot = '.' in potential_num
     if has_alpha and has_digit and not has_dot:
+        if debug:
+            print(f"      [DEBUG] Rejected (mixed alpha+digit, no dot): '{potential_num}'")
         return False, None, None, None
 
     section_num = potential_num.strip().rstrip('.')
     topic, remainder = split_topic_at_period(full_topic)
+    
+    if debug:
+        print(f"      [DEBUG] ACCEPTED: section='{section_num}' topic='{topic[:30] if topic else ''}...'")
     
     return True, section_num, topic.strip(), remainder.strip()
 
