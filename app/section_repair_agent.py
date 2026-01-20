@@ -227,9 +227,118 @@ class DocumentPositionTracker:
         return abs(major - self.current_major)
 
 
-def calculate_section_confidence(section: SectionNumber) -> float:
+def calculate_title_confidence(topic: str) -> float:
+    """
+    Calculate confidence based on whether the topic text looks like a real title.
+    
+    Real titles tend to be:
+    - Short (1-4 words is ideal)
+    - Noun phrases ("System Requirements", "Introduction")
+    - Not sentence-like
+    
+    False positives tend to be:
+    - Long (7+ words)
+    - Sentence-like ("The numbers in parenthesis refer to...")
+    - Start with articles or have conjunctions
+    
+    Returns a multiplier (0.0 to 1.0) to apply to the base confidence.
+    """
+    if not topic:
+        # Empty topic (just a section number) is valid
+        return 1.0
+    
+    # Clean up the topic
+    topic = topic.strip()
+    
+    # Count words (split on whitespace)
+    words = topic.split()
+    word_count = len(words)
+    
+    # === Word count based confidence ===
+    if word_count == 0:
+        word_confidence = 1.0
+    elif word_count <= 4:
+        word_confidence = 1.0  # Ideal length
+    elif word_count <= 6:
+        word_confidence = 0.85  # Slightly long but possible
+    elif word_count <= 8:
+        word_confidence = 0.65  # Suspicious - getting sentence-like
+    elif word_count <= 10:
+        word_confidence = 0.45  # Very suspicious
+    else:
+        word_confidence = 0.25  # Almost certainly not a title
+    
+    # === Sentence-like indicators ===
+    sentence_penalty = 1.0
+    
+    # Starts with common sentence starters (articles)
+    sentence_starters = ['the', 'a', 'an', 'this', 'that', 'these', 'those', 'it', 'there']
+    first_word = words[0].lower() if words else ""
+    if first_word in sentence_starters:
+        sentence_penalty *= 0.7
+    
+    # Contains sentence-like conjunctions/connectors mid-text
+    # These rarely appear in titles but often in sentences
+    sentence_connectors = ['that', 'which', 'where', 'when', 'because', 'since', 
+                          'although', 'however', 'therefore', 'furthermore',
+                          'refers', 'refer', 'shown', 'listed', 'described',
+                          'following', 'below', 'above']
+    topic_lower = topic.lower()
+    for connector in sentence_connectors:
+        # Check if connector appears as a word (not part of another word)
+        if re.search(r'\b' + connector + r'\b', topic_lower):
+            sentence_penalty *= 0.6
+            break  # Only apply once
+    
+    # Ends with prepositions (might be truncated sentence)
+    ending_preps = ['to', 'for', 'with', 'from', 'by', 'at', 'in', 'on', 'of']
+    last_word = words[-1].lower() if words else ""
+    if last_word in ending_preps and word_count > 3:
+        sentence_penalty *= 0.8
+    
+    # Contains parenthetical references like "(see section 4.2)"
+    if re.search(r'\([^)]*\)', topic):
+        sentence_penalty *= 0.7
+    
+    # Very long words or technical gibberish detection
+    # Titles usually have normal-length words
+    if words:
+        avg_word_len = sum(len(w) for w in words) / len(words)
+        if avg_word_len > 12:  # Unusually long average word length
+            sentence_penalty *= 0.8
+    
+    # === Positive indicators (boost confidence) ===
+    title_boost = 1.0
+    
+    # All caps or title case is common for section headers
+    if topic.isupper() or topic.istitle():
+        title_boost = 1.1  # Small boost
+    
+    # Common section title words
+    title_keywords = ['introduction', 'scope', 'requirements', 'overview', 'summary',
+                     'description', 'specification', 'interface', 'design', 'test',
+                     'verification', 'validation', 'general', 'system', 'software',
+                     'hardware', 'performance', 'functional', 'applicable', 'documents',
+                     'definitions', 'acronyms', 'abbreviations', 'references', 'appendix']
+    for keyword in title_keywords:
+        if keyword in topic_lower:
+            title_boost = min(title_boost * 1.1, 1.2)  # Cap at 1.2
+            break
+    
+    # Combine all factors
+    final_confidence = word_confidence * sentence_penalty * title_boost
+    
+    # Clamp to [0.1, 1.0] range (never completely zero out)
+    return max(0.1, min(1.0, final_confidence))
+
+
+def calculate_section_confidence(section: SectionNumber, topic: str = "") -> float:
     """
     Calculate how confident we are that this is a real section header.
+    
+    Combines two factors:
+    1. Depth-based confidence (hierarchical numbers are more trustworthy)
+    2. Title-based confidence (short, noun-phrase-like topics are more trustworthy)
     
     High confidence:
     - Deep hierarchical numbers (3.1.2.1) - very unlikely to be list items
@@ -252,22 +361,36 @@ def calculate_section_confidence(section: SectionNumber) -> float:
     
     # Depth-based confidence
     if depth >= 4:
-        return 0.95  # 3.1.2.1 - almost certainly real
+        depth_confidence = 0.95  # 3.1.2.1 - almost certainly real
     elif depth == 3:
-        return 0.90  # 3.1.2 - very likely real
+        depth_confidence = 0.90  # 3.1.2 - very likely real
     elif depth == 2:
-        return 0.80  # 3.1 - likely real
+        depth_confidence = 0.80  # 3.1 - likely real
     else:  # depth == 1 (simple number)
         # Simple numbers are suspicious
         # Smaller numbers are more suspicious (1, 2, 3 are common list items)
         if major <= 3:
-            return 0.30  # Very suspicious
+            depth_confidence = 0.30  # Very suspicious
         elif major <= 10:
-            return 0.40  # Suspicious
+            depth_confidence = 0.40  # Suspicious
         elif major <= 20:
-            return 0.35  # Suspicious (could be table row)
+            depth_confidence = 0.35  # Suspicious (could be table row)
         else:
-            return 0.20  # Very suspicious (large numbers are rarely real sections)
+            depth_confidence = 0.20  # Very suspicious (large numbers are rarely real sections)
+    
+    # Title-based confidence
+    title_confidence = calculate_title_confidence(topic)
+    
+    # Combine: use geometric mean to balance both factors
+    # But weight depth more heavily for hierarchical sections (they're reliable)
+    if depth >= 2:
+        # For hierarchical sections, title is less important (0.7 depth, 0.3 title)
+        combined = (depth_confidence ** 0.7) * (title_confidence ** 0.3)
+    else:
+        # For simple numbers, title matters more (0.5 depth, 0.5 title)
+        combined = (depth_confidence ** 0.5) * (title_confidence ** 0.5)
+    
+    return combined
 
 
 def analyze_simple_number(
@@ -439,12 +562,13 @@ def find_violations(elements: List[Dict]) -> Tuple[List[Tuple[int, TransitionAna
     
     for i, (idx, section) in enumerate(section_elements):
         curr_num = SectionNumber(section.get('section_number', ''))
+        topic = section.get('topic', '')
         
         if not curr_num.is_valid:
             continue
         
-        # Calculate confidence for this section
-        confidence = calculate_section_confidence(curr_num)
+        # Calculate confidence for this section (now includes title analysis)
+        confidence = calculate_section_confidence(curr_num, topic)
         
         if i == 0:
             # First section - establish baseline
