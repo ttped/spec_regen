@@ -204,17 +204,37 @@ def analyze_transition(
     
     # ==========================================================================
     # Rule 4: Check depth jumps (going too deep too fast)
+    # BUT: Sections with depth >= 3 (like 5.1.1) are almost certainly real
+    # because people don't accidentally type multiple dots
     # ==========================================================================
     depth_change = curr_depth - prev_depth
     
     if depth_change > 1:
         # Jumping more than one level deeper is suspicious
         # e.g., 1.1 -> 1.1.1.1 (skipped 1.1.1)
-        analysis.is_valid = False
-        analysis.violation_type = "depth_jump"
-        analysis.confidence = 0.7
-        analysis.reason = f"Depth jump of {depth_change} levels"
-        return analysis
+        
+        # EXCEPTION: If the current section has depth >= 3, it's likely real
+        # Nobody accidentally types "5.1.1" - that's intentional
+        if curr_depth >= 3:
+            # Check if the major section is progressing logically
+            if curr_major == prev_major or curr_major == prev_major + 1:
+                # This looks valid: 4.6 -> 5.1.1 or 5 -> 5.1.1 after 5 was missed
+                # Don't flag it
+                pass
+            else:
+                # Major section jump AND depth jump - more suspicious
+                analysis.is_valid = False
+                analysis.violation_type = "depth_jump"
+                analysis.confidence = 0.6  # Lower confidence since deep sections are usually real
+                analysis.reason = f"Depth jump of {depth_change} levels with major section change"
+                return analysis
+        else:
+            # Shallow section with depth jump - more suspicious
+            analysis.is_valid = False
+            analysis.violation_type = "depth_jump"
+            analysis.confidence = 0.7
+            analysis.reason = f"Depth jump of {depth_change} levels"
+            return analysis
     
     # ==========================================================================
     # Rule 5: Check for backwards progression at same depth
