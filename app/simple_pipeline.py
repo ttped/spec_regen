@@ -165,6 +165,12 @@ def main():
         help="Vertical (top) coordinate threshold for header filtering. Text above this value (less than) is dropped. Set to 0 to disable."
     )
     parser.add_argument(
+        "--footer-threshold",
+        type=int,
+        default=6100,
+        help="Vertical (top) coordinate threshold for footer filtering. Text below this value (greater than) is dropped. Set to 0 to disable."
+    )
+    parser.add_argument(
         "--repair-confidence",
         type=float,
         default=0.7,
@@ -253,7 +259,8 @@ def main():
                 raw_input, 
                 organized_out, 
                 content_start_page=content_start_page,
-                header_top_threshold=args.header_threshold
+                header_top_threshold=args.header_threshold,
+                footer_top_threshold=args.footer_threshold
             )
 
         # ========== STEP 4: REPAIR ==========

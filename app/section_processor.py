@@ -345,7 +345,8 @@ def run_section_processing_on_file(
     input_path: str, 
     output_path: str, 
     content_start_page: int = 1,
-    header_top_threshold: int = 0
+    header_top_threshold: int = 0,
+    footer_top_threshold: int = 0
 ):
     """
     Main execution function - processes raw OCR file into organized sections with bbox metadata.
@@ -355,11 +356,14 @@ def run_section_processing_on_file(
         output_path: Path to save the organized sections JSON.
         content_start_page: The page number where actual content begins (skips ToC).
         header_top_threshold: Filter out lines where bbox['top'] < this value (0 to disable).
+        footer_top_threshold: Filter out lines where bbox['top'] > this value (0 to disable).
     """
     print(f"  - Loading raw OCR from: {input_path}")
     print(f"  - Content starts at page: {content_start_page}")
     if header_top_threshold > 0:
         print(f"  - Filtering headers: Dropping text with Top position < {header_top_threshold}")
+    if footer_top_threshold > 0:
+        print(f"  - Filtering footers: Dropping text with Top position > {footer_top_threshold}")
     
     pages_to_process = load_raw_ocr_pages(input_path)
     
@@ -385,6 +389,7 @@ def run_section_processing_on_file(
     all_page_metadata = {}
     raw_elements = []
     dropped_header_lines = 0
+    dropped_footer_lines = 0
     
     for page_id, page_dict, page_meta in content_pages:
         if page_meta:
@@ -403,6 +408,13 @@ def run_section_processing_on_file(
             if header_top_threshold > 0 and line_bbox:
                 if line_bbox.get('top', 9999) < header_top_threshold:
                     dropped_header_lines += 1
+                    continue
+            # ---------------------
+            
+            # --- FOOTER FILTER ---
+            if footer_top_threshold > 0 and line_bbox:
+                if line_bbox.get('top', 0) > footer_top_threshold:
+                    dropped_footer_lines += 1
                     continue
             # ---------------------
 
@@ -451,6 +463,8 @@ def run_section_processing_on_file(
     print(f"  - Extracted {len(final_elements)} elements ({section_count} sections).")
     if header_top_threshold > 0:
         print(f"  - Filtered out {dropped_header_lines} header lines (Top < {header_top_threshold}).")
+    if footer_top_threshold > 0:
+        print(f"  - Filtered out {dropped_footer_lines} footer lines (Top > {footer_top_threshold}).")
     print(f"  - Results saved to {output_path}")
 
 
@@ -461,7 +475,14 @@ if __name__ == '__main__':
         input_file = sys.argv[1]
         output_file = sys.argv[2] if len(sys.argv) > 2 else "output_organized.json"
         start_page = int(sys.argv[3]) if len(sys.argv) > 3 else 1
-        threshold = int(sys.argv[4]) if len(sys.argv) > 4 else 0
-        run_section_processing_on_file(input_file, output_file, content_start_page=start_page, header_top_threshold=threshold)
+        header_thresh = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+        footer_thresh = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+        run_section_processing_on_file(
+            input_file, 
+            output_file, 
+            content_start_page=start_page, 
+            header_top_threshold=header_thresh,
+            footer_top_threshold=footer_thresh
+        )
     else:
-        print("Usage: python section_processor.py <input.json> [output.json] [content_start_page] [header_threshold]")
+        print("Usage: python section_processor.py <input.json> [output.json] [content_start_page] [header_threshold] [footer_threshold]")
