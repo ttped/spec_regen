@@ -82,11 +82,21 @@ MEASUREMENT_CONTEXT_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+# Pattern for "intentionally left blank" pages
+BLANK_PAGE_PATTERN = re.compile(
+    r'\b(?:THIS\s+PAGE\s+)?INTENTIONALLY\s+LEFT\s+BLANK\b',
+    re.IGNORECASE
+)
+
 # Minimum threshold for section numbers to auto-classify as TOC
 MIN_SECTION_NUMBERS_FOR_TOC = 10
 
 # Minimum threshold for TOC-style entries
 MIN_TOC_ENTRIES_FOR_TOC = 8
+
+# Minimum periods (dot leaders) to suggest TOC even without section numbers
+# OCR often mangles these: "......" becomes "....eee..cc.c....e..."
+MIN_PERIODS_FOR_TOC_HINT = 40
 
 
 def fast_classify_page(page_text: str) -> Optional[str]:
@@ -96,15 +106,29 @@ def fast_classify_page(page_text: str) -> Optional[str]:
     Returns:
         - "TABLE_OF_CONTENTS" if high confidence TOC detected
         - "TITLE_PAGE" if high confidence title page detected
+        - "BLANK_PAGE" if intentionally blank page detected
         - None if uncertain (fall back to LLM)
     
     This function is designed to be CONSERVATIVE - it only returns a 
     classification when very confident. Uncertain cases go to the LLM.
     """
-    if not page_text or len(page_text) < 50:
+    if not page_text or len(page_text) < 20:
         return None
     
     text_upper = page_text.upper()
+    word_count = len(page_text.split())
+    
+    # ==========================================================================
+    # Check for "Intentionally Left Blank" pages FIRST (quick check)
+    # ==========================================================================
+    if BLANK_PAGE_PATTERN.search(page_text):
+        # Confirm it's actually a mostly-blank page (low word count)
+        if word_count <= 30:
+            return "BLANK_PAGE"
+    
+    # Very short pages without the explicit marker - let LLM decide
+    if len(page_text) < 50:
+        return None
     
     # ==========================================================================
     # Check for Table of Contents (most reliable fast-path)
@@ -135,11 +159,17 @@ def fast_classify_page(page_text: str) -> Optional[str]:
     measurement_matches = MEASUREMENT_CONTEXT_PATTERN.findall(page_text)
     has_many_measurements = len(measurement_matches) > 5
     
+    # Count periods - dot leaders in TOC are often mangled by OCR
+    # "1.1 SCOPE .............. 5" becomes various garbled versions
+    period_count = page_text.count('.')
+    has_many_periods = period_count >= MIN_PERIODS_FOR_TOC_HINT
+    
     # Decision logic for TOC:
     # 1. Many unique section numbers (10+) AND not dominated by measurements → definitely TOC
     # 2. TOC header + several section numbers (5+) → definitely TOC  
     # 3. Many TOC-style entries (8+) → definitely TOC
-    # 4. List of Figures/Tables header → likely TOC (but let LLM confirm for edge cases)
+    # 4. List of Figures/Tables header with numbered items → TOC
+    # 5. FALLBACK: Many periods (dot leaders) + TOC header → likely TOC even without section numbers
     
     if len(unique_section_numbers) >= MIN_SECTION_NUMBERS_FOR_TOC and not has_many_measurements:
         return "TABLE_OF_CONTENTS"
@@ -157,6 +187,16 @@ def fast_classify_page(page_text: str) -> Optional[str]:
         fig_tab_numbers = re.findall(r'\b(?:Figure|Table|Fig\.?)\s*\d+', page_text, re.IGNORECASE)
         if len(fig_tab_numbers) >= 5:
             return "TABLE_OF_CONTENTS"
+    
+    # FALLBACK: Dot leader detection for TOC pages where OCR missed section numbers
+    # If we have TOC header + lots of periods, it's probably a TOC even without parsed numbers
+    if has_toc_header and has_many_periods:
+        return "TABLE_OF_CONTENTS"
+    
+    # Even without header, if we have LOTS of periods (80+) and some section-like patterns
+    # This catches TOC pages where the header was on a previous page
+    if period_count >= 80 and len(unique_section_numbers) >= 3:
+        return "TABLE_OF_CONTENTS"
     
     # ==========================================================================
     # Check for obvious Title Page characteristics  
@@ -253,6 +293,13 @@ def get_fast_classification_reason(page_text: str) -> str:
     Returns a human-readable reason for the fast classification.
     Used for debugging/logging.
     """
+    word_count = len(page_text.split())
+    period_count = page_text.count('.')
+    
+    # Check for blank page first
+    if BLANK_PAGE_PATTERN.search(page_text) and word_count <= 30:
+        return f"'Intentionally left blank' + low word count ({word_count})"
+    
     section_numbers = SECTION_NUMBER_PATTERN.findall(page_text)
     
     # Apply same filtering as fast_classify_page
@@ -282,6 +329,13 @@ def get_fast_classification_reason(page_text: str) -> str:
         fig_tab_numbers = re.findall(r'\b(?:Figure|Table|Fig\.?)\s*\d+', page_text, re.IGNORECASE)
         if len(fig_tab_numbers) >= 5:
             return f"List of Figures/Tables header + {len(fig_tab_numbers)} items"
+    
+    # Dot leader fallback
+    if has_toc_header and period_count >= MIN_PERIODS_FOR_TOC_HINT:
+        return f"TOC header + {period_count} periods (dot leaders)"
+    
+    if period_count >= 80 and len(unique_section_numbers) >= 3:
+        return f"{period_count} periods + {len(unique_section_numbers)} section numbers"
     
     return "No fast-path match"
 
@@ -665,6 +719,7 @@ def analyze_page_sequence(page_classifications: List[Dict]) -> Dict[str, Any]:
     - Standard: TITLE -> TOC -> CONTENT
     - No ToC: TITLE -> CONTENT
     - No Title: CONTENT starts on page 1
+    - Blank pages: Skip over them
     - Various edge cases
     """
     if not page_classifications:
@@ -675,6 +730,12 @@ def analyze_page_sequence(page_classifications: List[Dict]) -> Dict[str, Any]:
             "stub_redirect": None,
             "page_classifications": []
         }
+    
+    # Types that are "skippable" - not content, not significant for transitions
+    SKIPPABLE_TYPES = {'BLANK_PAGE'}
+    
+    # Types that come before content (title, TOC, etc.)
+    PRE_CONTENT_TYPES = {'TITLE_PAGE', 'TABLE_OF_CONTENTS', 'BLANK_PAGE', 'AMBIGUOUS'}
     
     # Check if page 1 is content (no title page case)
     first_page = page_classifications[0]
@@ -693,6 +754,14 @@ def analyze_page_sequence(page_classifications: List[Dict]) -> Dict[str, Any]:
         prev_type = page_classifications[i-1]['type']
         curr_type = page_classifications[i]['type']
         curr_page = page_classifications[i]['page']
+        
+        # Skip blank pages - look at what comes before them
+        if prev_type == 'BLANK_PAGE':
+            # Find the last non-blank type
+            for j in range(i-2, -1, -1):
+                if page_classifications[j]['type'] != 'BLANK_PAGE':
+                    prev_type = page_classifications[j]['type']
+                    break
         
         # Standard case: TOC -> CONTENT
         if prev_type == 'TABLE_OF_CONTENTS' and curr_type == 'CONTENT_BODY':
@@ -726,6 +795,17 @@ def analyze_page_sequence(page_classifications: List[Dict]) -> Dict[str, Any]:
                 "stub_redirect": None,
                 "page_classifications": page_classifications
             }
+        
+        # BLANK_PAGE -> CONTENT (blank page between front matter and content)
+        if prev_type == 'BLANK_PAGE' and curr_type == 'CONTENT_BODY':
+            print(f"  - Transition: Blank -> Content at page {curr_page}")
+            return {
+                "content_start_page": curr_page,
+                "document_type": "standard",
+                "is_stub": False,
+                "stub_redirect": None,
+                "page_classifications": page_classifications
+            }
     
     # Fallback: find the first CONTENT_BODY page
     for classification in page_classifications:
@@ -739,11 +819,11 @@ def analyze_page_sequence(page_classifications: List[Dict]) -> Dict[str, Any]:
                 "page_classifications": page_classifications
             }
     
-    # Last resort: if we only have TITLE/TOC/AMBIGUOUS, start after page 1
+    # Last resort: if we only have TITLE/TOC/AMBIGUOUS/BLANK, start after page 1
     # This handles cases where classification might have missed content pages
     if len(page_classifications) > 1:
         # Start at page 2 if page 1 looks like a title
-        if first_page['type'] in ('TITLE_PAGE', 'AMBIGUOUS'):
+        if first_page['type'] in PRE_CONTENT_TYPES:
             fallback_page = page_classifications[1]['page']
         else:
             fallback_page = first_page['page']
