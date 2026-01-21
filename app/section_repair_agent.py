@@ -880,60 +880,61 @@ def detect_sandwich_false_positives(elements: List[Dict]) -> Set[int]:
         return false_positives
     
     # ==========================================================================
-    # Pass 1: Detect sections sandwiched between hierarchical sections of same major
+    # Pass 1: Detect sections sandwiched between IMMEDIATE neighbors of same major
+    # This is now more conservative - only looks at immediate context
     # ==========================================================================
     for i in range(1, len(section_info) - 1):
         idx, num, depth, major, parts, raw = section_info[i]
-        
-        # Look backward for context (find the established major)
-        prev_majors = []
-        for j in range(i - 1, max(0, i - 8) - 1, -1):  # Look back up to 8 sections
-            prev_info = section_info[j]
-            if prev_info[2] >= 2:  # depth >= 2 (hierarchical)
-                prev_majors.append(prev_info[3])  # major
-        
-        # Look forward for context
-        next_majors = []
-        for j in range(i + 1, min(len(section_info), i + 8)):  # Look forward up to 8 sections
-            next_info = section_info[j]
-            if next_info[2] >= 2:  # depth >= 2 (hierarchical)
-                next_majors.append(next_info[3])  # major
-        
-        if not prev_majors or not next_majors:
-            continue
-        
-        # Get the dominant major before and after
-        prev_dominant = max(set(prev_majors), key=prev_majors.count) if prev_majors else None
-        next_dominant = max(set(next_majors), key=next_majors.count) if next_majors else None
-        
-        if prev_dominant is None or next_dominant is None:
-            continue
         
         # Skip if current section's major is None
         if major is None:
             continue
         
-        # Check if current section is OUT OF PLACE
-        # Case 1: prev and next are same major, but current is different
-        if prev_dominant == next_dominant and major != prev_dominant:
-            false_positives.add(idx)
+        # Get IMMEDIATE neighbors (more conservative than looking at 8)
+        prev_info = section_info[i - 1]
+        next_info = section_info[i + 1]
+        
+        prev_major = prev_info[3]
+        next_major = next_info[3]
+        prev_depth = prev_info[2]
+        next_depth = next_info[2]
+        
+        if prev_major is None or next_major is None:
             continue
         
-        # Case 2: prev and next are sequential (3 -> 4), but current doesn't fit
-        if next_dominant == prev_dominant + 1:
-            # We're at a transition point (e.g., end of section 3, start of section 4)
-            # Current should be either prev_dominant or next_dominant
-            if major != prev_dominant and major != next_dominant:
+        # Only flag if BOTH immediate neighbors are hierarchical AND same major
+        # AND current is different - this is a clear sandwich
+        if prev_depth >= 2 and next_depth >= 2:
+            if prev_major == next_major and major != prev_major:
+                # Extra validation: look one more step to confirm pattern
+                # This prevents flagging at legitimate transition boundaries
+                confirmed = False
+                
+                if i >= 2 and i < len(section_info) - 2:
+                    prev_prev_major = section_info[i - 2][3]
+                    next_next_major = section_info[i + 2][3]
+                    
+                    # If pattern is X, X, [current], X, X - definitely sandwiched
+                    if prev_prev_major == prev_major and next_next_major == next_major:
+                        confirmed = True
+                    # If pattern is X, X, [current], X, Y where Y = X+1, still likely sandwiched
+                    elif prev_prev_major == prev_major:
+                        confirmed = True
+                else:
+                    # At edges, trust the immediate neighbors
+                    confirmed = True
+                
+                if confirmed:
+                    false_positives.add(idx)
+                    continue
+        
+        # Case 2: Current major is WAY off (like 20 in the middle of section 3-5)
+        # Only flag if it's drastically out of range
+        if prev_depth >= 2 and next_depth >= 2:
+            expected_range = range(min(prev_major, next_major), max(prev_major, next_major) + 2)
+            if major not in expected_range and abs(major - prev_major) > 2 and abs(major - next_major) > 2:
                 false_positives.add(idx)
                 continue
-        
-        # Case 3: Current major is WAY off (like 20 in the middle of section 3)
-        if major > max(prev_dominant, next_dominant) + 2:
-            false_positives.add(idx)
-            continue
-        if major < min(prev_dominant, next_dominant) - 1 and major > 0:
-            false_positives.add(idx)
-            continue
     
     # ==========================================================================
     # Pass 2: Detect decimal-like section numbers that are contextually wrong
@@ -1045,7 +1046,9 @@ def detect_sandwich_false_positives(elements: List[Dict]) -> Set[int]:
                 false_positives.add(idx)
     
     # ==========================================================================
-    # Pass 4: Catch sequences of sandwiched items (3 -> 4 -> 5 between 3.x sections)
+    # Pass 4: Catch sequences of sandwiched items ONLY when they return to same major
+    # e.g., 3.1.1 -> [garbage] -> 3.1.2  (garbage is sandwiched)
+    # But NOT: 3.1.1 -> 4.1.1 -> 4.1.2 (this is legitimate progression)
     # ==========================================================================
     i = 0
     while i < len(section_info) - 2:
@@ -1061,9 +1064,14 @@ def detect_sandwich_false_positives(elements: List[Dict]) -> Set[int]:
             i += 1
             continue
         
-        # Collect consecutive non-matching sections
+        # Look ahead to see if we return to the same major after some interruption
+        # This catches: 3.1.1 -> [junk] -> 3.1.2
+        # But NOT: 3.1.1 -> 4.1.1 -> 4.1.2 (legitimate forward progress)
+        
         suspicious_sequence = []
+        found_return_to_start = False
         j = i + 1
+        
         while j < len(section_info):
             curr_info = section_info[j]
             curr_major = curr_info[3]
@@ -1074,23 +1082,40 @@ def detect_sandwich_false_positives(elements: List[Dict]) -> Set[int]:
                 j += 1
                 continue
             
-            # If it's a hierarchical section at the same major, check if sequence continues
+            # If we find a hierarchical section that RETURNS to start_major
+            # after seeing some non-matching sections, those are sandwiched
             if curr_depth >= 2 and curr_major == start_major:
-                # This might be the end of sandwich - check if it continues the sequence
                 if len(suspicious_sequence) > 0:
-                    # We had some suspicious sections - mark them
+                    # Verify that the suspicious sections are actually wrong
+                    # They should have different majors than start_major
                     for susp_info in suspicious_sequence:
-                        false_positives.add(susp_info[0])
+                        susp_major = susp_info[3]
+                        if susp_major != start_major:
+                            false_positives.add(susp_info[0])
+                    found_return_to_start = True
                 break
+            
+            # If we see a legitimate next major (start_major + 1) with hierarchy,
+            # that's normal document flow - STOP looking for sandwiches
             elif curr_depth >= 2 and curr_major == start_major + 1:
-                # Legitimate transition to next major section
+                # This is legitimate forward progress, not a sandwich situation
                 break
+            
+            # If we see a major MORE than +1 ahead, that's suspicious
+            # e.g., going from 3.x directly to 5.x
+            elif curr_depth >= 2 and curr_major > start_major + 1:
+                # Could be a problem, but don't mark as sandwich - let other passes handle
+                break
+            
             else:
-                # This section doesn't fit - might be sandwiched
-                suspicious_sequence.append(curr_info)
+                # Non-hierarchical or same major simple number - potentially sandwiched
+                # But only if we later return to start_major
+                if curr_major != start_major and curr_major != start_major + 1:
+                    suspicious_sequence.append(curr_info)
+            
             j += 1
         
-        i = max(i + 1, j)
+        i += 1
     
     return false_positives
 
@@ -1310,12 +1335,13 @@ def final_sequence_cleanup(elements: List[Dict]) -> Tuple[Set[int], List[Dict]]:
     """
     Final cleanup pass: simple sequential scan to catch any remaining out-of-sequence sections.
     
-    This is intentionally simple - just scan through and look for sections that don't fit
-    the flow. By this point, most false positives have been caught, so we're looking for
-    stragglers like:
-    - 2.5 appearing between 3.2.1 and 3.2.2
-    - 4.88 appearing in the middle of section 3 content
-    - Any section where the major jumps backward unexpectedly
+    This is intentionally CONSERVATIVE - only catches obvious misfits like:
+    - 2.5 appearing between 3.2.1 and 3.2.2 (same major on both sides, different in middle)
+    - 4.88 appearing where neighbors have small subsection numbers (decimal detection)
+    
+    This should NOT flag:
+    - Legitimate transitions (3.x -> 4.x -> 5.x)
+    - Sections at transition boundaries
     
     Returns:
         Tuple of (indices_to_demote, details_list)
@@ -1340,7 +1366,6 @@ def final_sequence_cleanup(elements: List[Dict]) -> Tuple[Set[int], List[Dict]]:
         return to_demote, details
     
     # Scan through looking for anomalies
-    # Use a sliding window approach: for each section, check if it fits between its neighbors
     for i in range(1, len(parsed_sections) - 1):
         idx, num, section = parsed_sections[i]
         major = num.get_major()
@@ -1348,77 +1373,59 @@ def final_sequence_cleanup(elements: List[Dict]) -> Tuple[Set[int], List[Dict]]:
         if major is None:
             continue
         
-        # Get context: look at sections before and after
-        prev_majors = []
-        for j in range(max(0, i - 5), i):
-            prev_major = parsed_sections[j][1].get_major()
-            if prev_major is not None:
-                prev_majors.append(prev_major)
+        # Get IMMEDIATE neighbors only (1-2 on each side) for sandwich detection
+        # Using a smaller window is more conservative
+        prev_major = parsed_sections[i-1][1].get_major()
+        next_major = parsed_sections[i+1][1].get_major()
         
-        next_majors = []
-        for j in range(i + 1, min(len(parsed_sections), i + 6)):
-            next_major = parsed_sections[j][1].get_major()
-            if next_major is not None:
-                next_majors.append(next_major)
-        
-        if not prev_majors or not next_majors:
+        if prev_major is None or next_major is None:
             continue
         
-        # Find the dominant/expected major in context
-        all_context = prev_majors + next_majors
-        context_major = max(set(all_context), key=all_context.count)
-        
-        # Check for obvious misfit
         is_misfit = False
         reason = ""
         
-        # Case 1: Major is completely different from context
-        # e.g., 2.5 appearing in section 3.x content
-        if major != context_major:
-            # Check if it's a legitimate transition (context_major -> context_major+1)
-            unique_context = set(all_context)
+        # =======================================================================
+        # CONSERVATIVE Case 1: Sandwiched between SAME major
+        # e.g., 3.2.1 -> 2.5 -> 3.2.2 (prev=3, curr=2, next=3)
+        # This is a clear misfit - something with different major between same majors
+        # =======================================================================
+        if prev_major == next_major and major != prev_major:
+            # Extra check: make sure this isn't at a legitimate boundary
+            # Look a bit further to confirm the pattern
+            extended_prev = [parsed_sections[j][1].get_major() for j in range(max(0, i-3), i)]
+            extended_next = [parsed_sections[j][1].get_major() for j in range(i+1, min(len(parsed_sections), i+4))]
+            extended_prev = [m for m in extended_prev if m is not None]
+            extended_next = [m for m in extended_next if m is not None]
             
-            # If context is all one major and we're different, we're a misfit
-            if len(unique_context) == 1:
-                is_misfit = True
-                reason = f"major {major} doesn't match context major {context_major}"
-            
-            # If context has two consecutive majors (transition), we should be one of them
-            elif len(unique_context) == 2:
-                sorted_context = sorted(unique_context)
-                if sorted_context[1] == sorted_context[0] + 1:
-                    # Legitimate transition zone
-                    if major not in unique_context:
-                        is_misfit = True
-                        reason = f"major {major} doesn't fit transition {sorted_context[0]}->{sorted_context[1]}"
+            # Only flag if extended context also shows this is out of place
+            if extended_prev and extended_next:
+                prev_consistent = all(m == prev_major for m in extended_prev[-2:]) if len(extended_prev) >= 2 else True
+                next_consistent = all(m == next_major for m in extended_next[:2]) if len(extended_next) >= 2 else True
+                
+                if prev_consistent and next_consistent:
+                    is_misfit = True
+                    reason = f"major {major} sandwiched between {prev_major} sections"
         
-        # Case 2: Looks like a decimal number (X.YY where YY > 30)
+        # =======================================================================
+        # CONSERVATIVE Case 2: Decimal-like subsection (X.YY where YY > 50)
+        # Only flag very obvious decimals, and only if context confirms
+        # =======================================================================
         parts = num.get_numeric_parts()
-        if len(parts) == 2 and parts[1] is not None and parts[1] > 30:
-            # Get neighbor subsection numbers for comparison
-            neighbor_subsections = []
-            for j in range(max(0, i - 2), min(len(parsed_sections), i + 3)):
-                if j != i:
-                    neighbor_parts = parsed_sections[j][1].get_numeric_parts()
-                    if len(neighbor_parts) >= 2 and neighbor_parts[1] is not None:
-                        neighbor_subsections.append(neighbor_parts[1])
+        if not is_misfit and len(parts) == 2 and parts[1] is not None and parts[1] > 50:
+            # Check immediate neighbor subsections
+            prev_parts = parsed_sections[i-1][1].get_numeric_parts()
+            next_parts = parsed_sections[i+1][1].get_numeric_parts()
             
-            if neighbor_subsections:
-                max_neighbor_sub = max(neighbor_subsections)
-                # If neighbors have subsections < 30 but we have 88, 75, etc., we're suspicious
-                if max_neighbor_sub < 30 and parts[1] > 30:
-                    is_misfit = True
-                    reason = f"subsection {parts[1]} looks like decimal (neighbors max: {max_neighbor_sub})"
-        
-        # Case 3: Major jumps backward significantly
-        if prev_majors:
-            recent_major = prev_majors[-1]
-            # Going from 3.x to 2.x is suspicious unless we're at a document boundary
-            if major < recent_major - 1:
-                # Check if forward context confirms this is wrong
-                if next_majors and all(m >= recent_major for m in next_majors[:3]):
-                    is_misfit = True
-                    reason = f"major {major} jumps backward from {recent_major}"
+            neighbor_subs = []
+            if len(prev_parts) >= 2 and prev_parts[1] is not None:
+                neighbor_subs.append(prev_parts[1])
+            if len(next_parts) >= 2 and next_parts[1] is not None:
+                neighbor_subs.append(next_parts[1])
+            
+            if neighbor_subs and max(neighbor_subs) < 30:
+                # Neighbors have small subsections, we have 50+, likely decimal
+                is_misfit = True
+                reason = f"subsection {parts[1]} looks like decimal (neighbors: {neighbor_subs})"
         
         if is_misfit:
             to_demote.add(idx)
@@ -1426,8 +1433,11 @@ def final_sequence_cleanup(elements: List[Dict]) -> Tuple[Set[int], List[Dict]]:
                 "index": idx,
                 "section": num.raw,
                 "reason": reason,
-                "context_major": context_major
+                "prev_major": prev_major,
+                "next_major": next_major
             })
+    
+    return to_demote, details
     
     return to_demote, details
 
