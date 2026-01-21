@@ -390,14 +390,19 @@ def find_content_start_page(
     input_path: str, 
     llm_config: Dict, 
     max_workers: int = 4,
-    max_pages_to_check: int = 20
+    initial_pages_to_check: int = 20,
+    max_pages_to_check: int = 100
 ) -> Dict[str, Any]:
     """
-    Analyzes the first N pages to find where main content begins.
+    Analyzes pages to find where main content begins.
     
     Uses a two-tier approach:
     1. Fast-path regex classification for obvious TOC/Title pages
     2. LLM classification for uncertain pages
+    
+    ADAPTIVE BEHAVIOR: If we're still seeing TOC pages at the end of our
+    initial batch, we keep classifying more pages until we find content.
+    This handles documents with very long TOCs (30+ pages).
     
     Returns a dict with:
         - content_start_page: int
@@ -449,62 +454,95 @@ def find_content_start_page(
             "page_classifications": [{'page': page_id, 'type': page_type, 'method': method}]
         }
     
-    # Multi-page document: classify first N pages (INCLUDING page 1)
-    pages_to_classify = pages[:max_pages_to_check]
-    
-    print(f"  - Classifying pages 1-{len(pages_to_classify)} (fast-path + LLM fallback)...")
-    
     # ==========================================================================
-    # Phase 1: Fast-path classification (synchronous, very fast)
+    # Multi-page document: ADAPTIVE classification
+    # Start with initial batch, then continue if still seeing TOC pages
     # ==========================================================================
+    
     page_classifications = []
-    pages_needing_llm = []
+    pages_classified_idx = 0
+    found_content = False
     
-    for page_id, page_text in pages_to_classify:
-        fast_result = fast_classify_page(page_text)
-        if fast_result:
-            reason = get_fast_classification_reason(page_text)
-            print(f"    Page {page_id}: {fast_result} [fast: {reason}]")
-            page_classifications.append({
-                'page': page_id, 
-                'type': fast_result, 
-                'method': 'fast'
-            })
+    while pages_classified_idx < min(len(pages), max_pages_to_check) and not found_content:
+        # Determine batch size
+        if pages_classified_idx == 0:
+            # First batch
+            batch_end = min(initial_pages_to_check, len(pages))
+            print(f"  - Classifying pages 1-{batch_end} (fast-path + LLM fallback)...")
         else:
-            pages_needing_llm.append((page_id, page_text))
-    
-    # ==========================================================================
-    # Phase 2: LLM classification for uncertain pages (parallel)
-    # ==========================================================================
-    if pages_needing_llm:
-        print(f"  - {len(pages_needing_llm)} page(s) need LLM classification...")
+            # Extension batch - classify 10 more pages at a time
+            batch_end = min(pages_classified_idx + 10, len(pages), max_pages_to_check)
+            print(f"  - Still in TOC, extending to page {batch_end}...")
         
-        tasks = [(page_id, page_text, llm_config) for page_id, page_text in pages_needing_llm]
+        batch_pages = pages[pages_classified_idx:batch_end]
         
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_task = {executor.submit(classify_page_wrapper, task): task for task in tasks}
+        # ======================================================================
+        # Phase 1: Fast-path classification (synchronous, very fast)
+        # ======================================================================
+        pages_needing_llm = []
+        
+        for page_id, page_text in batch_pages:
+            fast_result = fast_classify_page(page_text)
+            if fast_result:
+                reason = get_fast_classification_reason(page_text)
+                print(f"    Page {page_id}: {fast_result} [fast: {reason}]")
+                page_classifications.append({
+                    'page': page_id, 
+                    'type': fast_result, 
+                    'method': 'fast'
+                })
+            else:
+                pages_needing_llm.append((page_id, page_text))
+        
+        # ======================================================================
+        # Phase 2: LLM classification for uncertain pages (parallel)
+        # ======================================================================
+        if pages_needing_llm:
+            print(f"  - {len(pages_needing_llm)} page(s) need LLM classification...")
             
-            for future in as_completed(future_to_task):
-                try:
-                    result = future.result()
-                    page_classifications.append(result)
-                    print(f"    Page {result['page']}: {result['type']} [llm]")
-                except Exception as exc:
-                    page_num = future_to_task[future][0]
-                    print(f"    Page {page_num}: ERROR - {exc}")
-                    page_classifications.append({
-                        'page': page_num, 
-                        'type': 'AMBIGUOUS',
-                        'method': 'error'
-                    })
+            tasks = [(page_id, page_text, llm_config) for page_id, page_text in pages_needing_llm]
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_task = {executor.submit(classify_page_wrapper, task): task for task in tasks}
+                
+                for future in as_completed(future_to_task):
+                    try:
+                        result = future.result()
+                        page_classifications.append(result)
+                        print(f"    Page {result['page']}: {result['type']} [llm]")
+                    except Exception as exc:
+                        page_num = future_to_task[future][0]
+                        print(f"    Page {page_num}: ERROR - {exc}")
+                        page_classifications.append({
+                            'page': page_num, 
+                            'type': 'AMBIGUOUS',
+                            'method': 'error'
+                        })
+        
+        pages_classified_idx = batch_end
+        
+        # ======================================================================
+        # Check if we found content - sort first to check in order
+        # ======================================================================
+        page_classifications.sort(key=lambda x: x['page'])
+        
+        # Check if we've found CONTENT_BODY
+        for classification in page_classifications:
+            if classification['type'] == 'CONTENT_BODY':
+                found_content = True
+                break
+        
+        # Also stop if we've hit the end of available pages
+        if batch_end >= len(pages):
+            break
     
-    # Sort by page number (results may arrive out of order)
+    # Sort final results by page number
     page_classifications.sort(key=lambda x: x['page'])
     
     # Log summary
     fast_count = sum(1 for p in page_classifications if p.get('method') == 'fast')
     llm_count = sum(1 for p in page_classifications if p.get('method') == 'llm')
-    print(f"  - Classification summary: {fast_count} fast-path, {llm_count} LLM")
+    print(f"  - Classification summary: {fast_count} fast-path, {llm_count} LLM, {len(page_classifications)} total pages checked")
     
     # Determine content start page and document type
     return analyze_page_sequence(page_classifications)
