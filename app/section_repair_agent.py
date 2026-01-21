@@ -909,6 +909,10 @@ def detect_sandwich_false_positives(elements: List[Dict]) -> Set[int]:
         if prev_dominant is None or next_dominant is None:
             continue
         
+        # Skip if current section's major is None
+        if major is None:
+            continue
+        
         # Check if current section is OUT OF PLACE
         # Case 1: prev and next are same major, but current is different
         if prev_dominant == next_dominant and major != prev_dominant:
@@ -938,6 +942,10 @@ def detect_sandwich_false_positives(elements: List[Dict]) -> Set[int]:
     for i in range(len(section_info)):
         idx, num, depth, major, parts, raw = section_info[i]
         
+        # Skip if major is None
+        if major is None:
+            continue
+        
         # Check for decimal-like patterns (X.YY where YY > 30)
         if depth == 2 and len(parts) == 2:
             if parts[1] is not None and parts[1] > 30:
@@ -946,7 +954,9 @@ def detect_sandwich_false_positives(elements: List[Dict]) -> Set[int]:
                 context_majors = []
                 for j in range(max(0, i - 3), min(len(section_info), i + 4)):
                     if j != i and section_info[j][2] >= 2:  # hierarchical neighbor
-                        context_majors.append(section_info[j][3])
+                        neighbor_major = section_info[j][3]
+                        if neighbor_major is not None:
+                            context_majors.append(neighbor_major)
                 
                 if context_majors:
                     dominant_context = max(set(context_majors), key=context_majors.count)
@@ -1030,8 +1040,9 @@ def detect_sandwich_false_positives(elements: List[Dict]) -> Set[int]:
                             false_positives.add(section_info[k][0])
         
         # Also check: same major on both sides
-        if prev_major == next_major and prev_depth >= 2 and next_depth >= 2:
-            false_positives.add(idx)
+        if prev_major is not None and next_major is not None:
+            if prev_major == next_major and prev_depth >= 2 and next_depth >= 2:
+                false_positives.add(idx)
     
     # ==========================================================================
     # Pass 4: Catch sequences of sandwiched items (3 -> 4 -> 5 between 3.x sections)
@@ -1045,6 +1056,11 @@ def detect_sandwich_false_positives(elements: List[Dict]) -> Set[int]:
         
         start_idx, start_num, start_depth, start_major, start_parts, start_raw = section_info[i]
         
+        # Skip if start_major is None
+        if start_major is None:
+            i += 1
+            continue
+        
         # Collect consecutive non-matching sections
         suspicious_sequence = []
         j = i + 1
@@ -1052,6 +1068,11 @@ def detect_sandwich_false_positives(elements: List[Dict]) -> Set[int]:
             curr_info = section_info[j]
             curr_major = curr_info[3]
             curr_depth = curr_info[2]
+            
+            # Skip None majors
+            if curr_major is None:
+                j += 1
+                continue
             
             # If it's a hierarchical section at the same major, check if sequence continues
             if curr_depth >= 2 and curr_major == start_major:
