@@ -9,6 +9,7 @@ Pipeline Steps:
 5. assets    - Integrate figures/tables at correct positions based on bbox
 6. tables    - OCR any table images into structured data (or skip with --no-table-ocr)
 7. write     - Generate final DOCX
+8. validate  - Compare extracted sections against TOC (optional, runs with --validate)
 
 Usage:
     python simple_pipeline.py --step all
@@ -16,6 +17,7 @@ Usage:
     python simple_pipeline.py --step structure --header-threshold 600
     python simple_pipeline.py --step repair --repair-confidence 0.7
     python simple_pipeline.py --step all --no-table-ocr  # Skip LLM table OCR, use images
+    python simple_pipeline.py --step all --validate      # Run validation at end
 """
 
 import os
@@ -37,6 +39,13 @@ except ImportError as e:
     print(f"Import Error: {e}")
     print("Make sure all agent modules are in the same directory or Python path.")
     exit(1)
+
+# Validation is optional - don't fail if not present
+try:
+    from validation_agent import run_validation_on_file
+    VALIDATION_AVAILABLE = True
+except ImportError:
+    VALIDATION_AVAILABLE = False
 
 
 def get_document_stems(input_dir: str) -> List[str]:
@@ -124,7 +133,7 @@ def main():
         "--step", 
         type=str, 
         default="all", 
-        choices=["classify", "title", "structure", "repair", "assets", "tables", "write", "all"],
+        choices=["classify", "title", "structure", "repair", "assets", "tables", "write", "validate", "all"],
         help="Pipeline step to execute"
     )
     parser.add_argument(
@@ -187,6 +196,11 @@ def main():
         help="Skip LLM OCR for tables. Tables will be rendered as images in the final document. "
              "This still preserves Table captions (separate from Figure captions) for Table of Tables support."
     )
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Run validation step to compare extracted sections against TOC"
+    )
     
     args = parser.parse_args()
     os.makedirs(args.results_dir, exist_ok=True)
@@ -202,6 +216,9 @@ def main():
     doc_stems = get_document_stems(args.raw_ocr_dir)
     print(f"Found {len(doc_stems)} document(s).\n")
 
+    # Track validation results for summary
+    validation_results = []
+
     for stem in doc_stems:
         print(f"{'='*60}")
         print(f"Processing: {stem}")
@@ -216,6 +233,7 @@ def main():
         with_assets_out = os.path.join(args.results_dir, f"{stem}_with_assets.json")
         tables_out = os.path.join(args.results_dir, f"{stem}_with_tables.json")
         final_docx = os.path.join(args.results_dir, f"{stem}.docx")
+        validation_out = os.path.join(args.results_dir, f"{stem}_validation.json")
 
         # ========== STEP 1: CLASSIFY ==========
         if args.step in ["classify", "all"]:
@@ -362,7 +380,57 @@ def main():
                 title_out
             )
 
+        # ========== STEP 8: VALIDATE ==========
+        if args.step in ["validate", "all"] and args.validate:
+            print("\n[Step 8: Validation]")
+            
+            if not VALIDATION_AVAILABLE:
+                print("  [Warning] validation_agent.py not found. Skipping validation.")
+            else:
+                result = run_validation_on_file(stem, args.raw_ocr_dir, args.results_dir)
+                if result:
+                    validation_results.append({
+                        'document': stem,
+                        'toc_coverage': result.toc_coverage,
+                        'precision': result.precision,
+                        'missing_count': len(result.in_toc_not_output),
+                        'extra_count': len(result.in_output_not_toc)
+                    })
+
         print()  # Blank line between documents
+
+    # ========== VALIDATION SUMMARY ==========
+    if validation_results:
+        print("\n" + "="*60)
+        print("VALIDATION SUMMARY")
+        print("="*60)
+        
+        total_coverage = sum(r['toc_coverage'] for r in validation_results) / len(validation_results)
+        total_precision = sum(r['precision'] for r in validation_results) / len(validation_results)
+        
+        print(f"\nDocuments validated: {len(validation_results)}")
+        print(f"Average TOC Coverage: {total_coverage:.1f}%")
+        print(f"Average Precision: {total_precision:.1f}%")
+        
+        # Flag documents with issues
+        problem_docs = [r for r in validation_results if r['toc_coverage'] < 90 or r['precision'] < 90]
+        if problem_docs:
+            print(f"\nDocuments with potential issues (<90% coverage or precision):")
+            for doc in problem_docs:
+                print(f"  - {doc['document']}: Coverage={doc['toc_coverage']:.1f}%, Precision={doc['precision']:.1f}%, Missing={doc['missing_count']}, Extra={doc['extra_count']}")
+        else:
+            print("\nAll documents have good coverage and precision!")
+        
+        # Write summary file
+        summary_path = os.path.join(args.results_dir, "_validation_summary.json")
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'total_documents': len(validation_results),
+                'average_toc_coverage': round(total_coverage, 2),
+                'average_precision': round(total_precision, 2),
+                'documents': validation_results
+            }, f, indent=2)
+        print(f"\nValidation summary saved to: {summary_path}")
 
     print("\nPipeline complete!")
 
