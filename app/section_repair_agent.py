@@ -1279,9 +1279,157 @@ def repair_sections(elements: List[Dict], confidence_threshold: float = 0.7) -> 
     # Re-attach content to sections
     repaired = attach_content_to_previous_section(repaired)
     
+    # ==========================================================================
+    # FINAL CLEANUP PASS: Simple sequential scan to catch remaining anomalies
+    # This catches things like 2.5 appearing between 3.2.x sections
+    # ==========================================================================
+    final_demotions, final_details = final_sequence_cleanup(repaired)
+    
+    if final_demotions:
+        report["final_cleanup_demotions"] = len(final_demotions)
+        report["final_cleanup_details"] = final_details
+        
+        # Apply final demotions
+        final_repaired = []
+        for i, element in enumerate(repaired):
+            if i in final_demotions:
+                demoted = demote_section_to_content(element)
+                final_repaired.append(demoted)
+            else:
+                final_repaired.append(element)
+        
+        # Re-attach content again after final demotions
+        repaired = attach_content_to_previous_section(final_repaired)
+    
     report["total_sections_after"] = sum(1 for e in repaired if e.get('type') == 'section')
     
     return repaired, report
+
+
+def final_sequence_cleanup(elements: List[Dict]) -> Tuple[Set[int], List[Dict]]:
+    """
+    Final cleanup pass: simple sequential scan to catch any remaining out-of-sequence sections.
+    
+    This is intentionally simple - just scan through and look for sections that don't fit
+    the flow. By this point, most false positives have been caught, so we're looking for
+    stragglers like:
+    - 2.5 appearing between 3.2.1 and 3.2.2
+    - 4.88 appearing in the middle of section 3 content
+    - Any section where the major jumps backward unexpectedly
+    
+    Returns:
+        Tuple of (indices_to_demote, details_list)
+    """
+    to_demote = set()
+    details = []
+    
+    # Get all sections with their indices
+    sections = [(i, e) for i, e in enumerate(elements) if e.get('type') == 'section']
+    
+    if len(sections) < 3:
+        return to_demote, details
+    
+    # Parse all section numbers
+    parsed_sections = []
+    for idx, section in sections:
+        num = SectionNumber(section.get('section_number', ''))
+        if num.is_valid:
+            parsed_sections.append((idx, num, section))
+    
+    if len(parsed_sections) < 3:
+        return to_demote, details
+    
+    # Scan through looking for anomalies
+    # Use a sliding window approach: for each section, check if it fits between its neighbors
+    for i in range(1, len(parsed_sections) - 1):
+        idx, num, section = parsed_sections[i]
+        major = num.get_major()
+        
+        if major is None:
+            continue
+        
+        # Get context: look at sections before and after
+        prev_majors = []
+        for j in range(max(0, i - 5), i):
+            prev_major = parsed_sections[j][1].get_major()
+            if prev_major is not None:
+                prev_majors.append(prev_major)
+        
+        next_majors = []
+        for j in range(i + 1, min(len(parsed_sections), i + 6)):
+            next_major = parsed_sections[j][1].get_major()
+            if next_major is not None:
+                next_majors.append(next_major)
+        
+        if not prev_majors or not next_majors:
+            continue
+        
+        # Find the dominant/expected major in context
+        all_context = prev_majors + next_majors
+        context_major = max(set(all_context), key=all_context.count)
+        
+        # Check for obvious misfit
+        is_misfit = False
+        reason = ""
+        
+        # Case 1: Major is completely different from context
+        # e.g., 2.5 appearing in section 3.x content
+        if major != context_major:
+            # Check if it's a legitimate transition (context_major -> context_major+1)
+            unique_context = set(all_context)
+            
+            # If context is all one major and we're different, we're a misfit
+            if len(unique_context) == 1:
+                is_misfit = True
+                reason = f"major {major} doesn't match context major {context_major}"
+            
+            # If context has two consecutive majors (transition), we should be one of them
+            elif len(unique_context) == 2:
+                sorted_context = sorted(unique_context)
+                if sorted_context[1] == sorted_context[0] + 1:
+                    # Legitimate transition zone
+                    if major not in unique_context:
+                        is_misfit = True
+                        reason = f"major {major} doesn't fit transition {sorted_context[0]}->{sorted_context[1]}"
+        
+        # Case 2: Looks like a decimal number (X.YY where YY > 30)
+        parts = num.get_numeric_parts()
+        if len(parts) == 2 and parts[1] is not None and parts[1] > 30:
+            # Get neighbor subsection numbers for comparison
+            neighbor_subsections = []
+            for j in range(max(0, i - 2), min(len(parsed_sections), i + 3)):
+                if j != i:
+                    neighbor_parts = parsed_sections[j][1].get_numeric_parts()
+                    if len(neighbor_parts) >= 2 and neighbor_parts[1] is not None:
+                        neighbor_subsections.append(neighbor_parts[1])
+            
+            if neighbor_subsections:
+                max_neighbor_sub = max(neighbor_subsections)
+                # If neighbors have subsections < 30 but we have 88, 75, etc., we're suspicious
+                if max_neighbor_sub < 30 and parts[1] > 30:
+                    is_misfit = True
+                    reason = f"subsection {parts[1]} looks like decimal (neighbors max: {max_neighbor_sub})"
+        
+        # Case 3: Major jumps backward significantly
+        if prev_majors:
+            recent_major = prev_majors[-1]
+            # Going from 3.x to 2.x is suspicious unless we're at a document boundary
+            if major < recent_major - 1:
+                # Check if forward context confirms this is wrong
+                if next_majors and all(m >= recent_major for m in next_majors[:3]):
+                    is_misfit = True
+                    reason = f"major {major} jumps backward from {recent_major}"
+        
+        if is_misfit:
+            to_demote.add(idx)
+            details.append({
+                "index": idx,
+                "section": num.raw,
+                "reason": reason,
+                "context_major": context_major
+            })
+    
+    return to_demote, details
 
 
 def run_section_repair(input_path: str, output_path: str, confidence_threshold: float = 0.7):
@@ -1316,6 +1464,15 @@ def run_section_repair(input_path: str, output_path: str, confidence_threshold: 
     print(f"  - False positive chains found: {report['false_positive_chains_found']}")
     print(f"  - Sandwich false positives found: {report['sandwich_false_positives_found']}")
     print(f"  - Sections demoted: {report['sections_demoted']}")
+    
+    # Log final cleanup if any
+    if report.get('final_cleanup_demotions', 0) > 0:
+        print(f"  - Final cleanup demotions: {report['final_cleanup_demotions']}")
+        for detail in report.get('final_cleanup_details', [])[:5]:
+            print(f"      {detail['section']}: {detail['reason']}")
+        if len(report.get('final_cleanup_details', [])) > 5:
+            print(f"      ... and {len(report['final_cleanup_details']) - 5} more")
+    
     print(f"  - Sections after repair: {report['total_sections_after']}")
     
     if report['violation_details']:
