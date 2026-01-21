@@ -32,15 +32,31 @@ except ImportError:
 # =============================================================================
 
 # Pattern for hierarchical section numbers: 1.1, 1.1.1, 2.3.4.5, etc.
-# Must have at least one dot to distinguish from simple page numbers
+# IMPORTANT: Must be "structural" section numbers, NOT decimal measurements
+# 
+# Rules to avoid false positives:
+# 1. Must have at least one dot (so "20" alone won't match)
+# 2. Each component should be 1-2 digits (not 3+ which suggests decimals like 4.88)
+# 3. Should have 2+ components (so 1.1, 1.2.3, etc.)
+# 4. Should NOT be followed by units or letters (avoids "2.5gs", "3.2V")
+#
+# Valid: 1.1, 1.2.3, 3.2.1.4, 10.1, 1.10.2
+# Invalid: 4.88 (decimal), 2.5gs (measurement), 20 (no dot), 3.141592 (too precise)
+
 SECTION_NUMBER_PATTERN = re.compile(
-    r'\b(\d{1,3}(?:\.\d{1,3}){1,5})\b'  # e.g., 1.1, 1.1.1, 2.3.4.5
+    r'(?<![0-9\.])(\d{1,2}(?:\.\d{1,2}){1,5})(?![0-9]|[a-zA-Z]|\.\d)'
+    # (?<![0-9\.]) - not preceded by digit or dot (avoids matching middle of decimals)
+    # \d{1,2} - first component is 1-2 digits
+    # (?:\.\d{1,2}){1,5} - followed by 1-5 more components of .XX
+    # (?![0-9]|[a-zA-Z]|\.\d) - not followed by digit, letter, or more decimal places
 )
 
-# Pattern for TOC-style entries: section number followed by title and page number
+# Stricter pattern for TOC entries - section number at START of line context,
+# followed by title text and ending with a page number
 # e.g., "1.1 Introduction ..... 5" or "3.2.1 Requirements 12"
 TOC_ENTRY_PATTERN = re.compile(
-    r'\b\d{1,2}(?:\.\d{1,2}){1,4}\s+[A-Z][A-Za-z\s\-/&]+[\s\.]*\d{1,4}\b'
+    r'(?:^|\n)\s*(\d{1,2}(?:\.\d{1,2}){1,4})\s+[A-Z][A-Za-z\s\-/&,]+[\s\.]*\d{1,4}\s*(?:$|\n)',
+    re.MULTILINE
 )
 
 # Pattern for "Table of Contents", "Contents", "TOC" headers
@@ -52,6 +68,17 @@ TOC_HEADER_PATTERN = re.compile(
 # Pattern for "List of Figures" / "Table of Figures" / "List of Tables" / "Table of Tables"
 LIST_OF_PATTERN = re.compile(
     r'\b(?:LIST\s+OF|TABLE\s+OF)\s+(?:FIGURES?|TABLES?|ILLUSTRATIONS?)\b',
+    re.IGNORECASE
+)
+
+# Pattern to detect measurement/decimal contexts that should NOT be section numbers
+# These patterns indicate the number is a value, not a section reference
+MEASUREMENT_CONTEXT_PATTERN = re.compile(
+    r'\d+\.\d+\s*(?:g|gs|kg|lb|lbs|oz|mm|cm|m|km|in|ft|yd|mi|'
+    r'V|mV|kV|A|mA|W|kW|MW|Hz|kHz|MHz|GHz|'
+    r'°|deg|rad|%|pct|'
+    r'sec|s|ms|min|hr|'
+    r'per|/)\b',
     re.IGNORECASE
 )
 
@@ -85,7 +112,15 @@ def fast_classify_page(page_text: str) -> Optional[str]:
     
     # Count hierarchical section numbers (1.1, 1.2.3, etc.)
     section_numbers = SECTION_NUMBER_PATTERN.findall(page_text)
-    unique_section_numbers = set(section_numbers)
+    
+    # Filter out likely false positives (decimal numbers, not section numbers)
+    filtered_section_numbers = []
+    for num in section_numbers:
+        if is_likely_decimal_not_section(num):
+            continue
+        filtered_section_numbers.append(num)
+    
+    unique_section_numbers = set(filtered_section_numbers)
     
     # Count TOC-style entries (section + title + page number)
     toc_entries = TOC_ENTRY_PATTERN.findall(page_text)
@@ -96,13 +131,17 @@ def fast_classify_page(page_text: str) -> Optional[str]:
     # Check for List of Figures/Tables header (still TOC-like)
     has_list_of_header = bool(LIST_OF_PATTERN.search(page_text))
     
+    # Check if page has lots of measurement contexts (suggests body content, not TOC)
+    measurement_matches = MEASUREMENT_CONTEXT_PATTERN.findall(page_text)
+    has_many_measurements = len(measurement_matches) > 5
+    
     # Decision logic for TOC:
-    # 1. Many unique section numbers (10+) → definitely TOC
+    # 1. Many unique section numbers (10+) AND not dominated by measurements → definitely TOC
     # 2. TOC header + several section numbers (5+) → definitely TOC  
     # 3. Many TOC-style entries (8+) → definitely TOC
     # 4. List of Figures/Tables header → likely TOC (but let LLM confirm for edge cases)
     
-    if len(unique_section_numbers) >= MIN_SECTION_NUMBERS_FOR_TOC:
+    if len(unique_section_numbers) >= MIN_SECTION_NUMBERS_FOR_TOC and not has_many_measurements:
         return "TABLE_OF_CONTENTS"
     
     if has_toc_header and len(unique_section_numbers) >= 5:
@@ -151,22 +190,90 @@ def fast_classify_page(page_text: str) -> Optional[str]:
     return None
 
 
+def is_likely_decimal_not_section(num: str) -> bool:
+    """
+    Determines if a number like "4.88" is likely a decimal value rather than 
+    a section number like "4.8".
+    
+    Heuristics:
+    - Section numbers: 1.1, 3.2, 3.2.1, 1.10, 3.21 (subsections up to ~30)
+    - Decimals: 4.88, 2.50, 0.05, 3.75 (precise measurements)
+    
+    Key insight: In TOCs, you'll see PATTERNS like 3.1, 3.2, 3.3, 3.4...
+    Decimals are more random: 4.88, 2.5, 3.75 (no sequential pattern)
+    
+    For single-number detection, we use these rules:
+    - Two-part numbers where second part has leading zero (0.05, 1.05) → decimal
+    - Two-part numbers like X.Y0 where Y0 > 30 (2.50, 3.40) → likely decimal
+    - Two-part numbers where second part > 30 → likely decimal (rare to have 30+ subsections)
+    """
+    parts = num.split('.')
+    
+    # Only apply heuristics to simple X.Y format (not X.Y.Z which is clearly a section)
+    if len(parts) != 2:
+        return False  # X.Y.Z patterns are almost always section numbers
+    
+    first, second = parts
+    
+    # Leading zero in second part: 0.05, 1.05, 2.05 → decimal
+    if second.startswith('0') and len(second) >= 2:
+        return True
+    
+    try:
+        second_val = int(second)
+        
+        # Trailing zero check: 2.50, 3.40, 4.80 → decimal
+        # But NOT 1.10, 1.20, 3.10 (these are valid section X.10, X.20, X.30)
+        # The key is: if it ends in 0 AND the value is NOT a round 10/20/30, it's suspicious
+        # 2.50 → 50 is not 10/20/30, so it's a decimal
+        # 1.10 → 10 is a round number, so it's a valid section
+        if second.endswith('0') and len(second) >= 2:
+            if second_val % 10 != 0:  # Not a round 10, 20, 30
+                return True
+            # 2.50 has value 50, 50 % 10 == 0, but we still want to filter
+            # Actually 50 % 10 == 0, so this doesn't catch 2.50
+            # Let's think differently: X.10, X.20, X.30 are valid
+            # X.40, X.50, ... X.90 are suspicious (rarely have 40+ subsections)
+            if second_val > 30:
+                return True
+        
+        # Very high second component (> 30) → likely decimal
+        # Real documents rarely have section 3.45 (45 subsections under section 3)
+        if second_val > 30:
+            return True
+            
+    except ValueError:
+        pass
+    
+    return False
+
+
 def get_fast_classification_reason(page_text: str) -> str:
     """
     Returns a human-readable reason for the fast classification.
     Used for debugging/logging.
     """
     section_numbers = SECTION_NUMBER_PATTERN.findall(page_text)
-    unique_section_numbers = set(section_numbers)
+    
+    # Apply same filtering as fast_classify_page
+    filtered_section_numbers = []
+    for num in section_numbers:
+        if not is_likely_decimal_not_section(num):
+            filtered_section_numbers.append(num)
+    
+    unique_section_numbers = set(filtered_section_numbers)
     toc_entries = TOC_ENTRY_PATTERN.findall(page_text)
     has_toc_header = bool(TOC_HEADER_PATTERN.search(page_text))
     has_list_of_header = bool(LIST_OF_PATTERN.search(page_text))
     
+    filtered_out = len(section_numbers) - len(filtered_section_numbers)
+    filter_note = f" ({filtered_out} filtered as decimals)" if filtered_out > 0 else ""
+    
     if len(unique_section_numbers) >= MIN_SECTION_NUMBERS_FOR_TOC:
-        return f"Found {len(unique_section_numbers)} unique section numbers"
+        return f"Found {len(unique_section_numbers)} unique section numbers{filter_note}"
     
     if has_toc_header and len(unique_section_numbers) >= 5:
-        return f"TOC header + {len(unique_section_numbers)} section numbers"
+        return f"TOC header + {len(unique_section_numbers)} section numbers{filter_note}"
     
     if len(toc_entries) >= MIN_TOC_ENTRIES_FOR_TOC:
         return f"Found {len(toc_entries)} TOC-style entries"
@@ -721,14 +828,32 @@ def test_fast_classification(text: str) -> None:
     print("FAST CLASSIFICATION TEST")
     print("=" * 60)
     
-    # Find section numbers
-    section_numbers = SECTION_NUMBER_PATTERN.findall(text)
-    unique_sections = set(section_numbers)
-    print(f"\nSection numbers found ({len(section_numbers)} total, {len(unique_sections)} unique):")
-    for s in sorted(unique_sections)[:20]:
+    # Find all section number matches (before filtering)
+    section_numbers_raw = SECTION_NUMBER_PATTERN.findall(text)
+    print(f"\nRaw section number matches ({len(section_numbers_raw)} total):")
+    for s in sorted(set(section_numbers_raw))[:15]:
         print(f"  - {s}")
-    if len(unique_sections) > 20:
-        print(f"  ... and {len(unique_sections) - 20} more")
+    if len(set(section_numbers_raw)) > 15:
+        print(f"  ... and {len(set(section_numbers_raw)) - 15} more")
+    
+    # Apply filtering
+    filtered_section_numbers = []
+    rejected = []
+    for num in section_numbers_raw:
+        if is_likely_decimal_not_section(num):
+            rejected.append(num)
+        else:
+            filtered_section_numbers.append(num)
+    
+    unique_sections = set(filtered_section_numbers)
+    print(f"\nAfter filtering: {len(unique_sections)} unique section numbers")
+    
+    if rejected:
+        print(f"\nRejected as decimals ({len(rejected)}):")
+        for num in sorted(set(rejected))[:10]:
+            print(f"  - {num}")
+        if len(set(rejected)) > 10:
+            print(f"  ... and {len(set(rejected)) - 10} more")
     
     # Find TOC entries
     toc_entries = TOC_ENTRY_PATTERN.findall(text)
@@ -737,6 +862,14 @@ def test_fast_classification(text: str) -> None:
         print(f"  - {entry}")
     if len(toc_entries) > 10:
         print(f"  ... and {len(toc_entries) - 10} more")
+    
+    # Check for measurement contexts
+    measurements = MEASUREMENT_CONTEXT_PATTERN.findall(text)
+    print(f"\nMeasurement contexts found ({len(measurements)}):")
+    for m in measurements[:10]:
+        print(f"  - {m}")
+    if len(measurements) > 10:
+        print(f"  ... and {len(measurements) - 10} more")
     
     # Check headers
     has_toc = bool(TOC_HEADER_PATTERN.search(text))

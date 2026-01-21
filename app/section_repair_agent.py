@@ -838,16 +838,22 @@ def detect_false_positive_chains(elements: List[Dict], tracker: DocumentPosition
 
 def detect_sandwich_false_positives(elements: List[Dict]) -> Set[int]:
     """
-    Detect simple numbers that are "sandwiched" between hierarchical sections
-    at a deeper level. These are almost certainly false positives.
+    Detect sections that are "sandwiched" between other sections in a way that
+    violates logical numbering flow. These are almost certainly false positives.
+    
+    IMPROVED VERSION: Now catches ANY out-of-place section, not just simple numbers.
     
     Pattern examples:
     - 3.2.3.4 -> 3 -> 3.2.3.5  (the "3" is sandwiched)
-    - 3.2.3.4 -> 4 -> 3.2.3.5  (the "4" is sandwiched)
+    - 3.2.3.4 -> 4 -> 3.2.3.5  (the "4" is sandwiched)  
     - 3.1.1 -> 3 -> 4 -> 3.1.2  (both "3" and "4" are sandwiched)
+    - 3.1.1 -> 4.88 -> 3.1.2   (decimal "4.88" is sandwiched - NEW!)
+    - 3.1.1 -> 20 -> 3.1.2     (random number sandwiched)
+    - 3.1.5 -> 2.5 -> 3.1.6    (decimal masquerading as section)
     
-    The key insight: if we see hierarchical sections resume at the SAME or DEEPER
-    level after a simple number, the simple number was likely a false positive.
+    Key insight: If the MAJOR section number before and after a candidate are the
+    same (or form a logical sequence), but the candidate has a DIFFERENT major,
+    it's likely a false positive - especially if it looks like a decimal.
     """
     false_positives = set()
     
@@ -856,152 +862,214 @@ def detect_sandwich_false_positives(elements: List[Dict]) -> Set[int]:
     if len(section_elements) < 3:
         return false_positives
     
-    # Build a list of (index, section_number, depth, major, is_hierarchical)
+    # Build a list of (index, section_number, depth, major, parts, raw)
     section_info = []
     for idx, section in section_elements:
         num = SectionNumber(section.get('section_number', ''))
         if num.is_valid:
             section_info.append((
                 idx,
-                num.raw,
+                num,
                 num.depth,
                 num.get_major(),
-                num.has_dots()
+                num.get_numeric_parts(),
+                num.raw
             ))
     
     if len(section_info) < 3:
         return false_positives
     
-    # Scan for sandwich patterns
-    # For each simple number, check if it's between two hierarchical sections
-    # that form a sequence (same prefix, incrementing last number)
-    
+    # ==========================================================================
+    # Pass 1: Detect sections sandwiched between hierarchical sections of same major
+    # ==========================================================================
     for i in range(1, len(section_info) - 1):
-        idx, raw, depth, major, is_hier = section_info[i]
+        idx, num, depth, major, parts, raw = section_info[i]
+        
+        # Look backward for context (find the established major)
+        prev_majors = []
+        for j in range(i - 1, max(0, i - 8) - 1, -1):  # Look back up to 8 sections
+            prev_info = section_info[j]
+            if prev_info[2] >= 2:  # depth >= 2 (hierarchical)
+                prev_majors.append(prev_info[3])  # major
+        
+        # Look forward for context
+        next_majors = []
+        for j in range(i + 1, min(len(section_info), i + 8)):  # Look forward up to 8 sections
+            next_info = section_info[j]
+            if next_info[2] >= 2:  # depth >= 2 (hierarchical)
+                next_majors.append(next_info[3])  # major
+        
+        if not prev_majors or not next_majors:
+            continue
+        
+        # Get the dominant major before and after
+        prev_dominant = max(set(prev_majors), key=prev_majors.count) if prev_majors else None
+        next_dominant = max(set(next_majors), key=next_majors.count) if next_majors else None
+        
+        if prev_dominant is None or next_dominant is None:
+            continue
+        
+        # Check if current section is OUT OF PLACE
+        # Case 1: prev and next are same major, but current is different
+        if prev_dominant == next_dominant and major != prev_dominant:
+            false_positives.add(idx)
+            continue
+        
+        # Case 2: prev and next are sequential (3 -> 4), but current doesn't fit
+        if next_dominant == prev_dominant + 1:
+            # We're at a transition point (e.g., end of section 3, start of section 4)
+            # Current should be either prev_dominant or next_dominant
+            if major != prev_dominant and major != next_dominant:
+                false_positives.add(idx)
+                continue
+        
+        # Case 3: Current major is WAY off (like 20 in the middle of section 3)
+        if major > max(prev_dominant, next_dominant) + 2:
+            false_positives.add(idx)
+            continue
+        if major < min(prev_dominant, next_dominant) - 1 and major > 0:
+            false_positives.add(idx)
+            continue
+    
+    # ==========================================================================
+    # Pass 2: Detect decimal-like section numbers that are contextually wrong
+    # Numbers like 4.88, 2.50, etc. that slipped through initial detection
+    # ==========================================================================
+    for i in range(len(section_info)):
+        idx, num, depth, major, parts, raw = section_info[i]
+        
+        # Check for decimal-like patterns (X.YY where YY > 30)
+        if depth == 2 and len(parts) == 2:
+            if parts[1] is not None and parts[1] > 30:
+                # Looks like a decimal (4.88, 3.75, etc.)
+                # Check context - is it surrounded by sections with different major?
+                context_majors = []
+                for j in range(max(0, i - 3), min(len(section_info), i + 4)):
+                    if j != i and section_info[j][2] >= 2:  # hierarchical neighbor
+                        context_majors.append(section_info[j][3])
+                
+                if context_majors:
+                    dominant_context = max(set(context_majors), key=context_majors.count)
+                    # If context is different major, this is likely a decimal
+                    if dominant_context != major:
+                        false_positives.add(idx)
+                        continue
+                    # Even same major - 3.75 in section 3 content is suspicious
+                    # Check if neighboring sections have reasonable subsection numbers
+                    neighbor_subsections = []
+                    for j in range(max(0, i - 2), min(len(section_info), i + 3)):
+                        if j != i:
+                            neighbor_parts = section_info[j][4]
+                            if len(neighbor_parts) >= 2 and neighbor_parts[1] is not None:
+                                neighbor_subsections.append(neighbor_parts[1])
+                    
+                    if neighbor_subsections:
+                        max_neighbor = max(neighbor_subsections)
+                        # If neighbors have small subsection numbers but this has 75, 88, etc.
+                        if parts[1] > max_neighbor + 20:
+                            false_positives.add(idx)
+                            continue
+    
+    # ==========================================================================
+    # Pass 3: Original sandwich detection for simple numbers between hierarchical sequences
+    # ==========================================================================
+    for i in range(1, len(section_info) - 1):
+        idx, num, depth, major, parts, raw = section_info[i]
         
         # Only check simple numbers (depth 1)
-        if is_hier:
+        if depth != 1:
             continue
         
         # Look backward for a hierarchical section
         prev_hier = None
-        for j in range(i - 1, max(0, i - 5) - 1, -1):  # Look back up to 5 sections
-            if section_info[j][4]:  # is_hierarchical
+        for j in range(i - 1, max(0, i - 5) - 1, -1):
+            if section_info[j][2] >= 2:  # depth >= 2
                 prev_hier = section_info[j]
                 break
         
         if prev_hier is None:
             continue
         
-        prev_idx, prev_raw, prev_depth, prev_major, _ = prev_hier
+        prev_idx, prev_num, prev_depth, prev_major, prev_parts, prev_raw = prev_hier
         
         # Look forward for a hierarchical section
         next_hier = None
-        for j in range(i + 1, min(len(section_info), i + 6)):  # Look forward up to 5 sections
-            if section_info[j][4]:  # is_hierarchical
+        for j in range(i + 1, min(len(section_info), i + 6)):
+            if section_info[j][2] >= 2:  # depth >= 2
                 next_hier = section_info[j]
                 break
         
         if next_hier is None:
             continue
         
-        next_idx, next_raw, next_depth, next_major, _ = next_hier
+        next_idx, next_num, next_depth, next_major, next_parts, next_raw = next_hier
         
         # Check if prev and next form a sequence at the same depth
-        # e.g., 3.2.3.4 and 3.2.3.5, or 3.1.1 and 3.1.2
         if prev_depth == next_depth and prev_depth >= 2:
-            # Same depth - check if they share a prefix
-            prev_num = SectionNumber(prev_raw)
-            next_num = SectionNumber(next_raw)
-            
-            prev_parts = prev_num.get_numeric_parts()
-            next_parts = next_num.get_numeric_parts()
-            
-            if len(prev_parts) == len(next_parts) and len(prev_parts) >= 2:
+            if len(prev_parts) == len(next_parts) >= 2:
                 # Check if all but the last part match
                 prefix_matches = all(
                     prev_parts[k] == next_parts[k] 
                     for k in range(len(prev_parts) - 1)
+                    if prev_parts[k] is not None and next_parts[k] is not None
                 )
                 
                 # Check if the last part increments (with some tolerance for gaps)
                 last_increments = (
                     prev_parts[-1] is not None and 
                     next_parts[-1] is not None and
-                    0 < next_parts[-1] - prev_parts[-1] <= 3  # Allow small gaps
+                    0 < next_parts[-1] - prev_parts[-1] <= 5  # Allow gaps
                 )
                 
                 if prefix_matches and last_increments:
-                    # This simple number is sandwiched between a sequence!
-                    # Mark it and any other simple numbers between prev and next
+                    # This section is sandwiched between a sequence - mark it
                     for k in range(i, len(section_info)):
                         if section_info[k][0] == next_idx:
                             break
-                        if not section_info[k][4]:  # not hierarchical
+                        if section_info[k][2] == 1:  # simple number
                             false_positives.add(section_info[k][0])
-                            # Add to report details
-                    continue
         
-        # Also check: same major, deeper or equal depth on both sides
-        # e.g., 3.2.1 -> 3 -> 3.2.2 (the "3" is clearly wrong)
+        # Also check: same major on both sides
         if prev_major == next_major and prev_depth >= 2 and next_depth >= 2:
-            # Both hierarchical sections are in the same major and have depth
-            # The simple number between them is suspicious
-            # Extra check: the simple number should be the same or different major
-            if major == prev_major or major != prev_major:
-                # Mark as false positive
-                false_positives.add(idx)
+            false_positives.add(idx)
     
-    # Second pass: catch sequences of simple numbers sandwiched together
-    # e.g., 3.2.3.4 -> 3 -> 4 -> 5 -> 3.2.3.5
+    # ==========================================================================
+    # Pass 4: Catch sequences of sandwiched items (3 -> 4 -> 5 between 3.x sections)
+    # ==========================================================================
     i = 0
     while i < len(section_info) - 2:
         # Find start of a hierarchical section
-        if not section_info[i][4]:  # not hierarchical
+        if section_info[i][2] < 2:  # not hierarchical
             i += 1
             continue
         
-        start_idx, start_raw, start_depth, start_major, _ = section_info[i]
+        start_idx, start_num, start_depth, start_major, start_parts, start_raw = section_info[i]
         
-        if start_depth < 2:
-            i += 1
-            continue
-        
-        # Collect consecutive simple numbers
-        simple_sequence = []
+        # Collect consecutive non-matching sections
+        suspicious_sequence = []
         j = i + 1
-        while j < len(section_info) and not section_info[j][4]:
-            simple_sequence.append(section_info[j])
+        while j < len(section_info):
+            curr_info = section_info[j]
+            curr_major = curr_info[3]
+            curr_depth = curr_info[2]
+            
+            # If it's a hierarchical section at the same major, check if sequence continues
+            if curr_depth >= 2 and curr_major == start_major:
+                # This might be the end of sandwich - check if it continues the sequence
+                if len(suspicious_sequence) > 0:
+                    # We had some suspicious sections - mark them
+                    for susp_info in suspicious_sequence:
+                        false_positives.add(susp_info[0])
+                break
+            elif curr_depth >= 2 and curr_major == start_major + 1:
+                # Legitimate transition to next major section
+                break
+            else:
+                # This section doesn't fit - might be sandwiched
+                suspicious_sequence.append(curr_info)
             j += 1
         
-        if not simple_sequence or j >= len(section_info):
-            i += 1
-            continue
-        
-        # Check if the next hierarchical section continues the sequence
-        end_idx, end_raw, end_depth, end_major, _ = section_info[j]
-        
-        if end_depth >= 2 and end_major == start_major:
-            # Check if they form a sequence
-            start_num = SectionNumber(start_raw)
-            end_num = SectionNumber(end_raw)
-            
-            start_parts = start_num.get_numeric_parts()
-            end_parts = end_num.get_numeric_parts()
-            
-            # If same depth and incrementing, all simples between are false positives
-            if len(start_parts) == len(end_parts) >= 2:
-                prefix_matches = all(
-                    start_parts[k] == end_parts[k] 
-                    for k in range(len(start_parts) - 1)
-                )
-                
-                if prefix_matches:
-                    # Mark all simple numbers in between
-                    for simple_info in simple_sequence:
-                        false_positives.add(simple_info[0])
-        
-        i = j
+        i = max(i + 1, j)
     
     return false_positives
 
