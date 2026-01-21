@@ -135,6 +135,41 @@ def split_topic_at_period(text: str) -> Tuple[str, str]:
     return text.strip(), ""
 
 
+
+def normalize_section_number(raw: str) -> str:
+    """
+    Normalize a section number by fixing common OCR separator errors.
+    
+    OCR commonly confuses separators:
+    - '1,1.3' should be '1.1.3'
+    - '1-1-3' should be '1.1.3'
+    - '3,2,1' should be '3.2.1'
+    
+    Returns the normalized section number string.
+    """
+    if not raw:
+        return raw
+    
+    normalized = raw
+    
+    # Replace comma with period
+    normalized = normalized.replace(',', '.')
+    
+    # Replace hyphen with period, but only when between digits
+    # This avoids breaking things like "A-1" or "Phase-2"
+    # Use a loop to handle consecutive replacements like "3-2-1"
+    while True:
+        new_normalized = re.sub(r'(\d)-(\d)', r'\1.\2', normalized)
+        if new_normalized == normalized:
+            break
+        normalized = new_normalized
+    
+    # Clean up any double periods that might result
+    while '..' in normalized:
+        normalized = normalized.replace('..', '.')
+    
+    return normalized
+
 def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
     """
     Checks if a line of text is a section header using regex and heuristics.
@@ -147,9 +182,9 @@ def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[b
         Tuple of (is_header, section_number, topic, remainder)
     """
     # Primary regex: number followed by space and text
-    match = re.match(r'^\s*([a-zA-Z0-9\.]+)\s+(.+)', line_text)
+    match = re.match(r'^\s*([a-zA-Z0-9\.\,\-]+)\s+(.+)', line_text)
     # Secondary regex: just a number alone on the line
-    match_no_title = re.match(r'^\s*([a-zA-Z0-9\.]+)\s*$', line_text)
+    match_no_title = re.match(r'^\s*([a-zA-Z0-9\.\,\-]+)\s*$', line_text)
     
     if match:
         potential_num, full_topic = match.groups()
@@ -160,6 +195,13 @@ def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[b
         if debug:
             print(f"      [DEBUG] Rejected (no regex match): '{line_text[:50]}...'")
         return False, None, None, None
+
+    # Normalize the section number (fix OCR separator errors like 1,1.3 -> 1.1.3)
+    original_num = potential_num
+    potential_num = normalize_section_number(potential_num)
+    
+    if debug and original_num != potential_num:
+        print(f"      [DEBUG] Normalized section number: '{original_num}' -> '{potential_num}'")
 
     # Heuristics to filter out false positives
     

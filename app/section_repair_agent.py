@@ -37,19 +37,47 @@ class SectionNumber:
     parts: List[str] = field(default_factory=list)
     depth: int = 0
     is_valid: bool = True
+    normalized: str = ""  # The normalized version with consistent separators
     
     def __post_init__(self):
-        self.parts = self._parse_parts(self.raw)
+        self.normalized, self.parts = self._parse_parts(self.raw)
         self.depth = len(self.parts)
         self.is_valid = self.depth > 0
     
     @staticmethod
-    def _parse_parts(raw: str) -> List[str]:
-        """Parse '3.1.2' into ['3', '1', '2'], handling OCR errors like '3.A'"""
+    def _parse_parts(raw: str) -> Tuple[str, List[str]]:
+        """
+        Parse '3.1.2' into ['3', '1', '2'], handling OCR errors.
+        
+        OCR commonly confuses separators:
+        - '1,1.3' should be '1.1.3'
+        - '1-1-3' should be '1.1.3'
+        - '3,2,1' should be '3.2.1'
+        
+        Returns (normalized_string, parts_list)
+        """
         if not raw:
-            return []
-        parts = [p.strip() for p in raw.split('.') if p.strip()]
-        return parts
+            return "", []
+        
+        # Normalize separators: treat , and - as . (common OCR errors)
+        # But be careful: don't convert standalone hyphens in things like "A-1"
+        # We want to convert "1,1.3" -> "1.1.3" and "1-1-3" -> "1.1.3"
+        normalized = raw
+        
+        # Replace comma with period
+        normalized = normalized.replace(',', '.')
+        
+        # Replace hyphen with period, but only when between digits
+        # This avoids breaking things like "A-1" or "Phase-2"
+        # Use a loop to handle consecutive replacements like "3-2-1"
+        while True:
+            new_normalized = re.sub(r'(\d)-(\d)', r'\1.\2', normalized)
+            if new_normalized == normalized:
+                break
+            normalized = new_normalized
+        
+        parts = [p.strip() for p in normalized.split('.') if p.strip()]
+        return normalized, parts
     
     def get_numeric_parts(self) -> List[Optional[int]]:
         """Convert parts to integers where possible, None for non-numeric (OCR errors)"""
@@ -79,6 +107,8 @@ class SectionNumber:
         return self.depth >= 2
     
     def __repr__(self):
+        if self.raw != self.normalized:
+            return f"SectionNumber('{self.raw}' -> '{self.normalized}' -> {self.parts})"
         return f"SectionNumber('{self.raw}' -> {self.parts})"
 
 
