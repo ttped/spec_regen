@@ -329,11 +329,13 @@ class ValidationResult:
     match_percentage: float = 0.0
     toc_coverage: float = 0.0  # What % of TOC sections did we find?
     precision: float = 0.0     # What % of our sections are in TOC?
+    has_toc: bool = False      # Did this document have a TOC?
     
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization."""
         return {
             "summary": {
+                "has_toc": self.has_toc,
                 "toc_section_count": len(self.toc_sections),
                 "output_section_count": len(self.output_sections),
                 "matched_count": len(self.matched_sections),
@@ -379,7 +381,8 @@ def compare_sections(toc_sections: Set[str], output_sections: Set[str]) -> Valid
     """
     result = ValidationResult(
         toc_sections=toc_sections,
-        output_sections=output_sections
+        output_sections=output_sections,
+        has_toc=len(toc_sections) > 0
     )
     
     # Find matches, missing, and extra
@@ -387,16 +390,17 @@ def compare_sections(toc_sections: Set[str], output_sections: Set[str]) -> Valid
     result.in_toc_not_output = toc_sections - output_sections
     result.in_output_not_toc = output_sections - toc_sections
     
-    # Calculate metrics
-    total_unique = len(toc_sections | output_sections)
-    if total_unique > 0:
-        result.match_percentage = (len(result.matched_sections) / total_unique) * 100
-    
-    if len(toc_sections) > 0:
-        result.toc_coverage = (len(result.matched_sections) / len(toc_sections)) * 100
-    
-    if len(output_sections) > 0:
-        result.precision = (len(result.matched_sections) / len(output_sections)) * 100
+    # Calculate metrics (only meaningful if we have a TOC)
+    if result.has_toc:
+        total_unique = len(toc_sections | output_sections)
+        if total_unique > 0:
+            result.match_percentage = (len(result.matched_sections) / total_unique) * 100
+        
+        if len(toc_sections) > 0:
+            result.toc_coverage = (len(result.matched_sections) / len(toc_sections)) * 100
+        
+        if len(output_sections) > 0:
+            result.precision = (len(result.matched_sections) / len(output_sections)) * 100
     
     return result
 
@@ -437,13 +441,17 @@ def run_validation(
     
     # Print summary
     print(f"  - Results:")
-    print(f"      TOC sections:     {len(result.toc_sections)}")
-    print(f"      Output sections:  {len(result.output_sections)}")
-    print(f"      Matched:          {len(result.matched_sections)}")
-    print(f"      Missing (in TOC, not output): {len(result.in_toc_not_output)}")
-    print(f"      Extra (in output, not TOC):   {len(result.in_output_not_toc)}")
-    print(f"      TOC Coverage:     {result.toc_coverage:.1f}%")
-    print(f"      Precision:        {result.precision:.1f}%")
+    if result.has_toc:
+        print(f"      TOC sections:     {len(result.toc_sections)}")
+        print(f"      Output sections:  {len(result.output_sections)}")
+        print(f"      Matched:          {len(result.matched_sections)}")
+        print(f"      Missing (in TOC, not output): {len(result.in_toc_not_output)}")
+        print(f"      Extra (in output, not TOC):   {len(result.in_output_not_toc)}")
+        print(f"      TOC Coverage:     {result.toc_coverage:.1f}%")
+        print(f"      Precision:        {result.precision:.1f}%")
+    else:
+        print(f"      [No TOC detected] - Document has {len(result.output_sections)} sections")
+        print(f"      (Statistics not included in aggregate totals)")
     
     # Write validation report
     os.makedirs(os.path.dirname(validation_output_path) or '.', exist_ok=True)

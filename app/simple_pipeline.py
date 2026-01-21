@@ -391,8 +391,11 @@ def main():
                 if result:
                     validation_results.append({
                         'document': stem,
+                        'has_toc': result.has_toc,
                         'toc_coverage': result.toc_coverage,
                         'precision': result.precision,
+                        'toc_count': len(result.toc_sections),
+                        'output_count': len(result.output_sections),
                         'missing_count': len(result.in_toc_not_output),
                         'extra_count': len(result.in_output_not_toc)
                     })
@@ -405,29 +408,47 @@ def main():
         print("VALIDATION SUMMARY")
         print("="*60)
         
-        total_coverage = sum(r['toc_coverage'] for r in validation_results) / len(validation_results)
-        total_precision = sum(r['precision'] for r in validation_results) / len(validation_results)
+        # Separate documents with and without TOC
+        docs_with_toc = [r for r in validation_results if r['has_toc']]
+        docs_without_toc = [r for r in validation_results if not r['has_toc']]
         
-        print(f"\nDocuments validated: {len(validation_results)}")
-        print(f"Average TOC Coverage: {total_coverage:.1f}%")
-        print(f"Average Precision: {total_precision:.1f}%")
+        print(f"\nTotal documents validated: {len(validation_results)}")
+        print(f"  - With TOC: {len(docs_with_toc)}")
+        print(f"  - Without TOC: {len(docs_without_toc)}")
         
-        # Flag documents with issues
-        problem_docs = [r for r in validation_results if r['toc_coverage'] < 90 or r['precision'] < 90]
-        if problem_docs:
-            print(f"\nDocuments with potential issues (<90% coverage or precision):")
-            for doc in problem_docs:
-                print(f"  - {doc['document']}: Coverage={doc['toc_coverage']:.1f}%, Precision={doc['precision']:.1f}%, Missing={doc['missing_count']}, Extra={doc['extra_count']}")
-        else:
-            print("\nAll documents have good coverage and precision!")
+        # Calculate stats only for documents WITH a TOC
+        if docs_with_toc:
+            avg_coverage = sum(r['toc_coverage'] for r in docs_with_toc) / len(docs_with_toc)
+            avg_precision = sum(r['precision'] for r in docs_with_toc) / len(docs_with_toc)
+            
+            print(f"\n--- Documents WITH TOC ---")
+            print(f"Average TOC Coverage: {avg_coverage:.1f}%")
+            print(f"Average Precision: {avg_precision:.1f}%")
+            
+            # Flag documents with issues
+            problem_docs = [r for r in docs_with_toc if r['toc_coverage'] < 90 or r['precision'] < 90]
+            if problem_docs:
+                print(f"\nDocuments with potential issues (<90% coverage or precision):")
+                for doc in problem_docs:
+                    print(f"  - {doc['document']}: Coverage={doc['toc_coverage']:.1f}%, Precision={doc['precision']:.1f}%, Missing={doc['missing_count']}, Extra={doc['extra_count']}")
+            else:
+                print("\nAll documents with TOC have good coverage and precision!")
+        
+        # Report on documents without TOC
+        if docs_without_toc:
+            print(f"\n--- Documents WITHOUT TOC (not included in stats) ---")
+            for doc in docs_without_toc:
+                print(f"  - {doc['document']}: {doc['output_count']} sections extracted")
         
         # Write summary file
         summary_path = os.path.join(args.results_dir, "_validation_summary.json")
         with open(summary_path, 'w', encoding='utf-8') as f:
             json.dump({
                 'total_documents': len(validation_results),
-                'average_toc_coverage': round(total_coverage, 2),
-                'average_precision': round(total_precision, 2),
+                'documents_with_toc': len(docs_with_toc),
+                'documents_without_toc': len(docs_without_toc),
+                'average_toc_coverage': round(avg_coverage, 2) if docs_with_toc else None,
+                'average_precision': round(avg_precision, 2) if docs_with_toc else None,
                 'documents': validation_results
             }, f, indent=2)
         print(f"\nValidation summary saved to: {summary_path}")
