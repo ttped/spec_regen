@@ -836,6 +836,176 @@ def detect_false_positive_chains(elements: List[Dict], tracker: DocumentPosition
     return false_positives
 
 
+def detect_sandwich_false_positives(elements: List[Dict]) -> Set[int]:
+    """
+    Detect simple numbers that are "sandwiched" between hierarchical sections
+    at a deeper level. These are almost certainly false positives.
+    
+    Pattern examples:
+    - 3.2.3.4 -> 3 -> 3.2.3.5  (the "3" is sandwiched)
+    - 3.2.3.4 -> 4 -> 3.2.3.5  (the "4" is sandwiched)
+    - 3.1.1 -> 3 -> 4 -> 3.1.2  (both "3" and "4" are sandwiched)
+    
+    The key insight: if we see hierarchical sections resume at the SAME or DEEPER
+    level after a simple number, the simple number was likely a false positive.
+    """
+    false_positives = set()
+    
+    section_elements = [(i, s) for i, s in enumerate(elements) if s.get('type') == 'section']
+    
+    if len(section_elements) < 3:
+        return false_positives
+    
+    # Build a list of (index, section_number, depth, major, is_hierarchical)
+    section_info = []
+    for idx, section in section_elements:
+        num = SectionNumber(section.get('section_number', ''))
+        if num.is_valid:
+            section_info.append((
+                idx,
+                num.raw,
+                num.depth,
+                num.get_major(),
+                num.has_dots()
+            ))
+    
+    if len(section_info) < 3:
+        return false_positives
+    
+    # Scan for sandwich patterns
+    # For each simple number, check if it's between two hierarchical sections
+    # that form a sequence (same prefix, incrementing last number)
+    
+    for i in range(1, len(section_info) - 1):
+        idx, raw, depth, major, is_hier = section_info[i]
+        
+        # Only check simple numbers (depth 1)
+        if is_hier:
+            continue
+        
+        # Look backward for a hierarchical section
+        prev_hier = None
+        for j in range(i - 1, max(0, i - 5) - 1, -1):  # Look back up to 5 sections
+            if section_info[j][4]:  # is_hierarchical
+                prev_hier = section_info[j]
+                break
+        
+        if prev_hier is None:
+            continue
+        
+        prev_idx, prev_raw, prev_depth, prev_major, _ = prev_hier
+        
+        # Look forward for a hierarchical section
+        next_hier = None
+        for j in range(i + 1, min(len(section_info), i + 6)):  # Look forward up to 5 sections
+            if section_info[j][4]:  # is_hierarchical
+                next_hier = section_info[j]
+                break
+        
+        if next_hier is None:
+            continue
+        
+        next_idx, next_raw, next_depth, next_major, _ = next_hier
+        
+        # Check if prev and next form a sequence at the same depth
+        # e.g., 3.2.3.4 and 3.2.3.5, or 3.1.1 and 3.1.2
+        if prev_depth == next_depth and prev_depth >= 2:
+            # Same depth - check if they share a prefix
+            prev_num = SectionNumber(prev_raw)
+            next_num = SectionNumber(next_raw)
+            
+            prev_parts = prev_num.get_numeric_parts()
+            next_parts = next_num.get_numeric_parts()
+            
+            if len(prev_parts) == len(next_parts) and len(prev_parts) >= 2:
+                # Check if all but the last part match
+                prefix_matches = all(
+                    prev_parts[k] == next_parts[k] 
+                    for k in range(len(prev_parts) - 1)
+                )
+                
+                # Check if the last part increments (with some tolerance for gaps)
+                last_increments = (
+                    prev_parts[-1] is not None and 
+                    next_parts[-1] is not None and
+                    0 < next_parts[-1] - prev_parts[-1] <= 3  # Allow small gaps
+                )
+                
+                if prefix_matches and last_increments:
+                    # This simple number is sandwiched between a sequence!
+                    # Mark it and any other simple numbers between prev and next
+                    for k in range(i, len(section_info)):
+                        if section_info[k][0] == next_idx:
+                            break
+                        if not section_info[k][4]:  # not hierarchical
+                            false_positives.add(section_info[k][0])
+                            # Add to report details
+                    continue
+        
+        # Also check: same major, deeper or equal depth on both sides
+        # e.g., 3.2.1 -> 3 -> 3.2.2 (the "3" is clearly wrong)
+        if prev_major == next_major and prev_depth >= 2 and next_depth >= 2:
+            # Both hierarchical sections are in the same major and have depth
+            # The simple number between them is suspicious
+            # Extra check: the simple number should be the same or different major
+            if major == prev_major or major != prev_major:
+                # Mark as false positive
+                false_positives.add(idx)
+    
+    # Second pass: catch sequences of simple numbers sandwiched together
+    # e.g., 3.2.3.4 -> 3 -> 4 -> 5 -> 3.2.3.5
+    i = 0
+    while i < len(section_info) - 2:
+        # Find start of a hierarchical section
+        if not section_info[i][4]:  # not hierarchical
+            i += 1
+            continue
+        
+        start_idx, start_raw, start_depth, start_major, _ = section_info[i]
+        
+        if start_depth < 2:
+            i += 1
+            continue
+        
+        # Collect consecutive simple numbers
+        simple_sequence = []
+        j = i + 1
+        while j < len(section_info) and not section_info[j][4]:
+            simple_sequence.append(section_info[j])
+            j += 1
+        
+        if not simple_sequence or j >= len(section_info):
+            i += 1
+            continue
+        
+        # Check if the next hierarchical section continues the sequence
+        end_idx, end_raw, end_depth, end_major, _ = section_info[j]
+        
+        if end_depth >= 2 and end_major == start_major:
+            # Check if they form a sequence
+            start_num = SectionNumber(start_raw)
+            end_num = SectionNumber(end_raw)
+            
+            start_parts = start_num.get_numeric_parts()
+            end_parts = end_num.get_numeric_parts()
+            
+            # If same depth and incrementing, all simples between are false positives
+            if len(start_parts) == len(end_parts) >= 2:
+                prefix_matches = all(
+                    start_parts[k] == end_parts[k] 
+                    for k in range(len(start_parts) - 1)
+                )
+                
+                if prefix_matches:
+                    # Mark all simple numbers in between
+                    for simple_info in simple_sequence:
+                        false_positives.add(simple_info[0])
+        
+        i = j
+    
+    return false_positives
+
+
 def demote_section_to_content(section: Dict) -> Dict:
     """
     Convert a section element back to an unassigned_text_block.
@@ -951,9 +1121,11 @@ def repair_sections(elements: List[Dict], confidence_threshold: float = 0.7) -> 
         "violations_found": 0,
         "list_sequences_found": 0,
         "false_positive_chains_found": 0,
+        "sandwich_false_positives_found": 0,
         "sections_demoted": 0,
         "violation_details": [],
         "list_sequences": [],
+        "sandwich_patterns": [],
         "position_resets": 0
     }
     
@@ -969,6 +1141,10 @@ def repair_sections(elements: List[Dict], confidence_threshold: float = 0.7) -> 
     # Find false positive chains (simple numbers that corrupted position)
     false_positive_chains = detect_false_positive_chains(elements, tracker)
     report["false_positive_chains_found"] = len(false_positive_chains)
+    
+    # Find sandwich false positives (simple numbers between hierarchical sequences)
+    sandwich_false_positives = detect_sandwich_false_positives(elements)
+    report["sandwich_false_positives_found"] = len(sandwich_false_positives)
     
     # Determine which indices to demote
     indices_to_demote = set()
@@ -994,6 +1170,10 @@ def repair_sections(elements: List[Dict], confidence_threshold: float = 0.7) -> 
     
     # Add false positive chains
     for idx in false_positive_chains:
+        indices_to_demote.add(idx)
+    
+    # Add sandwich false positives
+    for idx in sandwich_false_positives:
         indices_to_demote.add(idx)
     
     report["sections_demoted"] = len(indices_to_demote)
@@ -1045,6 +1225,7 @@ def run_section_repair(input_path: str, output_path: str, confidence_threshold: 
     print(f"  - Violations found: {report['violations_found']}")
     print(f"  - List sequences found: {report['list_sequences_found']}")
     print(f"  - False positive chains found: {report['false_positive_chains_found']}")
+    print(f"  - Sandwich false positives found: {report['sandwich_false_positives_found']}")
     print(f"  - Sections demoted: {report['sections_demoted']}")
     print(f"  - Sections after repair: {report['total_sections_after']}")
     
