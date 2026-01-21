@@ -277,12 +277,18 @@ def calculate_title_confidence(topic: str) -> float:
     if first_word in sentence_starters:
         sentence_penalty *= 0.7
     
+    # Starts with imperative verbs (common in instructions/list items, not titles)
+    imperative_starters = ['see', 'refer', 'note', 'ensure', 'verify', 'check', 'use',
+                          'apply', 'follow', 'review', 'contact', 'consult', 'consider']
+    if first_word in imperative_starters:
+        sentence_penalty *= 0.5  # Strong penalty - very likely not a title
+    
     # Contains sentence-like conjunctions/connectors mid-text
     # These rarely appear in titles but often in sentences
     sentence_connectors = ['that', 'which', 'where', 'when', 'because', 'since', 
                           'although', 'however', 'therefore', 'furthermore',
                           'refers', 'refer', 'shown', 'listed', 'described',
-                          'following', 'below', 'above']
+                          'following', 'below', 'above', 'details', 'additional']
     topic_lower = topic.lower()
     for connector in sentence_connectors:
         # Check if connector appears as a word (not part of another word)
@@ -395,13 +401,15 @@ def calculate_section_confidence(section: SectionNumber, topic: str = "") -> flo
 
 def analyze_simple_number(
     curr: SectionNumber,
-    tracker: DocumentPositionTracker
+    tracker: DocumentPositionTracker,
+    combined_confidence: float = 1.0,
+    topic: str = ""
 ) -> TransitionAnalysis:
     """
     Analyze a simple number (no dots) against our current position.
     
     Simple numbers are the main source of false positives (list items, table rows).
-    They're valid if they're the logical next major section.
+    They're valid if they're the logical next major section AND have reasonable confidence.
     """
     from_section = tracker.observation_history[-1].section if tracker.observation_history else SectionNumber("")
     
@@ -413,6 +421,17 @@ def analyze_simple_number(
     curr_major = curr.get_major()
     if curr_major is None:
         return analysis  # Can't analyze, assume valid
+    
+    # === NEW: Direct rejection based on low confidence ===
+    # If the combined confidence (depth + title) is very low, reject immediately
+    # This catches cases like "4 The numbers in parenthesis refer to..."
+    if combined_confidence < 0.40:
+        analysis.is_valid = False
+        analysis.violation_type = "low_confidence_title"
+        analysis.confidence = 0.85
+        title_preview = topic[:50] + "..." if len(topic) > 50 else topic
+        analysis.reason = f"Simple number with suspicious title (conf={combined_confidence:.2f}): '{title_preview}'"
+        return analysis
     
     # Check for position corruption first
     if tracker.detect_position_corruption():
@@ -578,7 +597,8 @@ def find_violations(elements: List[Dict]) -> Tuple[List[Tuple[int, TransitionAna
         
         # Analyze based on whether it has dots or not
         if curr_num.is_simple_number():
-            analysis = analyze_simple_number(curr_num, tracker)
+            # Pass confidence and topic for direct low-confidence rejection
+            analysis = analyze_simple_number(curr_num, tracker, confidence, topic)
         else:
             analysis = analyze_hierarchical_section(curr_num, tracker)
         
