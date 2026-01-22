@@ -10,6 +10,7 @@ Key principles:
 3. Use observation history to detect when position state has been corrupted
 4. A simple number alone should NOT update major section state with high confidence
 5. Multiple corroborating observations are needed to confirm a major section change
+6. TOC matching provides additional confidence boost for hierarchical sections
 
 The repair is conservative: when in doubt, leave it alone.
 All text is preserved - demoted sections become regular content blocks.
@@ -20,6 +21,11 @@ IMPROVED APPROACH (v2):
 - Hierarchical sections (3.1.2) have HIGH confidence
 - When many high-confidence sections contradict the position, reset position
 - Implements a "soft Kalman filter" where observations are weighted by confidence
+
+IMPROVED APPROACH (v3):
+- Optional TOC matching to boost confidence for sections found in TOC
+- Only applies to hierarchical sections (depth >= 2) to avoid false positives
+- Protects legitimate sections from being incorrectly demoted
 """
 
 import os
@@ -28,6 +34,154 @@ import re
 from typing import List, Dict, Tuple, Optional, Any, Set
 from dataclasses import dataclass, field
 from collections import deque
+
+
+# =============================================================================
+# TOC EXTRACTION HELPERS
+# =============================================================================
+
+def normalize_section_for_comparison(raw: str) -> str:
+    """
+    Normalize a section number for comparison with TOC.
+    Handles OCR errors and formatting variations.
+    """
+    if not raw:
+        return ""
+    
+    normalized = raw.strip()
+    
+    # Replace comma with period (common OCR error)
+    normalized = normalized.replace(',', '.')
+    
+    # Replace hyphen between digits with period
+    while True:
+        new_normalized = re.sub(r'(\d)-(\d)', r'\1.\2', normalized)
+        if new_normalized == normalized:
+            break
+        normalized = new_normalized
+    
+    # Remove trailing dots
+    normalized = normalized.rstrip('.')
+    
+    # Clean up double dots
+    while '..' in normalized:
+        normalized = normalized.replace('..', '.')
+    
+    return normalized
+
+
+def load_toc_sections_from_classification(classification_path: str, raw_ocr_path: str) -> Set[str]:
+    """
+    Load section numbers from TOC pages.
+    
+    Args:
+        classification_path: Path to classification JSON (identifies TOC pages)
+        raw_ocr_path: Path to raw OCR JSON (contains page text)
+        
+    Returns:
+        Set of normalized section numbers found in TOC
+    """
+    toc_sections = set()
+    
+    # Load classification to find TOC pages
+    if not os.path.exists(classification_path):
+        return toc_sections
+    
+    try:
+        with open(classification_path, 'r', encoding='utf-8') as f:
+            classification = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return toc_sections
+    
+    # Find TOC page numbers
+    toc_page_numbers = set()
+    for page_class in classification.get('page_classifications', []):
+        if page_class.get('type') == 'TABLE_OF_CONTENTS':
+            toc_page_numbers.add(page_class.get('page'))
+    
+    if not toc_page_numbers:
+        return toc_sections
+    
+    # Load raw OCR
+    if not os.path.exists(raw_ocr_path):
+        return toc_sections
+    
+    try:
+        with open(raw_ocr_path, 'r', encoding='utf-8') as f:
+            raw_data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return toc_sections
+    
+    # Extract text from TOC pages
+    toc_texts = []
+    
+    if isinstance(raw_data, dict):
+        for key, val in raw_data.items():
+            try:
+                page_num = int(key)
+            except ValueError:
+                digits = re.findall(r'\d+', str(key))
+                page_num = int(digits[0]) if digits else 0
+            
+            if page_num in toc_page_numbers:
+                page_dict = val.get('page_dict', val) if isinstance(val, dict) else val
+                if isinstance(page_dict, dict):
+                    text_list = page_dict.get('text', [])
+                    if isinstance(text_list, list):
+                        toc_texts.append(" ".join(str(t) for t in text_list))
+                        
+    elif isinstance(raw_data, list):
+        for item in raw_data:
+            if not isinstance(item, dict):
+                continue
+            page_num = item.get('page_Id') or item.get('page_num') or 0
+            try:
+                page_num = int(page_num)
+            except (ValueError, TypeError):
+                continue
+            
+            if page_num in toc_page_numbers:
+                page_dict = item.get('page_dict', item)
+                if isinstance(page_dict, dict):
+                    text_list = page_dict.get('text', [])
+                    if isinstance(text_list, list):
+                        toc_texts.append(" ".join(str(t) for t in text_list))
+    
+    # Extract section numbers from TOC text
+    toc_text = "\n".join(toc_texts)
+    
+    # Pattern for hierarchical section numbers
+    section_pattern = re.compile(
+        r'(?:^|\s)(\d{1,2}(?:\.\d{1,2}){1,5})(?=\s|\.{2,}|$)',
+        re.MULTILINE
+    )
+    
+    matches = section_pattern.findall(toc_text)
+    for match in matches:
+        normalized = normalize_section_for_comparison(match)
+        if normalized and '.' in normalized:  # Only hierarchical (has dots)
+            toc_sections.add(normalized)
+    
+    return toc_sections
+
+
+def is_section_in_toc(section_number: str, toc_sections: Set[str]) -> bool:
+    """
+    Check if a section number appears in the TOC.
+    
+    Only returns True for hierarchical sections (depth >= 2) to avoid
+    false positives from simple numbers like 1, 2, 3.
+    """
+    if not toc_sections:
+        return False
+    
+    normalized = normalize_section_for_comparison(section_number)
+    
+    # Only match hierarchical sections (must have at least one dot)
+    if '.' not in normalized:
+        return False
+    
+    return normalized in toc_sections
 
 
 @dataclass
@@ -368,17 +522,23 @@ def calculate_title_confidence(topic: str) -> float:
     return max(0.1, min(1.0, final_confidence))
 
 
-def calculate_section_confidence(section: SectionNumber, topic: str = "") -> float:
+def calculate_section_confidence(
+    section: SectionNumber, 
+    topic: str = "",
+    toc_sections: Optional[Set[str]] = None
+) -> float:
     """
     Calculate how confident we are that this is a real section header.
     
-    Combines two factors:
+    Combines multiple factors:
     1. Depth-based confidence (hierarchical numbers are more trustworthy)
     2. Title-based confidence (short, noun-phrase-like topics are more trustworthy)
+    3. TOC matching (if section appears in TOC, boost confidence by 25%)
     
     High confidence:
     - Deep hierarchical numbers (3.1.2.1) - very unlikely to be list items
     - Medium depth (3.1.2) - quite likely real
+    - Section found in TOC - strong signal it's real
     
     Medium confidence:
     - Shallow hierarchical (3.1) - could be outline or real
@@ -425,6 +585,13 @@ def calculate_section_confidence(section: SectionNumber, topic: str = "") -> flo
     else:
         # For simple numbers, title matters more (0.5 depth, 0.5 title)
         combined = (depth_confidence ** 0.5) * (title_confidence ** 0.5)
+    
+    # TOC matching boost (only for hierarchical sections, depth >= 2)
+    # Simple numbers (1, 2, 3) are too common in text to trust TOC matching
+    if toc_sections and depth >= 2:
+        if is_section_in_toc(section.raw, toc_sections):
+            # Boost confidence by 25%, but cap at 0.98
+            combined = min(0.98, combined * 1.25)
     
     return combined
 
@@ -1212,7 +1379,11 @@ def attach_content_to_previous_section(elements: List[Dict]) -> List[Dict]:
     return result
 
 
-def repair_sections(elements: List[Dict], confidence_threshold: float = 0.7) -> Tuple[List[Dict], Dict]:
+def repair_sections(
+    elements: List[Dict], 
+    confidence_threshold: float = 0.7,
+    toc_sections: Optional[Set[str]] = None
+) -> Tuple[List[Dict], Dict]:
     """
     Main repair function: detect and fix section numbering violations.
     
@@ -1222,10 +1393,12 @@ def repair_sections(elements: List[Dict], confidence_threshold: float = 0.7) -> 
     3. Track position with OBSERVATION HISTORY, not just current state
     4. Detect when simple numbers have corrupted position and recover
     5. Use confidence-weighted position updates
+    6. (v3) Use TOC matching to boost confidence for legitimate sections
     
     Args:
         elements: List of document elements
         confidence_threshold: Only repair violations with confidence >= this value
+        toc_sections: Optional set of section numbers from TOC for confidence boost
     
     Returns:
         Tuple of (repaired_elements, repair_report)
@@ -1237,6 +1410,8 @@ def repair_sections(elements: List[Dict], confidence_threshold: float = 0.7) -> 
         "false_positive_chains_found": 0,
         "sandwich_false_positives_found": 0,
         "sections_demoted": 0,
+        "toc_sections_available": len(toc_sections) if toc_sections else 0,
+        "toc_protected_sections": 0,
         "violation_details": [],
         "list_sequences": [],
         "sandwich_patterns": [],
@@ -1289,6 +1464,29 @@ def repair_sections(elements: List[Dict], confidence_threshold: float = 0.7) -> 
     # Add sandwich false positives
     for idx in sandwich_false_positives:
         indices_to_demote.add(idx)
+    
+    # ==========================================================================
+    # TOC PROTECTION: Remove indices from demotion if they match TOC entries
+    # Only protects hierarchical sections (depth >= 2) to avoid false positives
+    # ==========================================================================
+    toc_protected = set()
+    if toc_sections:
+        for idx in list(indices_to_demote):
+            element = elements[idx]
+            if element.get('type') == 'section':
+                section_num = element.get('section_number', '')
+                if is_section_in_toc(section_num, toc_sections):
+                    # This section is in the TOC - protect it from demotion
+                    indices_to_demote.remove(idx)
+                    toc_protected.add(idx)
+        
+        report["toc_protected_sections"] = len(toc_protected)
+        if toc_protected:
+            # Log which sections were protected
+            protected_nums = []
+            for idx in toc_protected:
+                protected_nums.append(elements[idx].get('section_number', ''))
+            report["toc_protected_list"] = protected_nums
     
     report["sections_demoted"] = len(indices_to_demote)
     
@@ -1442,9 +1640,22 @@ def final_sequence_cleanup(elements: List[Dict]) -> Tuple[Set[int], List[Dict]]:
     return to_demote, details
 
 
-def run_section_repair(input_path: str, output_path: str, confidence_threshold: float = 0.7):
+def run_section_repair(
+    input_path: str, 
+    output_path: str, 
+    confidence_threshold: float = 0.7,
+    classification_path: str = None,
+    raw_ocr_path: str = None
+):
     """
     Main entry point: load elements, repair sections, save results.
+    
+    Args:
+        input_path: Path to organized JSON
+        output_path: Path to save repaired JSON
+        confidence_threshold: Minimum confidence to apply repairs
+        classification_path: Optional path to classification JSON (for TOC extraction)
+        raw_ocr_path: Optional path to raw OCR JSON (for TOC extraction)
     """
     print(f"  - Loading elements from: {input_path}")
     
@@ -1466,13 +1677,25 @@ def run_section_repair(input_path: str, output_path: str, confidence_threshold: 
     
     print(f"  - Found {len(elements)} elements")
     
-    repaired_elements, report = repair_sections(elements, confidence_threshold)
+    # Load TOC sections if paths provided
+    toc_sections = None
+    if classification_path and raw_ocr_path:
+        toc_sections = load_toc_sections_from_classification(classification_path, raw_ocr_path)
+        if toc_sections:
+            print(f"  - Loaded {len(toc_sections)} sections from TOC for confidence boost")
+    
+    repaired_elements, report = repair_sections(elements, confidence_threshold, toc_sections)
     
     print(f"  - Sections before repair: {report['total_sections_before']}")
     print(f"  - Violations found: {report['violations_found']}")
     print(f"  - List sequences found: {report['list_sequences_found']}")
     print(f"  - False positive chains found: {report['false_positive_chains_found']}")
     print(f"  - Sandwich false positives found: {report['sandwich_false_positives_found']}")
+    
+    # Log TOC protection
+    if report.get('toc_protected_sections', 0) > 0:
+        print(f"  - TOC-protected sections (saved from demotion): {report['toc_protected_sections']}")
+    
     print(f"  - Sections demoted: {report['sections_demoted']}")
     
     # Log final cleanup if any

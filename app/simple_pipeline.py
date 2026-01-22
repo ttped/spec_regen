@@ -288,7 +288,9 @@ def main():
                 run_section_repair(
                     organized_out,
                     repaired_out,
-                    confidence_threshold=args.repair_confidence
+                    confidence_threshold=args.repair_confidence,
+                    classification_path=classify_out,
+                    raw_ocr_path=raw_input
                 )
             else:
                 print(f"  [Skipping] Missing organized file: {organized_out}")
