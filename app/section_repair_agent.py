@@ -26,6 +26,15 @@ IMPROVED APPROACH (v3):
 - Optional TOC matching to boost confidence for sections found in TOC
 - Only applies to hierarchical sections (depth >= 2) to avoid false positives
 - Protects legitimate sections from being incorrectly demoted
+
+IMPROVED APPROACH (v4):
+- Fuzzy TOC matching with soft penalties instead of just exact match boost
+- Section numbers that partially match TOC (e.g., "1.1.A" when TOC has "1.1.1") 
+  still get a confidence boost based on prefix correlation
+- Section numbers that don't correlate with TOC at all (e.g., "25.28994.1" when 
+  TOC only has sections 1-5) get a confidence PENALTY
+- This helps catch garbage numbers that shouldn't be sections at all
+- Scoring considers: prefix matching, major section existence, plausibility of subsections
 """
 
 import os
@@ -182,6 +191,179 @@ def is_section_in_toc(section_number: str, toc_sections: Set[str]) -> bool:
         return False
     
     return normalized in toc_sections
+
+
+def calculate_toc_fuzzy_score(section_number: str, toc_sections: Set[str]) -> float:
+    """
+    Calculate a fuzzy match score for a section number against the TOC.
+    
+    This provides a soft penalty/bonus based on how well the section number
+    correlates with entries in the TOC, even if it's not an exact match.
+    
+    Returns a score from 0.0 to 1.0:
+        - 1.0: Exact match in TOC
+        - 0.7-0.9: Partial match (shares prefix with TOC entries)
+        - 0.3-0.5: Weak correlation (major section exists in TOC)
+        - 0.0-0.2: No correlation (nothing similar in TOC - likely garbage)
+    
+    Examples:
+        - "1.1.A" when TOC has "1.1.1", "1.1.2", etc. -> ~0.75 (shares "1.1" prefix)
+        - "3.2.1" when TOC has "3.2.1" -> 1.0 (exact match)
+        - "25.28994.1" when TOC has "1.x", "2.x", "3.x" -> ~0.1 (no correlation)
+    """
+    if not toc_sections:
+        return 0.5  # No TOC to compare against, neutral score
+    
+    normalized = normalize_section_for_comparison(section_number)
+    
+    # Simple numbers don't get TOC fuzzy matching (too generic)
+    if '.' not in normalized:
+        return 0.5  # Neutral - don't penalize or reward
+    
+    # Exact match is perfect score
+    if normalized in toc_sections:
+        return 1.0
+    
+    # Parse the section number into parts
+    parts = normalized.split('.')
+    
+    # === Strategy 1: Prefix matching ===
+    # Check if any TOC entry shares a prefix with our section
+    # More shared levels = higher score
+    best_prefix_match = 0
+    for toc_entry in toc_sections:
+        toc_parts = toc_entry.split('.')
+        matching_levels = 0
+        for i, (p1, p2) in enumerate(zip(parts, toc_parts)):
+            # Try to match numerically (handles OCR errors like "1" vs "l")
+            try:
+                if int(p1) == int(p2):
+                    matching_levels += 1
+                else:
+                    break
+            except ValueError:
+                # Non-numeric part (like "A") - do string comparison
+                if p1.upper() == p2.upper():
+                    matching_levels += 1
+                else:
+                    break
+        
+        if matching_levels > best_prefix_match:
+            best_prefix_match = matching_levels
+    
+    # === Strategy 2: Check if major section exists in TOC ===
+    major_in_toc = False
+    try:
+        our_major = int(parts[0])
+        for toc_entry in toc_sections:
+            toc_parts = toc_entry.split('.')
+            try:
+                if int(toc_parts[0]) == our_major:
+                    major_in_toc = True
+                    break
+            except ValueError:
+                pass
+    except ValueError:
+        pass
+    
+    # === Strategy 3: Check section number plausibility ===
+    # If the numbers are way outside the TOC range, it's suspicious
+    max_toc_major = 0
+    max_toc_depth = 0
+    for toc_entry in toc_sections:
+        toc_parts = toc_entry.split('.')
+        max_toc_depth = max(max_toc_depth, len(toc_parts))
+        try:
+            max_toc_major = max(max_toc_major, int(toc_parts[0]))
+        except ValueError:
+            pass
+    
+    # Check if our section is plausible given the TOC structure
+    plausibility_score = 1.0
+    try:
+        our_major = int(parts[0])
+        if our_major > max_toc_major + 5:  # Way beyond what's in TOC
+            plausibility_score *= 0.3
+        elif our_major > max_toc_major + 2:  # Somewhat beyond
+            plausibility_score *= 0.6
+    except ValueError:
+        pass
+    
+    # Check for suspicious subsection numbers (like 28994)
+    for part in parts[1:]:  # Skip major section
+        try:
+            part_val = int(part)
+            if part_val > 50:  # Subsections rarely go above 50
+                plausibility_score *= 0.2
+            elif part_val > 20:  # Unusual but possible
+                plausibility_score *= 0.7
+        except ValueError:
+            # Non-numeric part (like "A", "B") - these are valid
+            pass
+    
+    # === Combine scores ===
+    # Prefix matching is most important
+    if best_prefix_match >= 2:
+        # Shares 2+ levels (e.g., "1.1" prefix matches "1.1.x" in TOC)
+        prefix_score = 0.7 + (0.15 * min(best_prefix_match - 1, 2))  # 0.7-1.0
+    elif best_prefix_match == 1:
+        # Only major section matches
+        prefix_score = 0.4 if major_in_toc else 0.3
+    else:
+        # No prefix match at all
+        prefix_score = 0.1
+    
+    # Final score combines prefix matching with plausibility
+    final_score = prefix_score * plausibility_score
+    
+    # Clamp to valid range
+    return max(0.0, min(1.0, final_score))
+
+
+def get_toc_confidence_modifier(section_number: str, toc_sections: Set[str]) -> float:
+    """
+    Get a confidence modifier based on TOC fuzzy matching.
+    
+    This is used to adjust section confidence:
+        - >0.8: Boost confidence (section correlates well with TOC)
+        - 0.4-0.8: Neutral (no strong signal either way)
+        - <0.4: Penalty (section doesn't fit TOC structure - suspicious)
+    
+    Returns a multiplier to apply to the base confidence:
+        - 1.25: Strong TOC correlation (boost)
+        - 1.0: Neutral
+        - 0.7-0.9: Weak penalty
+        - 0.5-0.7: Strong penalty (likely garbage number)
+    """
+    if not toc_sections:
+        return 1.0  # No TOC available, no modification
+    
+    normalized = normalize_section_for_comparison(section_number)
+    
+    # Simple numbers don't get TOC-based modification
+    if '.' not in normalized:
+        return 1.0
+    
+    fuzzy_score = calculate_toc_fuzzy_score(section_number, toc_sections)
+    
+    if fuzzy_score >= 0.9:
+        # Exact or near-exact match - strong boost
+        return 1.25
+    elif fuzzy_score >= 0.7:
+        # Good prefix match - modest boost
+        return 1.15
+    elif fuzzy_score >= 0.5:
+        # Partial correlation - slight boost
+        return 1.05
+    elif fuzzy_score >= 0.3:
+        # Weak correlation - neutral to slight penalty
+        return 0.95
+    elif fuzzy_score >= 0.15:
+        # Poor correlation - moderate penalty
+        return 0.80
+    else:
+        # No correlation - strong penalty (likely garbage like 25.28994.1)
+        return 0.60
 
 
 @dataclass
@@ -533,18 +715,22 @@ def calculate_section_confidence(
     Combines multiple factors:
     1. Depth-based confidence (hierarchical numbers are more trustworthy)
     2. Title-based confidence (short, noun-phrase-like topics are more trustworthy)
-    3. TOC matching (if section appears in TOC, boost confidence by 25%)
+    3. TOC fuzzy matching - applies soft penalty/bonus based on correlation with TOC:
+       - Exact match in TOC: 25% confidence boost
+       - Prefix match (e.g., "1.1.A" when TOC has "1.1.1"): 5-15% boost
+       - No correlation (e.g., "25.28994.1" when TOC has "1.x"-"5.x"): up to 40% penalty
     
     High confidence:
     - Deep hierarchical numbers (3.1.2.1) - very unlikely to be list items
     - Medium depth (3.1.2) - quite likely real
-    - Section found in TOC - strong signal it's real
+    - Section found in or correlates with TOC - strong signal it's real
     
     Medium confidence:
     - Shallow hierarchical (3.1) - could be outline or real
     
     Low confidence:
     - Simple numbers (4) - could easily be list items
+    - Sections that don't correlate with TOC structure
     """
     if not section.is_valid:
         return 0.0
@@ -586,12 +772,19 @@ def calculate_section_confidence(
         # For simple numbers, title matters more (0.5 depth, 0.5 title)
         combined = (depth_confidence ** 0.5) * (title_confidence ** 0.5)
     
-    # TOC matching boost (only for hierarchical sections, depth >= 2)
+    # TOC fuzzy matching (only for hierarchical sections, depth >= 2)
     # Simple numbers (1, 2, 3) are too common in text to trust TOC matching
+    # 
+    # This applies a soft penalty/bonus based on how well the section correlates
+    # with the TOC structure:
+    #   - Exact match: 25% boost
+    #   - Prefix match (e.g., "1.1.A" when TOC has "1.1.x"): 15% boost
+    #   - No correlation (e.g., "25.28994.1"): up to 40% penalty
     if toc_sections and depth >= 2:
-        if is_section_in_toc(section.raw, toc_sections):
-            # Boost confidence by 25%, but cap at 0.98
-            combined = min(0.98, combined * 1.25)
+        toc_modifier = get_toc_confidence_modifier(section.raw, toc_sections)
+        combined = combined * toc_modifier
+        # Cap at 0.98 to avoid absolute certainty
+        combined = min(0.98, combined)
     
     return combined
 
