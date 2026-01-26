@@ -44,7 +44,7 @@ except ImportError:
 # Invalid: 4.88 (decimal), 2.5gs (measurement), 20 (no dot), 3.141592 (too precise)
 
 SECTION_NUMBER_PATTERN = re.compile(
-    r'(?<![0-9\.])(\d{1,2}(?:\.\d{1,2}){1,5})(?![0-9]|[a-zA-Z]|\.\d)'
+    r'(?<![0-9\.])(\d{1,2}(?:\.\d{1,2}){1,5})(?=$|[^0-9\.])'
     # (?<![0-9\.]) - not preceded by digit or dot (avoids matching middle of decimals)
     # \d{1,2} - first component is 1-2 digits
     # (?:\.\d{1,2}){1,5} - followed by 1-5 more components of .XX

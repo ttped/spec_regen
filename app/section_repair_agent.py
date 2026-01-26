@@ -496,21 +496,21 @@ class DocumentPositionTracker:
     recent_window: int = 10  # Look at last N observations
     
     def add_observation(self, obs: Observation):
-        """Add an observation and update position estimate."""
         self.observation_history.append(obs)
+        if obs.major is None: return
+
+        # STRICTER RULE: Simple numbers (depth 1) cannot override current position 
+        # unless we have seen TWO of them in sequence or confidence is extremely high (0.95+)
+        is_hierarchical = obs.section.depth > 1
         
-        if obs.major is None:
-            return
-            
-        # High-confidence observations (hierarchical sections) update position strongly
-        if obs.confidence >= 0.8:
+        if is_hierarchical:
+            # Trust hierarchical sections (3.1.1) to reset position
             self.current_major = obs.major
             self.max_confident_major = max(self.max_confident_major, obs.major)
-        elif obs.confidence >= 0.5:
-            # Medium confidence: only update if it's a reasonable progression
-            if obs.major == self.current_major + 1 or obs.major == self.current_major:
+        elif obs.confidence > 0.95:
+            # Very high confidence simple number
+            if self.is_reasonable_next_major(obs.major):
                 self.current_major = obs.major
-                self.max_confident_major = max(self.max_confident_major, obs.major)
         # Low confidence observations don't update position
     
     def get_recent_major_distribution(self) -> Dict[int, float]:

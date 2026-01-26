@@ -205,7 +205,12 @@ def load_toc_pages_text(raw_ocr_path: str, classification_path: str) -> str:
             
             # Find all pages classified as TOC
             for page_class in classification.get('page_classifications', []):
-                if page_class.get('type') == 'TABLE_OF_CONTENTS':
+                p_type = page_class.get('type')
+                if p_type == 'TABLE_OF_CONTENTS':
+                    toc_page_numbers.add(page_class.get('page'))
+                # ADD THIS:
+                elif p_type == 'AMBIGUOUS' and not toc_page_numbers:
+                    # Keep ambiguous pages as candidates if no explicit TOC found yet
                     toc_page_numbers.add(page_class.get('page'))
         except (json.JSONDecodeError, KeyError) as e:
             print(f"    [Warning] Could not parse classification file: {e}")
