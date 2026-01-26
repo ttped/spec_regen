@@ -2,6 +2,7 @@ import os
 import json
 import re
 from typing import List, Dict, Tuple, Optional, Any
+from json_repair import repair_json
 
 
 def get_line_bbox(page_dict: Dict, word_indices: List[int]) -> Optional[Dict]:
@@ -376,22 +377,41 @@ def extract_page_metadata(page_dict: Dict) -> Dict:
 def load_raw_ocr_pages(input_path: str) -> List[Tuple[int, Dict, Dict]]:
     """
     Loads raw OCR data and returns a sorted list of (page_id, page_dict, page_metadata) tuples.
-    Handles malformed JSON files gracefully.
+    Handles malformed JSON files gracefully using json_repair.
     """
     if not os.path.exists(input_path):
         print(f"  - [Error] File not found: {input_path}")
         return []
 
-    # Defensive loading for malformed JSON
+    data = None
+    
+    # 1. Try standard load (Fastest)
     try:
         with open(input_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        print(f"  - [Error] Failed to load JSON from {input_path}: {e}")
+    except json.JSONDecodeError as e:
+        # 2. Try Repair (Slower but robust)
+        if repair_json:
+            print(f"  - [Notice] JSON malformed in {os.path.basename(input_path)}. Attempting repair...")
+            try:
+                with open(input_path, 'r', encoding='utf-8') as f:
+                    file_content = f.read()
+                    # repair_json returns a string of corrected JSON, so we parse it again
+                    repaired_content = repair_json(file_content)
+                    data = json.loads(repaired_content)
+                print(f"  - [Success] File repaired successfully.")
+            except Exception as repair_error:
+                print(f"  - [Error] Repair failed: {repair_error}")
+        else:
+            print(f"  - [Error] JSON malformed and 'json_repair' library not found.")
+            print(f"  - [Action] Run `pip install json_repair` to enable auto-fixing.")
+
+    if data is None:
         return []
 
     pages_to_process = []
 
+    # (The rest of your existing logic remains exactly the same)
     if isinstance(data, dict):
         for key, val in data.items():
             page_dict = get_page_dict_from_object(val)
