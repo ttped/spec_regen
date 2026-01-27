@@ -206,8 +206,9 @@ def extract_features_for_section(
     # =========================================================================
     features['_doc_name'] = doc_name
     features['_index'] = idx
-    features['_section_number'] = section.get('section_number', '')
+    features['_section_number_raw'] = section.get('section_number', '')  # Original OCR'd string
     features['_title'] = section.get('topic', '')[:100]  # Truncate for CSV
+    features['_title_full_length'] = len(section.get('topic', '') or '')  # Full length for reference
     features['_page'] = section.get('page_number', 0)
     features['_label'] = ''  # To be filled manually: 1=valid, 0=false positive
     
@@ -215,6 +216,9 @@ def extract_features_for_section(
     # SECTION NUMBER FEATURES
     # =========================================================================
     parsed = ParsedSection(section.get('section_number', ''))
+    
+    # Add normalized version to metadata too
+    features['_section_number_normalized'] = parsed.normalized
     
     features['section_depth'] = parsed.depth
     features['section_depth_vs_median'] = parsed.depth - doc_stats.depth_median if doc_stats.depth_median else 0
@@ -241,6 +245,130 @@ def extract_features_for_section(
             max_subsection = max(max_subsection, p)
     features['max_subsection_value'] = max_subsection
     features['subsection_looks_like_decimal'] = 1 if max_subsection >= 50 else 0
+    
+    # =========================================================================
+    # SECTION NUMBER STRING ANALYSIS (new features)
+    # =========================================================================
+    raw_section_num = section.get('section_number', '')
+    
+    # Count of alpha characters in section number
+    # Previously: rejected if > 2 alpha chars. Now it's a feature.
+    alpha_count = sum(1 for c in raw_section_num if c.isalpha())
+    features['section_num_alpha_count'] = alpha_count
+    features['section_num_too_many_alpha'] = 1 if alpha_count > 2 else 0
+    
+    # Is this a pure digit section number? (no dots)
+    # Previously: rejected if pure digits > 3 chars. Now it's a feature.
+    digits_only = raw_section_num.replace(' ', '')
+    features['section_num_is_pure_digits'] = 1 if digits_only.isdigit() else 0
+    features['section_num_pure_digit_length'] = len(digits_only) if digits_only.isdigit() else 0
+    features['section_num_pure_digits_too_long'] = 1 if digits_only.isdigit() and len(digits_only) > 3 else 0
+    
+    # Mixed alpha+digit without dots (like "A1" or "B2")
+    # Previously: rejected. Now it's a feature.
+    has_alpha = any(c.isalpha() for c in raw_section_num)
+    has_digit = any(c.isdigit() for c in raw_section_num)
+    has_dot = '.' in raw_section_num
+    features['section_num_mixed_no_dot'] = 1 if has_alpha and has_digit and not has_dot else 0
+    
+    # Length to depth ratio: "1" = 1/1 = 1.0, "1.2.3" = 5/3 = 1.67, "1.10.11" = 7/3 = 2.33
+    # Optimal is ~1.0-1.5, anything > 2 is suspicious
+    section_num_length = len(raw_section_num.replace(' ', ''))  # Length without spaces
+    if parsed.depth > 0:
+        features['section_num_length_to_depth_ratio'] = section_num_length / parsed.depth
+    else:
+        features['section_num_length_to_depth_ratio'] = 0
+    
+    # Flag if ratio is suspicious (> 2.0 means long numbers like 1.10.100)
+    features['section_num_ratio_suspicious'] = 1 if features['section_num_length_to_depth_ratio'] > 2.0 else 0
+    
+    # Raw section number length
+    features['section_num_raw_length'] = section_num_length
+    
+    # Count of dots in raw string (should equal depth - 1 for valid sections)
+    dot_count = raw_section_num.count('.')
+    features['section_num_dot_count'] = dot_count
+    features['section_num_dots_match_depth'] = 1 if dot_count == parsed.depth - 1 else 0
+    
+    # Check for non-standard separators (OCR errors: hyphens, commas, spaces)
+    features['section_num_has_hyphen'] = 1 if '-' in raw_section_num else 0
+    features['section_num_has_comma'] = 1 if ',' in raw_section_num else 0
+    features['section_num_has_space'] = 1 if ' ' in raw_section_num else 0
+    
+    # Count non-standard characters (anything that's not digit or dot)
+    non_standard_chars = sum(1 for c in raw_section_num if not c.isdigit() and c != '.')
+    features['section_num_non_standard_char_count'] = non_standard_chars
+    
+    # Check if section number contains letters (like "3.A" or "A.1")
+    features['section_num_has_letters'] = 1 if any(c.isalpha() for c in raw_section_num) else 0
+    
+    # Check for double dots (OCR error: "1..2")
+    features['section_num_has_double_dot'] = 1 if '..' in raw_section_num else 0
+    
+    # Check if starts/ends with dot (malformed: ".1.2" or "1.2.")
+    features['section_num_starts_with_dot'] = 1 if raw_section_num.startswith('.') else 0
+    features['section_num_ends_with_dot'] = 1 if raw_section_num.endswith('.') else 0
+    
+    # =========================================================================
+    # DETECTION CONTEXT FEATURES (from greedy section_processor)
+    # =========================================================================
+    # These features capture the context in which the section number was found
+    # Useful for ML to determine if this is a real section or false positive
+    
+    detection_ctx = section.get('detection_context', {})
+    
+    # Was there whitespace before the section number? (suggests line start)
+    features['had_leading_whitespace'] = 1 if detection_ctx.get('had_leading_whitespace', False) else 0
+    features['leading_whitespace_len'] = detection_ctx.get('leading_whitespace_len', 0)
+    
+    # Was there text BEFORE the section number? (suggests mid-line, likely false positive)
+    features['had_text_before_number'] = 1 if detection_ctx.get('had_text_before_number', False) else 0
+    
+    # Length of text before the number (0 if at line start)
+    text_before = detection_ctx.get('text_before_number', '')
+    features['text_before_number_len'] = len(text_before)
+    
+    # Check what kind of text was before (if any)
+    if text_before:
+        # Common prefixes that might indicate a reference, not a section
+        reference_words = ['see', 'refer', 'section', 'para', 'paragraph', 'item', 'ref', 'per']
+        features['text_before_is_reference'] = 1 if any(w in text_before.lower() for w in reference_words) else 0
+    else:
+        features['text_before_is_reference'] = 0
+    
+    # Original line length (very long lines might indicate paragraph text, not headers)
+    features['original_line_length'] = detection_ctx.get('original_line_length', 0)
+    
+    # =========================================================================
+    # LINE POSITION FEATURES (inferred from bbox)
+    # =========================================================================
+    bbox = section.get('bbox', {})
+    if bbox:
+        x_pos = bbox.get('left', 0)
+        
+        # Check if X position is at/near the left margin
+        # Sections typically start at consistent left positions
+        # If X is much further right than typical, might be mid-line text
+        if doc_stats.section_x_positions:
+            min_x = min(doc_stats.section_x_positions)
+            # Is this section's X position near the minimum (left margin)?
+            features['x_near_left_margin'] = 1 if x_pos <= min_x * 1.5 else 0
+            features['x_distance_from_min'] = x_pos - min_x
+        else:
+            features['x_near_left_margin'] = 0
+            features['x_distance_from_min'] = 0
+        
+        # Check if X position suggests indentation (deeper sections are often indented)
+        # Compare X position to what's expected for this depth
+        depth_x_median = doc_stats.get_x_median_for_depth(parsed.depth)
+        if depth_x_median is not None:
+            features['x_matches_depth_indent'] = 1 if abs(x_pos - depth_x_median) < 50 else 0
+        else:
+            features['x_matches_depth_indent'] = 0
+    else:
+        features['x_near_left_margin'] = 0
+        features['x_distance_from_min'] = 0
+        features['x_matches_depth_indent'] = 0
     
     # =========================================================================
     # SEQUENCE FEATURES (Kalman-like)
@@ -376,6 +504,12 @@ def extract_features_for_section(
                           'apply', 'follow', 'review', 'contact', 'consult', 'consider']
     features['title_starts_with_imperative'] = 1 if first_word_lower in imperative_starters else 0
     
+    # Title starts with month name (likely a date, not a section title)
+    # Previously this was a hard filter, now it's a feature for ML
+    months = ['january', 'february', 'march', 'april', 'may', 'june', 
+              'july', 'august', 'september', 'october', 'november', 'december']
+    features['title_starts_with_month'] = 1 if first_word_lower in months else 0
+    
     # Contains parenthetical
     features['title_has_parenthetical'] = 1 if re.search(r'\([^)]*\)', title) else 0
     
@@ -390,6 +524,44 @@ def extract_features_for_section(
     # Average word length
     words = title.split()
     features['title_avg_word_length'] = sum(len(w) for w in words) / len(words) if words else 0
+    
+    # =========================================================================
+    # TITLE LENGTH FLAGS (detecting missed sections / absorbed content)
+    # =========================================================================
+    # When a section header is missed, the "title" can become absurdly long
+    # because it absorbs body content. Normal titles are 1-6 words typically.
+    
+    # Absolute length flags
+    features['title_suspiciously_long'] = 1 if len(title) > 100 else 0  # > 100 chars
+    features['title_very_long'] = 1 if len(title) > 200 else 0  # > 200 chars
+    features['title_absurdly_long'] = 1 if len(title) > 500 else 0  # > 500 chars - almost certainly wrong
+    
+    # Word count flags
+    features['title_too_many_words'] = 1 if features['title_length_words'] > 10 else 0
+    features['title_sentence_length'] = 1 if features['title_length_words'] > 15 else 0  # Definitely a sentence
+    
+    # Check for newlines in title (suggests multiple lines were captured)
+    features['title_has_newline'] = 1 if '\n' in title else 0
+    features['title_newline_count'] = title.count('\n')
+    
+    # Check for multiple sentences (multiple periods followed by space+capital)
+    sentence_breaks = len(re.findall(r'\.\s+[A-Z]', title))
+    features['title_sentence_break_count'] = sentence_breaks
+    features['title_has_multiple_sentences'] = 1 if sentence_breaks > 0 else 0
+    
+    # =========================================================================
+    # CONTENT FEATURES (if available)
+    # =========================================================================
+    content = section.get('content', '') or ''
+    features['content_length_chars'] = len(content)
+    features['content_length_words'] = len(content.split()) if content else 0
+    features['content_is_empty'] = 1 if not content.strip() else 0
+    
+    # Ratio of title to content length (high ratio = suspicious, title too long relative to content)
+    if features['content_length_chars'] > 0:
+        features['title_to_content_ratio'] = features['title_length_chars'] / features['content_length_chars']
+    else:
+        features['title_to_content_ratio'] = 0 if features['title_length_chars'] == 0 else 999  # No content but has title
     
     # =========================================================================
     # TOC MATCHING FEATURES
@@ -719,6 +891,10 @@ def process_directory(
     """
     Process all documents in a directory and return a pandas DataFrame.
     
+    If output_csv already exists, labels from the existing file will be preserved
+    and merged back into the new DataFrame (matched by doc_name, section_number, 
+    title, and page).
+    
     Args:
         results_dir: Directory containing *_organized.json and *_classification.json
                     (default: results_simple)
@@ -772,6 +948,69 @@ def process_directory(
     feature_cols = [c for c in df.columns if not c.startswith('_')]
     df = df[meta_cols + feature_cols]
     
+    # =========================================================================
+    # PRESERVE EXISTING LABELS
+    # =========================================================================
+    # Primary key for matching: (_doc_name, _section_number_raw, _title, _page)
+    primary_key_cols = ['_doc_name', '_section_number_raw', '_title', '_page']
+    
+    if output_csv and os.path.exists(output_csv):
+        print(f"\nFound existing CSV: {output_csv}")
+        try:
+            existing_df = pd.read_csv(output_csv)
+            
+            # Check if _label column exists and has any non-empty values
+            if '_label' in existing_df.columns:
+                # Get rows with labels (not empty/NaN)
+                labeled_mask = existing_df['_label'].notna() & (existing_df['_label'] != '')
+                labeled_df = existing_df[labeled_mask]
+                
+                if len(labeled_df) > 0:
+                    print(f"  Found {len(labeled_df)} existing labels to preserve")
+                    
+                    # Create a mapping from primary key to label
+                    # Handle potential column name differences (old vs new)
+                    old_key_cols = []
+                    for col in primary_key_cols:
+                        if col in existing_df.columns:
+                            old_key_cols.append(col)
+                        elif col == '_section_number_raw' and '_section_number' in existing_df.columns:
+                            # Handle old column name
+                            old_key_cols.append('_section_number')
+                    
+                    if len(old_key_cols) >= 3:  # Need at least 3 key columns to match
+                        # Create composite key for existing labels
+                        labeled_df = labeled_df.copy()
+                        labeled_df['_merge_key'] = labeled_df[old_key_cols].astype(str).agg('|'.join, axis=1)
+                        label_map = dict(zip(labeled_df['_merge_key'], labeled_df['_label']))
+                        
+                        # Create composite key for new data
+                        new_key_cols = [c for c in primary_key_cols if c in df.columns]
+                        df['_merge_key'] = df[new_key_cols].astype(str).agg('|'.join, axis=1)
+                        
+                        # Merge labels
+                        labels_before = df['_label'].notna().sum() if '_label' in df.columns else 0
+                        df['_label'] = df['_merge_key'].map(label_map).fillna(df['_label'])
+                        labels_after = df['_label'].notna().sum()
+                        
+                        # Clean up merge key
+                        df = df.drop(columns=['_merge_key'])
+                        
+                        preserved = labels_after - labels_before
+                        print(f"  Preserved {preserved} labels from existing file")
+                        
+                        # Check for labels that couldn't be matched (rows removed)
+                        unmatched = len(labeled_df) - preserved
+                        if unmatched > 0:
+                            print(f"  Warning: {unmatched} labeled rows from old file no longer exist in new data")
+                else:
+                    print("  No existing labels found to preserve")
+            else:
+                print("  Existing file has no _label column")
+                
+        except Exception as e:
+            print(f"  Warning: Could not load existing CSV for label preservation: {e}")
+    
     # Print summary
     print(f"\n{'='*60}")
     print(f"FEATURE EXTRACTION COMPLETE")
@@ -780,6 +1019,13 @@ def process_directory(
     print(f"Documents processed:   {df['_doc_name'].nunique()}")
     print(f"Feature columns:       {len(feature_cols)}")
     print(f"Metadata columns:      {meta_cols}")
+    
+    # Label summary
+    if '_label' in df.columns:
+        labeled_count = df['_label'].notna() & (df['_label'] != '')
+        labeled_count = labeled_count.sum()
+        print(f"Rows with labels:      {labeled_count} / {len(df)} ({100*labeled_count/len(df):.1f}%)")
+    
     print(f"\nFeatures: {feature_cols}")
     
     # Save to CSV if path provided

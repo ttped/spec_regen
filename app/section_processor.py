@@ -171,32 +171,87 @@ def normalize_section_number(raw: str) -> str:
     
     return normalized
 
-def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
+def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[bool, Optional[str], Optional[str], Optional[str], Optional[Dict]]:
     """
-    Checks if a line of text is a section header using regex and heuristics.
+    Checks if a line of text is a section header using regex.
+    
+    GREEDY VERSION: Captures more potential sections and stores context metadata
+    for ML-based filtering later. Only applies minimal filtering here.
     
     Args:
         line_text: The text line to check
         debug: If True, print why a line was rejected
     
     Returns:
-        Tuple of (is_header, section_number, topic, remainder)
+        Tuple of (is_header, section_number, topic, remainder, context)
+        
+        context dict contains:
+            - raw_section_number: Original string before normalization
+            - had_leading_whitespace: Was there whitespace before the number?
+            - leading_whitespace_len: How much whitespace?
+            - had_text_before_number: Was there non-whitespace text before the number?
+            - text_before_number: What text was before the number (if any)
+            - original_line: The full original line
+            - rejection_reason: If rejected, why (for debugging/features)
     """
-    # Primary regex: number followed by space and text
-    match = re.match(r'^\s*([a-zA-Z0-9\.\,\-]+)\s+(.+)', line_text)
-    # Secondary regex: just a number alone on the line
-    match_no_title = re.match(r'^\s*([a-zA-Z0-9\.\,\-]+)\s*$', line_text)
+    context = {
+        'raw_section_number': None,
+        'had_leading_whitespace': False,
+        'leading_whitespace_len': 0,
+        'had_text_before_number': False,
+        'text_before_number': '',
+        'original_line': line_text,
+        'rejection_reason': None,
+        'line_length': len(line_text),
+    }
     
-    if match:
-        potential_num, full_topic = match.groups()
-    elif match_no_title:
-        potential_num = match_no_title.group(1)
+    # Check for leading whitespace
+    stripped = line_text.lstrip()
+    leading_ws = len(line_text) - len(stripped)
+    context['had_leading_whitespace'] = leading_ws > 0
+    context['leading_whitespace_len'] = leading_ws
+    
+    # ==========================================================================
+    # GREEDY REGEX: Find section-number-like patterns ANYWHERE in the line
+    # ==========================================================================
+    
+    # Pattern 1: Section number at START of line (after optional whitespace)
+    # This is the most common and reliable case
+    match_start = re.match(r'^(\s*)([0-9]+(?:[.\-,][0-9]+)*[.\-,]?[A-Za-z]?)\s+(.+)', line_text)
+    match_start_no_title = re.match(r'^(\s*)([0-9]+(?:[.\-,][0-9]+)*[.\-,]?[A-Za-z]?)\s*$', line_text)
+    
+    # Pattern 2: Section number NOT at start (text before it) - GREEDY capture
+    # e.g., "See section 1.2.3 for details" or "Reference: 3.1 Overview"
+    match_mid = re.search(r'(?:^|[:\s])([0-9]+(?:\.[0-9]+)+)\s+([A-Z][A-Za-z].*?)(?:\.|$)', line_text)
+    
+    potential_num = None
+    full_topic = ""
+    
+    if match_start:
+        ws, potential_num, full_topic = match_start.groups()
+        context['had_text_before_number'] = False
+    elif match_start_no_title:
+        ws, potential_num = match_start_no_title.groups()
         full_topic = ""
+        context['had_text_before_number'] = False
+    elif match_mid:
+        # Found section number mid-line - capture it but note the context
+        potential_num, full_topic = match_mid.groups()
+        # Get text before the match
+        match_start_pos = match_mid.start(1)
+        text_before = line_text[:match_start_pos].strip()
+        context['had_text_before_number'] = len(text_before) > 0
+        context['text_before_number'] = text_before[:50]  # Truncate
     else:
+        # No match at all
         if debug:
             print(f"      [DEBUG] Rejected (no regex match): '{line_text[:50]}...'")
-        return False, None, None, None
-
+        context['rejection_reason'] = 'no_regex_match'
+        return False, None, None, None, context
+    
+    # Store raw section number before normalization
+    context['raw_section_number'] = potential_num
+    
     # Normalize the section number (fix OCR separator errors like 1,1.3 -> 1.1.3)
     original_num = potential_num
     potential_num = normalize_section_number(potential_num)
@@ -204,56 +259,39 @@ def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[b
     if debug and original_num != potential_num:
         print(f"      [DEBUG] Normalized section number: '{original_num}' -> '{potential_num}'")
 
-    # Heuristics to filter out false positives
+    # ==========================================================================
+    # MINIMAL FILTERING - Let ML handle most decisions
+    # Only reject things that are DEFINITELY not section numbers
+    # ==========================================================================
     
-    # 1. Reject if topic starts with a month (likely a date)
-    MONTHS = [
-        'january', 'february', 'march', 'april', 'may', 'june', 
-        'july', 'august', 'september', 'october', 'november', 'december'
-    ]
-    if full_topic and any(full_topic.lower().startswith(m) for m in MONTHS):
-        if debug:
-            print(f"      [DEBUG] Rejected (month name): '{potential_num}' '{full_topic[:30]}'")
-        return False, None, None, None
-
-    # 2. Must contain at least one digit
+    # 1. Must contain at least one digit
     if not any(c.isdigit() for c in potential_num):
         if debug:
             print(f"      [DEBUG] Rejected (no digits): '{potential_num}'")
-        return False, None, None, None
+        context['rejection_reason'] = 'no_digits'
+        return False, None, None, None, context
 
-    # 3. Too many alpha characters (likely a word, not a section number)
-    if sum(c.isalpha() for c in potential_num) > 2:
+    # 2. Way too long to be a section number (like a sentence or paragraph)
+    if len(potential_num) > 30:
         if debug:
-            print(f"      [DEBUG] Rejected (too many alpha chars): '{potential_num}'")
-        return False, None, None, None
-        
-    # 4. Too long to be a section number
-    if len(potential_num) > 20:
-        if debug:
-            print(f"      [DEBUG] Rejected (too long): '{potential_num}'")
-        return False, None, None, None
+            print(f"      [DEBUG] Rejected (too long > 30): '{potential_num}'")
+        context['rejection_reason'] = 'too_long'
+        return False, None, None, None, context
 
-    # 5. Pure alpha (no digits) - already caught by rule 2, but explicit
-    if potential_num.isalpha():
+    # 3. Pure alpha (no digits) - already caught by rule 1, but explicit
+    if potential_num.replace('.', '').replace('-', '').replace(',', '').isalpha():
         if debug:
             print(f"      [DEBUG] Rejected (pure alpha): '{potential_num}'")
-        return False, None, None, None
+        context['rejection_reason'] = 'pure_alpha'
+        return False, None, None, None, context
 
-    # 6. Pure digits but too many (like a year or ID number)
-    if potential_num.isdigit() and len(potential_num) > 3:
-        if debug:
-            print(f"      [DEBUG] Rejected (pure digits > 3 chars): '{potential_num}'")
-        return False, None, None, None
-
-    # 7. Mixed alpha+digit without dots (like "A1" or "B2" - not section numbers)
-    has_alpha = any(c.isalpha() for c in potential_num)
-    has_digit = any(c.isdigit() for c in potential_num)
-    has_dot = '.' in potential_num
-    if has_alpha and has_digit and not has_dot:
-        if debug:
-            print(f"      [DEBUG] Rejected (mixed alpha+digit, no dot): '{potential_num}'")
-        return False, None, None, None
+    # ==========================================================================
+    # REMOVED FILTERS (now handled by ML features):
+    # - Month name check (now a feature)
+    # - Too many alpha characters (now a feature) 
+    # - Pure digits > 3 chars (now a feature)
+    # - Mixed alpha+digit without dots (now a feature)
+    # ==========================================================================
 
     section_num = potential_num.strip().rstrip('.')
     topic, remainder = split_topic_at_period(full_topic)
@@ -261,7 +299,16 @@ def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[b
     if debug:
         print(f"      [DEBUG] ACCEPTED: section='{section_num}' topic='{topic[:30] if topic else ''}...'")
     
-    return True, section_num, topic.strip(), remainder.strip()
+    return True, section_num, topic.strip(), remainder.strip(), context
+
+
+def check_if_paragraph_is_header_legacy(line_text: str, debug: bool = False) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
+    """
+    LEGACY VERSION: Original function signature for backward compatibility.
+    Wraps the new greedy function but returns the old tuple format.
+    """
+    is_header, section_num, topic, remainder, context = check_if_paragraph_is_header(line_text, debug)
+    return is_header, section_num, topic, remainder
 
 
 def group_elements_with_bbox(elements: List[Dict]) -> List[Dict]:
@@ -472,7 +519,6 @@ def run_section_processing_on_file(
             json.dump([], f)
         return
 
-    # How does the discern whether it is a content page?
     content_pages = [(pid, pdict, pmeta) for pid, pdict, pmeta in pages_to_process if pid >= content_start_page]
     
     skipped_count = len(pages_to_process) - len(content_pages)
@@ -490,15 +536,12 @@ def run_section_processing_on_file(
     dropped_header_lines = 0
     dropped_footer_lines = 0
     
-    # These pages signal whether it is a content page?
     for page_id, page_dict, page_meta in content_pages:
         if page_meta:
             all_page_metadata[page_id] = page_meta
         
-        # I'm assuming this attempt to convert the document in to something that is read from top to bottom?
         lines = reconstruct_lines_with_bbox(page_dict)
         
-        # Header/foot logic seems correct
         for line_data in lines:
             line_text = line_data['text'].strip()
             if not line_text:
@@ -520,8 +563,7 @@ def run_section_processing_on_file(
                     continue
             # ---------------------
 
-            # Logic for determing if section like 1.1.1?
-            is_header, section_num, topic, remainder = check_if_paragraph_is_header(line_text)
+            is_header, section_num, topic, remainder, context = check_if_paragraph_is_header(line_text)
 
             if is_header:
                 raw_elements.append({
@@ -530,10 +572,19 @@ def run_section_processing_on_file(
                     "topic": topic,
                     "content": "",
                     "page_number": page_id,
-                    "bbox": line_bbox
+                    "bbox": line_bbox,
+                    # Store context for ML features
+                    "detection_context": {
+                        "raw_section_number": context.get('raw_section_number'),
+                        "had_leading_whitespace": context.get('had_leading_whitespace', False),
+                        "leading_whitespace_len": context.get('leading_whitespace_len', 0),
+                        "had_text_before_number": context.get('had_text_before_number', False),
+                        "text_before_number": context.get('text_before_number', ''),
+                        "original_line_length": context.get('line_length', 0),
+                    }
                 })
                 
-                if remainder: # What is remainder? Extra text?
+                if remainder:
                     raw_elements.append({
                         "type": "unassigned_text_block",
                         "content": remainder,
@@ -541,7 +592,6 @@ def run_section_processing_on_file(
                         "bbox": line_bbox
                     })
             else:
-                # Seems correct to preserve all text
                 raw_elements.append({
                     "type": "unassigned_text_block",
                     "content": line_text,
@@ -549,7 +599,6 @@ def run_section_processing_on_file(
                     "bbox": line_bbox
                 })
     
-    # What is the purpose of this?
     final_elements = group_elements_with_bbox(raw_elements)
 
     output_data = {
