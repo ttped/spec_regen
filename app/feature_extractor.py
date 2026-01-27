@@ -432,20 +432,71 @@ def extract_features_for_section(
     features['extended_sandwich_score'] = _compute_extended_sandwich_score(idx, all_sections)
     
     # =========================================================================
-    # BOUNDING BOX FEATURES (normalized to document)
+    # BOUNDING BOX FEATURES (normalized to page dimensions)
     # =========================================================================
+    # Page dimensions come from image_meta.render_raw.width_px/height_px
+    # This allows proper normalization as percentages (0-1) that are
+    # comparable across documents with different page sizes
+    
     bbox = section.get('bbox', {})
     
-    if bbox and doc_stats.x_median:
+    if bbox:
         x_pos = bbox.get('left', 0)
         y_pos = bbox.get('top', 0)
         width = bbox.get('width', 0)
         height = bbox.get('height', 0)
+        right_pos = x_pos + width
+        bottom_pos = y_pos + height
         
-        # Deviation from document median
-        features['x_deviation_from_median'] = (x_pos - doc_stats.x_median) / doc_stats.x_std if doc_stats.x_std else 0
+        # Raw pixel values (for reference)
+        features['bbox_left_px'] = x_pos
+        features['bbox_top_px'] = y_pos
+        features['bbox_width_px'] = width
+        features['bbox_height_px'] = height
         
-        # Deviation from depth-specific median
+        # =====================================================================
+        # NORMALIZED POSITIONS (as percentage of page, 0.0 to 1.0)
+        # =====================================================================
+        # These are comparable across documents with different page sizes
+        
+        if doc_stats.page_width > 0:
+            features['bbox_left_pct'] = x_pos / doc_stats.page_width
+            features['bbox_right_pct'] = right_pos / doc_stats.page_width
+            features['bbox_width_pct'] = width / doc_stats.page_width
+            features['bbox_center_x_pct'] = (x_pos + width / 2) / doc_stats.page_width
+        else:
+            features['bbox_left_pct'] = 0
+            features['bbox_right_pct'] = 0
+            features['bbox_width_pct'] = 0
+            features['bbox_center_x_pct'] = 0
+        
+        if doc_stats.page_height > 0:
+            features['bbox_top_pct'] = y_pos / doc_stats.page_height
+            features['bbox_bottom_pct'] = bottom_pos / doc_stats.page_height
+            features['bbox_height_pct'] = height / doc_stats.page_height
+            features['bbox_center_y_pct'] = (y_pos + height / 2) / doc_stats.page_height
+        else:
+            features['bbox_top_pct'] = 0
+            features['bbox_bottom_pct'] = 0
+            features['bbox_height_pct'] = 0
+            features['bbox_center_y_pct'] = 0
+        
+        # =====================================================================
+        # DEVIATION FROM DOCUMENT NORMS (z-scores)
+        # =====================================================================
+        # How does this section's position compare to other sections in same doc?
+        
+        if doc_stats.x_std and doc_stats.x_std > 0:
+            features['x_deviation_from_median'] = (x_pos - doc_stats.x_median) / doc_stats.x_std
+        else:
+            features['x_deviation_from_median'] = 0
+        
+        if doc_stats.y_std and doc_stats.y_std > 0:
+            features['y_deviation_from_median'] = (y_pos - doc_stats.y_median) / doc_stats.y_std
+        else:
+            features['y_deviation_from_median'] = 0
+        
+        # Deviation from depth-specific median (sections at same depth should align)
         depth_x_median = doc_stats.get_x_median_for_depth(parsed.depth)
         depth_x_std = doc_stats.get_x_std_for_depth(parsed.depth)
         if depth_x_median is not None and depth_x_std and depth_x_std > 0:
@@ -453,25 +504,47 @@ def extract_features_for_section(
         else:
             features['x_deviation_from_depth_median'] = 0
         
-        # Relative position on page (0-1)
-        if doc_stats.page_width > 0:
-            features['x_position_relative'] = x_pos / doc_stats.page_width
-        else:
-            features['x_position_relative'] = 0
+        # =====================================================================
+        # POSITION FLAGS
+        # =====================================================================
+        # Is this near the left margin? (typical for section headers)
+        features['is_near_left_margin'] = 1 if features.get('bbox_left_pct', 1) < 0.15 else 0
         
-        if doc_stats.page_height > 0:
-            features['y_position_relative'] = y_pos / doc_stats.page_height
-        else:
-            features['y_position_relative'] = 0
+        # Is this indented? (might indicate subsection or list item)
+        features['is_indented'] = 1 if features.get('bbox_left_pct', 0) > 0.10 else 0
         
-        # Width relative to page
-        if doc_stats.page_width > 0:
-            features['width_relative'] = width / doc_stats.page_width
-        else:
-            features['width_relative'] = 0
+        # Is this in the header zone? (top 10% of page)
+        features['is_in_header_zone'] = 1 if features.get('bbox_top_pct', 1) < 0.10 else 0
+        
+        # Is this in the footer zone? (bottom 10% of page)
+        features['is_in_footer_zone'] = 1 if features.get('bbox_top_pct', 0) > 0.90 else 0
+        
+        # Legacy compatibility
+        features['x_position_relative'] = features.get('bbox_left_pct', 0)
+        features['y_position_relative'] = features.get('bbox_top_pct', 0)
+        features['width_relative'] = features.get('bbox_width_pct', 0)
+        
     else:
+        # No bbox data available
+        features['bbox_left_px'] = 0
+        features['bbox_top_px'] = 0
+        features['bbox_width_px'] = 0
+        features['bbox_height_px'] = 0
+        features['bbox_left_pct'] = 0
+        features['bbox_right_pct'] = 0
+        features['bbox_width_pct'] = 0
+        features['bbox_center_x_pct'] = 0
+        features['bbox_top_pct'] = 0
+        features['bbox_bottom_pct'] = 0
+        features['bbox_height_pct'] = 0
+        features['bbox_center_y_pct'] = 0
         features['x_deviation_from_median'] = 0
+        features['y_deviation_from_median'] = 0
         features['x_deviation_from_depth_median'] = 0
+        features['is_near_left_margin'] = 0
+        features['is_indented'] = 0
+        features['is_in_header_zone'] = 0
+        features['is_in_footer_zone'] = 0
         features['x_position_relative'] = 0
         features['y_position_relative'] = 0
         features['width_relative'] = 0
@@ -506,9 +579,62 @@ def extract_features_for_section(
     
     # Title starts with month name (likely a date, not a section title)
     # Previously this was a hard filter, now it's a feature for ML
-    months = ['january', 'february', 'march', 'april', 'may', 'june', 
-              'july', 'august', 'september', 'october', 'november', 'december']
-    features['title_starts_with_month'] = 1 if first_word_lower in months else 0
+    months_full = ['january', 'february', 'march', 'april', 'may', 'june', 
+                   'july', 'august', 'september', 'october', 'november', 'december']
+    months_abbrev = ['jan', 'feb', 'mar', 'apr', 'jun', 'jul', 'aug', 'sep', 'sept', 'oct', 'nov', 'dec']
+    all_months = months_full + months_abbrev
+    
+    features['title_starts_with_month'] = 1 if first_word_lower.rstrip('-.') in all_months else 0
+    
+    # =========================================================================
+    # DATE PATTERN DETECTION
+    # =========================================================================
+    # Pattern: section_number="17" + title="Jan-1999" or "December-97"
+    # This is a common false positive where dates get split into section + title
+    
+    section_num = section.get('section_number', '')
+    
+    # Check if section number could be a day (1-31)
+    is_possible_day = False
+    try:
+        num_val = int(section_num.replace('.', '').replace('-', '').replace(',', ''))
+        is_possible_day = 1 <= num_val <= 31
+    except ValueError:
+        pass
+    features['section_num_is_possible_day'] = 1 if is_possible_day else 0
+    
+    # Check if title starts with month (full or abbreviated, with optional separator)
+    # Patterns: "Jan-1999", "January 1999", "Dec-97", "December, 1997"
+    title_lower = title.lower().strip()
+    title_starts_month = False
+    for month in all_months:
+        if title_lower.startswith(month):
+            title_starts_month = True
+            break
+    features['title_starts_with_month_pattern'] = 1 if title_starts_month else 0
+    
+    # Check if title contains year pattern after month
+    # Matches: "Jan-1999", "January 1999", "Dec-97", "Mar, 2001"
+    year_after_month_pattern = re.search(
+        r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december)'
+        r'[\s,\-\.]*'
+        r'(\d{2,4})($|\s|[,\.])',
+        title_lower
+    )
+    features['title_is_month_year'] = 1 if year_after_month_pattern else 0
+    
+    # Combined date flag: section looks like day AND title looks like month-year
+    features['looks_like_date'] = 1 if (is_possible_day and (title_starts_month or year_after_month_pattern)) else 0
+    
+    # Also check for other date patterns in title
+    # e.g., "1999", "12/25/1999", "1999-01-15"
+    has_date_pattern = bool(re.search(
+        r'(^|\s)(\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4})|'  # 12/25/1999 or 12-25-99
+        r'(\d{4}[/\-\.]\d{1,2}[/\-\.]\d{1,2})|'  # 1999-12-25
+        r'(^(19|20)\d{2}($|\s|[,\.]))',  # Standalone year like 1999 or 2001
+        title
+    ))
+    features['title_has_date_pattern'] = 1 if has_date_pattern else 0
     
     # Contains parenthetical
     features['title_has_parenthetical'] = 1 if re.search(r'\([^)]*\)', title) else 0
