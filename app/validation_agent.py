@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 # Matches: 1, 1.1, 1.1.1, 2.3.4.5, etc.
 # Must be at or near the start of a line (after optional whitespace)
 SECTION_NUMBER_PATTERN = re.compile(
-    r'(?:^|\n)\s*(\d{1,2}(?:\.\d{1,2}){0,5})(?=\s|\.{2,}|$)',
+    r'(?:^|\n)\s*(\d{1,2}(?:\.\d{1,2}){0,5})(?=$|\s|[^0-9\.])', 
     re.MULTILINE
 )
 
@@ -38,36 +38,14 @@ SECTION_WITH_TITLE_PATTERN = re.compile(
 
 
 def normalize_section_number(raw: str) -> str:
-    """
-    Normalize a section number for comparison.
-    - Remove trailing dots
-    - Normalize separators (comma -> dot, hyphen -> dot)
-    - Strip whitespace
-    """
-    if not raw:
-        return ""
-    
-    normalized = raw.strip()
-    
-    # Replace comma with period
-    normalized = normalized.replace(',', '.')
-    
-    # Replace hyphen between digits with period
+    if not raw: return ""
+    normalized = raw.strip().replace(',', '.').replace('..', '.')
+    # Fix 1-1-3 -> 1.1.3
     while True:
         new_normalized = re.sub(r'(\d)-(\d)', r'\1.\2', normalized)
-        if new_normalized == normalized:
-            break
+        if new_normalized == normalized: break
         normalized = new_normalized
-    
-    # Remove trailing dots
-    normalized = normalized.rstrip('.')
-    
-    # Clean up double dots
-    while '..' in normalized:
-        normalized = normalized.replace('..', '.')
-    
-    return normalized
-
+    return normalized.rstrip('.')
 
 def is_valid_section_number(num: str) -> bool:
     """
@@ -185,15 +163,21 @@ def extract_sections_from_toc_text(toc_text: str) -> Set[str]:
     return sections
 
 
-def load_toc_pages_text(raw_ocr_path: str, classification_path: str) -> str:
+def load_toc_pages_text(raw_ocr_path: str, classification_path: str) -> Tuple[str, bool]:
     """
     Load and combine text from TOC pages.
     
     Uses classification results to identify which pages are TOC,
     then extracts their text from the raw OCR.
+    
+    Returns:
+        Tuple of (toc_text, has_toc_in_classification)
+        - toc_text: Combined text from TOC pages
+        - has_toc_in_classification: True if classify_agent found TOC pages
     """
     # Load classification to find TOC pages
     toc_page_numbers = set()
+    explicit_toc_found = False  # Track if classify_agent explicitly found TOC
     content_start_page = 1
     
     if os.path.exists(classification_path):
@@ -208,9 +192,9 @@ def load_toc_pages_text(raw_ocr_path: str, classification_path: str) -> str:
                 p_type = page_class.get('type')
                 if p_type == 'TABLE_OF_CONTENTS':
                     toc_page_numbers.add(page_class.get('page'))
-                # ADD THIS:
+                    explicit_toc_found = True  # classify_agent found TOC!
+                # Also include ambiguous pages as candidates if no explicit TOC found yet
                 elif p_type == 'AMBIGUOUS' and not toc_page_numbers:
-                    # Keep ambiguous pages as candidates if no explicit TOC found yet
                     toc_page_numbers.add(page_class.get('page'))
         except (json.JSONDecodeError, KeyError) as e:
             print(f"    [Warning] Could not parse classification file: {e}")
@@ -221,19 +205,19 @@ def load_toc_pages_text(raw_ocr_path: str, classification_path: str) -> str:
     
     if not toc_page_numbers:
         print("    [Warning] No TOC pages identified")
-        return ""
+        return "", False
     
     # Load raw OCR and extract TOC page text
     if not os.path.exists(raw_ocr_path):
         print(f"    [Warning] Raw OCR file not found: {raw_ocr_path}")
-        return ""
+        return "", explicit_toc_found
     
     try:
         with open(raw_ocr_path, 'r', encoding='utf-8') as f:
             raw_data = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         print(f"    [Warning] Could not load raw OCR: {e}")
-        return ""
+        return "", explicit_toc_found
     
     toc_texts = []
     
@@ -270,7 +254,7 @@ def load_toc_pages_text(raw_ocr_path: str, classification_path: str) -> str:
                     if isinstance(text_list, list):
                         toc_texts.append(" ".join(str(t) for t in text_list))
     
-    return "\n".join(toc_texts)
+    return "\n".join(toc_texts), explicit_toc_found
 
 
 # =============================================================================
@@ -334,7 +318,7 @@ class ValidationResult:
     match_percentage: float = 0.0
     toc_coverage: float = 0.0  # What % of TOC sections did we find?
     precision: float = 0.0     # What % of our sections are in TOC?
-    has_toc: bool = False      # Did this document have a TOC?
+    has_toc: bool = False      # Did this document have a TOC? (based on classification)
     
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization."""
@@ -348,7 +332,8 @@ class ValidationResult:
                 "extra_count": len(self.in_output_not_toc),
                 "match_percentage": round(self.match_percentage, 2),
                 "toc_coverage": round(self.toc_coverage, 2),
-                "precision": round(self.precision, 2)
+                "precision": round(self.precision, 2),
+                "note": "has_toc is now based on classify_agent finding TABLE_OF_CONTENTS pages"
             },
             "toc_sections": sorted(self.toc_sections, key=section_sort_key),
             "output_sections": sorted(self.output_sections, key=section_sort_key),
@@ -373,21 +358,30 @@ def section_sort_key(section: str) -> Tuple:
     return tuple(result)
 
 
-def compare_sections(toc_sections: Set[str], output_sections: Set[str]) -> ValidationResult:
+def compare_sections(toc_sections: Set[str], output_sections: Set[str], has_toc_from_classification: bool = None) -> ValidationResult:
     """
     Compare TOC sections against output sections.
     
     Args:
         toc_sections: Section numbers found in TOC
         output_sections: Section numbers found in output
+        has_toc_from_classification: Whether classify_agent found TOC pages.
+            If provided, this overrides the default behavior of checking
+            if toc_sections is non-empty.
         
     Returns:
         ValidationResult with comparison details
     """
+    # Determine has_toc: prefer classification result, fallback to checking toc_sections
+    if has_toc_from_classification is not None:
+        has_toc = has_toc_from_classification
+    else:
+        has_toc = len(toc_sections) > 0
+    
     result = ValidationResult(
         toc_sections=toc_sections,
         output_sections=output_sections,
-        has_toc=len(toc_sections) > 0
+        has_toc=has_toc
     )
     
     # Find matches, missing, and extra
@@ -433,16 +427,18 @@ def run_validation(
         ValidationResult
     """
     print(f"  - Extracting sections from TOC pages...")
-    toc_text = load_toc_pages_text(raw_ocr_path, classification_path)
+    toc_text, has_toc_from_classification = load_toc_pages_text(raw_ocr_path, classification_path)
     toc_sections = extract_sections_from_toc_text(toc_text)
-    print(f"    Found {len(toc_sections)} sections in TOC")
+    print(f"    Found {len(toc_sections)} sections in TOC text")
+    print(f"    Classification reports TOC present: {has_toc_from_classification}")
     
     print(f"  - Extracting sections from output...")
     output_sections = extract_sections_from_output(output_path)
     print(f"    Found {len(output_sections)} sections in output")
     
     print(f"  - Comparing sections...")
-    result = compare_sections(toc_sections, output_sections)
+    # Pass has_toc_from_classification to use classify_agent's determination
+    result = compare_sections(toc_sections, output_sections, has_toc_from_classification)
     
     # Print summary
     print(f"  - Results:")
