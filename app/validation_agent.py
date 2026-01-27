@@ -19,21 +19,34 @@ from dataclasses import dataclass, field
 
 
 # =============================================================================
-# SECTION NUMBER PARSING (reused patterns from other modules)
+# SECTION NUMBER PARSING - GREEDY VERSION FOR TOC
 # =============================================================================
+# Since we KNOW we're looking at TOC pages (already classified by classify_agent),
+# we can be much more aggressive/greedy in finding section numbers.
+# TOC entries typically look like:
+#   1.1.1 ............ Some Title
+#   1.1.1    Section Title
+#   1.1.1 Section Title .... 5
+# There are usually 10-30+ sections per TOC page.
 
-# Pattern for hierarchical section numbers in TOC
-# Matches: 1, 1.1, 1.1.1, 2.3.4.5, etc.
-# Must be at or near the start of a line (after optional whitespace)
-SECTION_NUMBER_PATTERN = re.compile(
-    r'(?:^|\n)\s*(\d{1,2}(?:\.\d{1,2}){0,5})(?=$|\s|[^0-9\.])', 
-    re.MULTILINE
+# GREEDY pattern - finds section numbers ANYWHERE in text
+# Matches: 1.1, 1.1.1, 2.3.4.5, etc. (must have at least one dot)
+# Does NOT require start of line - OCR often mangles line breaks
+SECTION_NUMBER_PATTERN_GREEDY = re.compile(
+    r'(?<![0-9])(\d{1,2}(?:\.\d{1,3}){1,6})(?![0-9])',
+    # (?<![0-9]) - not preceded by digit (avoids partial matches)
+    # \d{1,2} - first component 1-2 digits
+    # (?:\.\d{1,3}){1,6} - 1-6 more components of .X, .XX, or .XXX
+    # (?![0-9]) - not followed by digit
 )
 
-# Alternative pattern for sections that might have titles right after
-SECTION_WITH_TITLE_PATTERN = re.compile(
-    r'(?:^|\n)\s*(\d{1,2}(?:\.\d{1,2}){0,5})\s+[A-Z]',
-    re.MULTILINE
+# Pattern for top-level sections (just "1", "2", "3", etc.)
+# These need SOME context to avoid matching page numbers everywhere
+# Look for digit followed by space(s) and letter ON SAME LINE (title start)
+TOP_LEVEL_SECTION_PATTERN = re.compile(
+    r'(?<![0-9.])(\d{1,2})[ \t]+[A-Za-z]',  # "1 Introduction", "2 Scope"
+    # No newline requirement - just needs letter after to confirm it's a section
+    # Use [ \t]+ instead of \s+ to avoid matching across newlines
 )
 
 
@@ -47,10 +60,11 @@ def normalize_section_number(raw: str) -> str:
         normalized = new_normalized
     return normalized.rstrip('.')
 
-def is_valid_section_number(num: str) -> bool:
+
+def is_valid_section_number_strict(num: str) -> bool:
     """
-    Check if a string looks like a valid section number.
-    Filters out things that look like page numbers, dates, etc.
+    STRICT validation - used for non-TOC contexts.
+    Filters out things that look like page numbers, dates, decimals, etc.
     """
     if not num:
         return False
@@ -93,10 +107,55 @@ def is_valid_section_number(num: str) -> bool:
     return True
 
 
+def is_valid_section_number_greedy(num: str) -> bool:
+    """
+    GREEDY validation for TOC context - much more permissive.
+    Since we know we're in a TOC, most X.Y.Z patterns are valid sections.
+    """
+    if not num:
+        return False
+    
+    normalized = normalize_section_number(num)
+    
+    # Must have at least one digit
+    if not any(c.isdigit() for c in normalized):
+        return False
+    
+    parts = normalized.split('.')
+    
+    # Must have at least 2 parts for greedy mode (1.1 minimum)
+    # This avoids matching standalone numbers like page numbers
+    if len(parts) < 2:
+        return False
+    
+    # Check each part is a reasonable number
+    for part in parts:
+        try:
+            val = int(part)
+            # Be generous - allow up to 999 for each component
+            # Real sections can have high numbers like 10.2.15.3
+            if val > 999:
+                return False
+        except ValueError:
+            # Non-numeric part (like 'A' in '3.A') - allow single letters
+            if not re.match(r'^[A-Za-z]{1,2}$', part):
+                return False
+    
+    return True
+
+
+# Keep old function name for compatibility with other code
+def is_valid_section_number(num: str) -> bool:
+    """Wrapper that uses strict validation by default."""
+    return is_valid_section_number_strict(num)
+
+
 def is_likely_decimal(num: str) -> bool:
     """
     Check if a number looks like a decimal value rather than a section number.
     E.g., 4.88, 2.50, 3.75
+    
+    STRICT version - used for non-TOC contexts.
     """
     parts = normalize_section_number(num).split('.')
     
@@ -120,13 +179,55 @@ def is_likely_decimal(num: str) -> bool:
     return False
 
 
+def is_likely_decimal_greedy(num: str) -> bool:
+    """
+    GREEDY version for TOC - reject obvious decimals but be permissive.
+    In TOC context, we want to accept more patterns as valid sections.
+    
+    Rejects: 4.88, 12.50, 1.05, 2.99, 3.75 (look like prices/measurements)
+    Accepts: 1.1, 3.10, 3.21, 4.12, 10.1 (look like sections)
+    """
+    parts = normalize_section_number(num).split('.')
+    
+    # Only applies to X.Y format (two parts)
+    if len(parts) != 2:
+        return False
+    
+    try:
+        first_val = int(parts[0])
+        second_val = int(parts[1])
+        second_str = parts[1]
+        
+        # Leading zero like 1.05, 2.00, 3.08 - likely decimal
+        if second_str.startswith('0') and len(second_str) >= 2:
+            return True
+        
+        # Two-digit second component that's high (>=50) suggests decimal
+        # Section numbers can have X.21, X.32, X.45 etc.
+        # But X.88, X.99, X.75 are almost certainly decimals
+        if len(second_str) == 2 and second_val >= 50:
+            return True
+        
+        # Exact cents-like patterns that are very common: .25, .50, .75, .99
+        if len(second_str) == 2 and second_val in [25, 75, 99]:
+            return True
+            
+    except ValueError:
+        pass
+    
+    return False
+
+
 # =============================================================================
-# TOC PARSING
+# TOC PARSING - GREEDY EXTRACTION
 # =============================================================================
 
 def extract_sections_from_toc_text(toc_text: str) -> Set[str]:
     """
-    Extract section numbers from TOC page text.
+    Extract section numbers from TOC page text using GREEDY matching.
+    
+    Since we know this is TOC text (already classified), we can be aggressive
+    in finding section numbers. TOC pages typically have 10-30+ sections.
     
     Args:
         toc_text: Flattened text from TOC pages
@@ -136,29 +237,39 @@ def extract_sections_from_toc_text(toc_text: str) -> Set[str]:
     """
     sections = set()
     
-    # Try multiple patterns
-    # Pattern 1: Section number at start of line
-    matches1 = SECTION_NUMBER_PATTERN.findall(toc_text)
+    if not toc_text:
+        return sections
     
-    # Pattern 2: Section number followed by title
-    matches2 = SECTION_WITH_TITLE_PATTERN.findall(toc_text)
+    # ==========================================================================
+    # PRIMARY: Find ALL X.Y.Z patterns anywhere in text (greedy)
+    # This catches most section numbers without requiring newlines
+    # ==========================================================================
+    greedy_matches = SECTION_NUMBER_PATTERN_GREEDY.findall(toc_text)
     
-    # Combine all matches
-    all_matches = set(matches1) | set(matches2)
-    
-    for match in all_matches:
+    for match in greedy_matches:
         normalized = normalize_section_number(match)
-        
-        if not normalized:
-            continue
-            
-        if not is_valid_section_number(normalized):
-            continue
-            
-        if is_likely_decimal(normalized):
-            continue
-        
-        sections.add(normalized)
+        if normalized and is_valid_section_number_greedy(normalized):
+            if not is_likely_decimal_greedy(normalized):
+                sections.add(normalized)
+    
+    # ==========================================================================
+    # SECONDARY: Top-level sections (1, 2, 3 followed by title text)
+    # These don't have dots so need some context to avoid page numbers
+    # ==========================================================================
+    top_level_matches = TOP_LEVEL_SECTION_PATTERN.findall(toc_text)
+    
+    for match in top_level_matches:
+        normalized = normalize_section_number(match)
+        if normalized:
+            try:
+                val = int(normalized)
+                # Top-level sections are usually 1-30
+                if 1 <= val <= 30:
+                    sections.add(normalized)
+            except ValueError:
+                pass
+    
+    return sections
     
     return sections
 
