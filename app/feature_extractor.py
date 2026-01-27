@@ -9,6 +9,12 @@ not absolute values. Section formatting is consistent within a document
 but varies across documents.
 
 Output: CSV with features + metadata for manual labeling
+
+UPDATES (v2):
+- Added vertical_gap_from_prev_line: Distance (px and pct) from previous line
+- Added newlines_before_section_num: Count of newlines preceding the section number
+- Removed is_sandwiched and sandwich_same_neighbors (negative correlation)
+- Added manual labeling helper features (see MANUAL LABELING FEATURES section)
 """
 
 import os
@@ -121,6 +127,9 @@ class DocumentStats:
     section_widths: List[float] = field(default_factory=list)
     section_heights: List[float] = field(default_factory=list)
     
+    # Vertical gaps between consecutive sections (NEW)
+    vertical_gaps: List[float] = field(default_factory=list)
+    
     # By depth
     x_by_depth: Dict[int, List[float]] = field(default_factory=lambda: defaultdict(list))
     
@@ -147,6 +156,10 @@ class DocumentStats:
     title_len_std: float = 0
     depth_median: float = 0
     
+    # Vertical gap stats (NEW)
+    vertical_gap_median: float = 0
+    vertical_gap_std: float = 0
+    
     def compute_stats(self):
         """Compute derived statistics after collecting all data."""
         if self.section_x_positions:
@@ -163,6 +176,11 @@ class DocumentStats:
         
         if self.depths:
             self.depth_median = statistics.median(self.depths)
+        
+        # Compute vertical gap stats (NEW)
+        if self.vertical_gaps:
+            self.vertical_gap_median = statistics.median(self.vertical_gaps)
+            self.vertical_gap_std = statistics.stdev(self.vertical_gaps) if len(self.vertical_gaps) > 1 else 1
     
     def get_x_median_for_depth(self, depth: int) -> Optional[float]:
         """Get median X position for sections at a specific depth."""
@@ -340,6 +358,17 @@ def extract_features_for_section(
     features['original_line_length'] = detection_ctx.get('original_line_length', 0)
     
     # =========================================================================
+    # NEW: NEWLINES BEFORE SECTION NUMBER
+    # =========================================================================
+    # Count newlines in detection context - new sections often have whitespace above
+    # This captures whether the section number was preceded by blank lines
+    original_line = detection_ctx.get('original_line', '')
+    
+    # Count leading newlines in the original line (if captured)
+    # This would need to be captured in section_processor if not already
+    features['newlines_before_section_num'] = detection_ctx.get('newlines_before', 0)
+    
+    # =========================================================================
     # LINE POSITION FEATURES (inferred from bbox)
     # =========================================================================
     bbox = section.get('bbox', {})
@@ -395,7 +424,7 @@ def extract_features_for_section(
         features['depth_change_from_prev'] = 0
         features['is_logical_next'] = 1  # First section is always "logical"
     
-    # Look ahead for sandwich detection
+    # Look ahead for context
     if idx < len(all_sections) - 1:
         next_section = all_sections[idx + 1]
         next_parsed = ParsedSection(next_section.get('section_number', ''))
@@ -405,31 +434,78 @@ def extract_features_for_section(
             features['major_gap_to_next'] = next_major - major
         else:
             features['major_gap_to_next'] = 0
+        
+        # NEW: Is the NEXT section a logical successor to THIS one?
+        # This helps identify if current section "fits" in the sequence
+        features['next_is_logical_successor'] = _is_logical_next(parsed, next_parsed)
     else:
         features['major_gap_to_next'] = 0
+        features['next_is_logical_successor'] = 0
     
     # =========================================================================
-    # SANDWICH FEATURES
+    # EXTENDED SEQUENCE FEATURES (replaces problematic sandwich features)
     # =========================================================================
-    # Check if this section is "sandwiched" between sections with different major
-    features['is_sandwiched'] = 0
-    features['sandwich_same_neighbors'] = 0
+    # Instead of sandwich detection (which had negative correlation),
+    # focus on sequence continuity and logical flow
     
-    if 0 < idx < len(all_sections) - 1:
-        prev_parsed = ParsedSection(all_sections[idx - 1].get('section_number', ''))
-        next_parsed = ParsedSection(all_sections[idx + 1].get('section_number', ''))
-        
-        prev_major = prev_parsed.get_major()
-        next_major = next_parsed.get_major()
-        
-        if prev_major is not None and next_major is not None and major is not None:
-            # Sandwiched between same major but this one is different
-            if prev_major == next_major and major != prev_major:
-                features['is_sandwiched'] = 1
-                features['sandwich_same_neighbors'] = 1
+    features['extended_sequence_score'] = _compute_extended_sequence_score(idx, all_sections)
     
-    # Extended sandwich check (look at 2-3 neighbors each side)
-    features['extended_sandwich_score'] = _compute_extended_sandwich_score(idx, all_sections)
+    # =========================================================================
+    # NEW: VERTICAL GAP FEATURES (distance from previous line)
+    # =========================================================================
+    # New sections tend to have MORE whitespace above them
+    # Numbers embedded in text have LESS whitespace above
+    
+    bbox = section.get('bbox', {})
+    prev_bottom = None
+    
+    if idx > 0:
+        prev_section = all_sections[idx - 1]
+        prev_bbox = prev_section.get('bbox', {})
+        if prev_bbox:
+            prev_bottom = prev_bbox.get('top', 0) + prev_bbox.get('height', 0)
+    
+    if bbox and prev_bottom is not None:
+        current_top = bbox.get('top', 0)
+        
+        # Only compute if on same page (cross-page gaps are meaningless)
+        prev_page = all_sections[idx - 1].get('page_number', 0) if idx > 0 else 0
+        curr_page = section.get('page_number', 0)
+        
+        if prev_page == curr_page and current_top >= prev_bottom:
+            vertical_gap_px = current_top - prev_bottom
+            features['vertical_gap_from_prev_px'] = vertical_gap_px
+            
+            # Normalize by page height
+            if doc_stats.page_height > 0:
+                features['vertical_gap_from_prev_pct'] = vertical_gap_px / doc_stats.page_height
+            else:
+                features['vertical_gap_from_prev_pct'] = 0
+            
+            # Compare to document median vertical gap
+            if doc_stats.vertical_gap_std and doc_stats.vertical_gap_std > 0:
+                features['vertical_gap_z_score'] = (vertical_gap_px - doc_stats.vertical_gap_median) / doc_stats.vertical_gap_std
+            else:
+                features['vertical_gap_z_score'] = 0
+            
+            # Flag: is this gap larger than typical? (suggests new section)
+            features['has_large_vertical_gap'] = 1 if vertical_gap_px > doc_stats.vertical_gap_median * 1.5 else 0
+            
+            # Flag: is this gap smaller than typical? (suggests embedded in text)
+            features['has_small_vertical_gap'] = 1 if vertical_gap_px < doc_stats.vertical_gap_median * 0.5 else 0
+        else:
+            # Cross-page or invalid gap
+            features['vertical_gap_from_prev_px'] = -1  # Sentinel for "not applicable"
+            features['vertical_gap_from_prev_pct'] = -1
+            features['vertical_gap_z_score'] = 0
+            features['has_large_vertical_gap'] = 0
+            features['has_small_vertical_gap'] = 0
+    else:
+        features['vertical_gap_from_prev_px'] = -1
+        features['vertical_gap_from_prev_pct'] = -1
+        features['vertical_gap_z_score'] = 0
+        features['has_large_vertical_gap'] = 0
+        features['has_small_vertical_gap'] = 0
     
     # =========================================================================
     # BOUNDING BOX FEATURES (normalized to page dimensions)
@@ -720,6 +796,32 @@ def extract_features_for_section(
     same_page_count = sum(1 for s in all_sections if s.get('page_number') == section.get('page_number'))
     features['sections_on_same_page'] = same_page_count
     
+    # =========================================================================
+    # MANUAL LABELING HELPER FEATURES
+    # =========================================================================
+    # These features help with manual labeling but are also useful for ML
+    # They represent "soft" indicators that a human might use to judge validity
+    
+    # 1. Bidirectional logical sequence: both prev->this AND this->next are logical
+    #    Strong indicator of a valid section in an intact sequence
+    if idx > 0 and idx < len(all_sections) - 1:
+        features['in_logical_sequence'] = 1 if (features['is_logical_next'] and features['next_is_logical_successor']) else 0
+    else:
+        features['in_logical_sequence'] = features.get('is_logical_next', 0)
+    
+    # 2. Kalman-style prediction confidence
+    #    How well does this section fit the expected pattern?
+    features['sequence_fit_score'] = _compute_sequence_fit_score(idx, all_sections, parsed)
+    
+    # 3. Structural consistency: does this section's format match others at same depth?
+    features['format_consistency_score'] = _compute_format_consistency_score(section, all_sections, parsed)
+    
+    # 4. Title quality score: how "title-like" is the title?
+    features['title_quality_score'] = _compute_title_quality_score(title)
+    
+    # 5. Combined confidence score (weighted combination of positive indicators)
+    features['combined_confidence'] = _compute_combined_confidence(features)
+    
     return features
 
 
@@ -750,26 +852,51 @@ def _is_logical_next(prev: ParsedSection, curr: ParsedSection) -> int:
     # Going up and incrementing (e.g., 1.1.9 -> 1.2)
     if len(curr_parts) < len(prev_parts):
         # Check if it's incrementing at the right level
-        pass  # Complex logic, skip for now
+        prefix_len = len(curr_parts) - 1
+        if prefix_len >= 0:
+            # Check prefix matches
+            if prev_parts[:prefix_len] == curr_parts[:prefix_len]:
+                # Check last part increments
+                if prev_parts[prefix_len] is not None and curr_parts[-1] is not None:
+                    if curr_parts[-1] == prev_parts[prefix_len] + 1:
+                        return 1
     
     return 0
 
 
-def _compute_extended_sandwich_score(idx: int, all_sections: List[Dict]) -> float:
+def _compute_extended_sequence_score(idx: int, all_sections: List[Dict]) -> float:
     """
-    Compute a sandwich score looking at extended neighborhood.
-    Higher score = more likely to be sandwiched (false positive).
+    Compute a sequence consistency score looking at extended neighborhood.
+    Higher score = more consistent with surrounding sections (likely valid).
+    
+    This replaces the sandwich detection which had negative correlation.
     """
-    if idx == 0 or idx >= len(all_sections) - 1:
-        return 0.0
+    if len(all_sections) < 3:
+        return 0.5  # Neutral for very short sequences
     
     curr_parsed = ParsedSection(all_sections[idx].get('section_number', ''))
     curr_major = curr_parsed.get_major()
     
     if curr_major is None:
-        return 0.0
+        return 0.3  # Low score for unparseable
     
-    # Look at 3 neighbors on each side
+    score = 0.0
+    checks = 0
+    
+    # Check logical progression with immediate neighbors
+    if idx > 0:
+        prev_parsed = ParsedSection(all_sections[idx - 1].get('section_number', ''))
+        if _is_logical_next(prev_parsed, curr_parsed):
+            score += 1.0
+        checks += 1
+    
+    if idx < len(all_sections) - 1:
+        next_parsed = ParsedSection(all_sections[idx + 1].get('section_number', ''))
+        if _is_logical_next(curr_parsed, next_parsed):
+            score += 1.0
+        checks += 1
+    
+    # Check if major section is consistent with neighbors (within reasonable range)
     prev_majors = []
     for i in range(max(0, idx - 3), idx):
         p = ParsedSection(all_sections[i].get('section_number', ''))
@@ -784,24 +911,23 @@ def _compute_extended_sandwich_score(idx: int, all_sections: List[Dict]) -> floa
         if m is not None:
             next_majors.append(m)
     
-    if not prev_majors or not next_majors:
-        return 0.0
+    if prev_majors:
+        # Is current major within reasonable range of previous majors?
+        max_prev = max(prev_majors)
+        min_prev = min(prev_majors)
+        if min_prev <= curr_major <= max_prev + 2:  # Allow +2 for progression
+            score += 0.5
+        checks += 1
     
-    # Check how "out of place" current major is
-    all_neighbor_majors = prev_majors + next_majors
-    if curr_major in all_neighbor_majors:
-        return 0.0  # Current major appears in neighbors, not sandwiched
+    if next_majors:
+        # Is current major consistent with next majors?
+        min_next = min(next_majors)
+        max_next = max(next_majors)
+        if curr_major - 1 <= min_next <= curr_major + 2:
+            score += 0.5
+        checks += 1
     
-    # Check if neighbors are consistent with each other
-    unique_neighbor_majors = set(all_neighbor_majors)
-    if len(unique_neighbor_majors) == 1:
-        # All neighbors have same major, current is different -> strong sandwich
-        return 1.0
-    elif len(unique_neighbor_majors) == 2:
-        # Neighbors have 2 majors, could be at boundary
-        return 0.3
-    else:
-        return 0.1
+    return score / checks if checks > 0 else 0.5
 
 
 def _calculate_toc_fuzzy_score(section_number: str, toc_sections: Set[str]) -> float:
@@ -840,6 +966,180 @@ def _calculate_toc_fuzzy_score(section_number: str, toc_sections: Set[str]) -> f
         return 0.1
 
 
+def _compute_sequence_fit_score(idx: int, all_sections: List[Dict], parsed: ParsedSection) -> float:
+    """
+    Compute how well this section fits the expected sequence pattern.
+    Uses a simple Kalman-like prediction approach.
+    """
+    if idx == 0:
+        # First section: check if it's a reasonable starting point (1, 1.1, etc.)
+        if parsed.normalized in ['1', '1.1', '1.0']:
+            return 1.0
+        major = parsed.get_major()
+        if major is not None and major <= 3:
+            return 0.7
+        return 0.3
+    
+    score = 0.0
+    
+    # Check logical next
+    prev_parsed = ParsedSection(all_sections[idx - 1].get('section_number', ''))
+    if _is_logical_next(prev_parsed, parsed):
+        score += 0.5
+    
+    # Check if major section makes sense in context
+    prev_major = prev_parsed.get_major()
+    curr_major = parsed.get_major()
+    
+    if prev_major is not None and curr_major is not None:
+        gap = curr_major - prev_major
+        if gap == 0:
+            score += 0.3  # Same major, likely subsection
+        elif gap == 1:
+            score += 0.4  # Next major section
+        elif gap > 1:
+            score -= 0.1 * (gap - 1)  # Penalize jumps
+    
+    # Check depth consistency
+    if idx >= 2:
+        depths = [ParsedSection(s.get('section_number', '')).depth for s in all_sections[max(0, idx-3):idx]]
+        if depths:
+            avg_depth = sum(depths) / len(depths)
+            depth_diff = abs(parsed.depth - avg_depth)
+            if depth_diff <= 1:
+                score += 0.2
+    
+    return max(0, min(1, score))
+
+
+def _compute_format_consistency_score(section: Dict, all_sections: List[Dict], parsed: ParsedSection) -> float:
+    """
+    Check if this section's format matches others at the same depth.
+    """
+    depth = parsed.depth
+    same_depth_sections = [s for s in all_sections 
+                          if ParsedSection(s.get('section_number', '')).depth == depth
+                          and s != section]
+    
+    if not same_depth_sections:
+        return 0.5  # No comparison available
+    
+    score = 0.0
+    checks = 0
+    
+    # Check X position consistency
+    bbox = section.get('bbox', {})
+    if bbox:
+        curr_x = bbox.get('left', 0)
+        other_xs = [s.get('bbox', {}).get('left', 0) for s in same_depth_sections if s.get('bbox')]
+        if other_xs:
+            median_x = statistics.median(other_xs)
+            if abs(curr_x - median_x) < 50:  # Within 50px
+                score += 0.5
+            checks += 1
+    
+    # Check title style consistency
+    title = section.get('topic', '')
+    if title:
+        curr_is_caps = title.isupper()
+        curr_is_title = title.istitle()
+        
+        other_titles = [s.get('topic', '') for s in same_depth_sections if s.get('topic')]
+        if other_titles:
+            caps_count = sum(1 for t in other_titles if t.isupper())
+            title_count = sum(1 for t in other_titles if t.istitle())
+            
+            if caps_count > len(other_titles) / 2 and curr_is_caps:
+                score += 0.3
+            elif title_count > len(other_titles) / 2 and curr_is_title:
+                score += 0.3
+            checks += 1
+    
+    return score / checks if checks > 0 else 0.5
+
+
+def _compute_title_quality_score(title: str) -> float:
+    """
+    Compute how "title-like" the title text is.
+    Higher scores indicate more typical section titles.
+    """
+    if not title or not title.strip():
+        return 0.0
+    
+    score = 0.0
+    
+    # Length check (typical titles are 2-50 chars)
+    length = len(title)
+    if 2 <= length <= 50:
+        score += 0.3
+    elif 50 < length <= 100:
+        score += 0.1
+    
+    # Word count check (typical titles are 1-8 words)
+    word_count = len(title.split())
+    if 1 <= word_count <= 8:
+        score += 0.3
+    elif 8 < word_count <= 15:
+        score += 0.1
+    
+    # Starts with capital
+    if title[0].isupper():
+        score += 0.1
+    
+    # No sentence-ending punctuation mid-title
+    if not re.search(r'\.\s+[A-Z]', title):
+        score += 0.1
+    
+    # Contains section keyword
+    keywords = ['introduction', 'scope', 'requirements', 'overview', 'summary',
+               'description', 'specification', 'interface', 'design', 'test',
+               'general', 'system', 'software', 'hardware', 'definitions', 'references']
+    if any(kw in title.lower() for kw in keywords):
+        score += 0.2
+    
+    return min(1.0, score)
+
+
+def _compute_combined_confidence(features: Dict) -> float:
+    """
+    Compute a combined confidence score from multiple positive indicators.
+    This serves as a "manual labeling helper" feature.
+    """
+    score = 0.0
+    
+    # Positive indicators
+    if features.get('is_logical_next'):
+        score += 0.15
+    if features.get('next_is_logical_successor'):
+        score += 0.15
+    if features.get('in_toc_exact'):
+        score += 0.2
+    if features.get('parent_exists'):
+        score += 0.1
+    if features.get('title_has_section_keyword'):
+        score += 0.1
+    if features.get('title_quality_score', 0) > 0.5:
+        score += 0.1
+    if features.get('has_large_vertical_gap'):
+        score += 0.05
+    if not features.get('had_text_before_number'):
+        score += 0.1
+    
+    # Negative indicators
+    if features.get('looks_like_date'):
+        score -= 0.3
+    if features.get('title_absurdly_long'):
+        score -= 0.2
+    if features.get('subsection_looks_like_decimal'):
+        score -= 0.15
+    if features.get('had_text_before_number'):
+        score -= 0.1
+    if features.get('has_small_vertical_gap'):
+        score -= 0.05
+    
+    return max(0, min(1, score))
+
+
 # =============================================================================
 # MAIN PROCESSING (using pandas)
 # =============================================================================
@@ -855,7 +1155,8 @@ def collect_document_stats(elements: List[Dict], page_metadata: Dict) -> Documen
         stats.page_height = first_page_meta.get('page_height', 0)
         stats.total_pages = len(page_metadata)
     
-    # Collect from all sections
+    # First pass: collect basic stats
+    sections_with_bbox = []
     for elem in elements:
         if elem.get('type') != 'section':
             continue
@@ -885,11 +1186,28 @@ def collect_document_stats(elements: List[Dict], page_metadata: Dict) -> Documen
             
             # By depth
             stats.x_by_depth[parsed.depth].append(x)
+            
+            # Save for vertical gap computation
+            sections_with_bbox.append({
+                'page': elem.get('page_number', 0),
+                'top': y,
+                'bottom': y + bbox.get('height', 0)
+            })
         
         # Title stats
         title = elem.get('topic', '') or ''
         stats.title_lengths.append(len(title))
         stats.title_word_counts.append(len(title.split()) if title else 0)
+    
+    # Second pass: compute vertical gaps between consecutive sections on same page
+    sections_with_bbox.sort(key=lambda x: (x['page'], x['top']))
+    for i in range(1, len(sections_with_bbox)):
+        prev = sections_with_bbox[i - 1]
+        curr = sections_with_bbox[i]
+        
+        if prev['page'] == curr['page'] and curr['top'] >= prev['bottom']:
+            gap = curr['top'] - prev['bottom']
+            stats.vertical_gaps.append(gap)
     
     stats.compute_stats()
     return stats
@@ -1001,48 +1319,34 @@ def process_document(
     return all_features
 
 
+# Check for pandas
 try:
     import pandas as pd
     HAS_PANDAS = True
 except ImportError:
     HAS_PANDAS = False
-    print("Warning: pandas not installed. Install with: pip install pandas")
+    print("[Warning] pandas not installed. Some features will be limited.")
+    print("  Install with: pip install pandas")
 
 
 def process_directory(
-    results_dir: str = None,
-    raw_ocr_dir: str = None,
+    results_dir: str = DEFAULT_RESULTS_DIR,
+    raw_ocr_dir: str = DEFAULT_RAW_OCR_DIR,
     output_csv: str = None
 ) -> 'pd.DataFrame':
     """
-    Process all documents in a directory and return a pandas DataFrame.
-    
-    If output_csv already exists, labels from the existing file will be preserved
-    and merged back into the new DataFrame (matched by doc_name, section_number, 
-    title, and page).
+    Process all documents in a results directory.
     
     Args:
-        results_dir: Directory containing *_organized.json and *_classification.json
-                    (default: results_simple)
+        results_dir: Directory containing pipeline output files
         raw_ocr_dir: Directory containing raw OCR JSON files
-                    (default: iris_ocr/CM_Spec_OCR_and_figtab_output/raw_data_advanced)
-        output_csv: Optional path to save CSV (if None, just returns DataFrame)
-    
+        output_csv: Path to save CSV (optional)
+        
     Returns:
         pandas DataFrame with all features
     """
     if not HAS_PANDAS:
-        raise ImportError("pandas is required. Install with: pip install pandas")
-    
-    # Use defaults if not specified
-    if results_dir is None:
-        results_dir = DEFAULT_RESULTS_DIR
-    if raw_ocr_dir is None:
-        raw_ocr_dir = DEFAULT_RAW_OCR_DIR
-    
-    print(f"Results dir: {results_dir}")
-    print(f"Raw OCR dir: {raw_ocr_dir}")
-    print()
+        raise ImportError("pandas is required for this function. Install with: pip install pandas")
     
     all_features = []
     
@@ -1051,11 +1355,16 @@ def process_directory(
     for f in os.listdir(results_dir):
         if f.endswith('_organized.json'):
             stem = f.replace('_organized.json', '')
-            organized_files.append((stem, os.path.join(results_dir, f)))
+            organized_files.append((stem, f))
     
-    print(f"Found {len(organized_files)} organized files")
+    if not organized_files:
+        print(f"No organized files found in {results_dir}")
+        return pd.DataFrame()
     
-    for stem, organized_path in sorted(organized_files):
+    print(f"Processing {len(organized_files)} documents...")
+    
+    for stem, organized_file in sorted(organized_files):
+        organized_path = os.path.join(results_dir, organized_file)
         classification_path = os.path.join(results_dir, f"{stem}_classification.json")
         raw_ocr_path = os.path.join(raw_ocr_dir, f"{stem}.json")
         
@@ -1069,33 +1378,26 @@ def process_directory(
     # Create DataFrame
     df = pd.DataFrame(all_features)
     
-    # Reorder columns: metadata first (prefixed with _), then features
+    # Reorder columns: metadata first, then features
     meta_cols = [c for c in df.columns if c.startswith('_')]
     feature_cols = [c for c in df.columns if not c.startswith('_')]
-    df = df[meta_cols + feature_cols]
+    df = df[meta_cols + sorted(feature_cols)]
     
-    # =========================================================================
-    # PRESERVE EXISTING LABELS
-    # =========================================================================
-    # Primary key for matching: (_doc_name, _section_number_raw, _title, _page)
-    primary_key_cols = ['_doc_name', '_section_number_raw', '_title', '_page']
-    
+    # Preserve existing labels if output file exists
     if output_csv and os.path.exists(output_csv):
-        print(f"\nFound existing CSV: {output_csv}")
         try:
             existing_df = pd.read_csv(output_csv)
-            
-            # Check if _label column exists and has any non-empty values
             if '_label' in existing_df.columns:
-                # Get rows with labels (not empty/NaN)
-                labeled_mask = existing_df['_label'].notna() & (existing_df['_label'] != '')
-                labeled_df = existing_df[labeled_mask]
+                # Get labeled rows
+                labeled_df = existing_df[existing_df['_label'].notna() & (existing_df['_label'] != '')]
                 
                 if len(labeled_df) > 0:
                     print(f"  Found {len(labeled_df)} existing labels to preserve")
                     
-                    # Create a mapping from primary key to label
-                    # Handle potential column name differences (old vs new)
+                    # Create composite key for matching
+                    primary_key_cols = ['_doc_name', '_index', '_section_number_raw', '_page']
+                    
+                    # Check which key columns exist in both
                     old_key_cols = []
                     for col in primary_key_cols:
                         if col in existing_df.columns:
@@ -1144,7 +1446,7 @@ def process_directory(
     print(f"Total rows (sections): {len(df)}")
     print(f"Documents processed:   {df['_doc_name'].nunique()}")
     print(f"Feature columns:       {len(feature_cols)}")
-    print(f"Metadata columns:      {meta_cols}")
+    print(f"Metadata columns:      {len(meta_cols)}")
     
     # Label summary
     if '_label' in df.columns:
@@ -1152,7 +1454,22 @@ def process_directory(
         labeled_count = labeled_count.sum()
         print(f"Rows with labels:      {labeled_count} / {len(df)} ({100*labeled_count/len(df):.1f}%)")
     
-    print(f"\nFeatures: {feature_cols}")
+    print(f"\nNew features in this version:")
+    new_features = [
+        'vertical_gap_from_prev_px', 'vertical_gap_from_prev_pct', 'vertical_gap_z_score',
+        'has_large_vertical_gap', 'has_small_vertical_gap',
+        'newlines_before_section_num', 'next_is_logical_successor',
+        'in_logical_sequence', 'sequence_fit_score', 'format_consistency_score',
+        'title_quality_score', 'combined_confidence', 'extended_sequence_score'
+    ]
+    for f in new_features:
+        if f in feature_cols:
+            print(f"  - {f}")
+    
+    print(f"\nRemoved features (negative correlation):")
+    removed_features = ['is_sandwiched', 'sandwich_same_neighbors']
+    for f in removed_features:
+        print(f"  - {f}")
     
     # Save to CSV if path provided
     if output_csv:
@@ -1212,17 +1529,17 @@ def summary_by_document(df: 'pd.DataFrame') -> 'pd.DataFrame':
         raise ImportError("pandas is required")
     
     summary = df.groupby('_doc_name').agg({
-        '_section_number': 'count',
+        '_section_number_raw': 'count',
         '_label': lambda x: x.notna().sum(),
         'section_depth': 'mean',
-        'is_sandwiched': 'sum',
         'in_toc_exact': 'mean',
+        'combined_confidence': 'mean',
     }).rename(columns={
-        '_section_number': 'num_sections',
+        '_section_number_raw': 'num_sections',
         '_label': 'num_labeled',
         'section_depth': 'avg_depth',
-        'is_sandwiched': 'sandwiched_count',
         'in_toc_exact': 'toc_match_rate',
+        'combined_confidence': 'avg_confidence',
     })
     
     return summary.round(2)
@@ -1231,6 +1548,43 @@ def summary_by_document(df: 'pd.DataFrame') -> 'pd.DataFrame':
 # =============================================================================
 # CLI
 # =============================================================================
+
+def print_feature_correlations(df: 'pd.DataFrame', min_samples: int = 50) -> None:
+    """
+    Print correlations of features with the _label column.
+    Useful for identifying which features are predictive.
+    """
+    if not HAS_PANDAS:
+        raise ImportError("pandas is required")
+    
+    labeled = df[df['_label'].notna()].copy()
+    if len(labeled) < min_samples:
+        print(f"Need at least {min_samples} labeled samples, have {len(labeled)}")
+        return
+    
+    labeled['_label'] = labeled['_label'].astype(float)
+    
+    feature_cols = get_feature_columns(df)
+    correlations = []
+    
+    for col in feature_cols:
+        if labeled[col].std() > 0:  # Skip constant columns
+            corr = labeled['_label'].corr(labeled[col])
+            correlations.append((col, corr))
+    
+    # Sort by absolute correlation
+    correlations.sort(key=lambda x: abs(x[1]), reverse=True)
+    
+    print("\nFeature Correlations with Label (sorted by |correlation|):")
+    print("=" * 60)
+    print(f"{'Feature':<45} {'Correlation':>12}")
+    print("-" * 60)
+    
+    for col, corr in correlations:
+        indicator = "+++" if corr > 0.3 else "++" if corr > 0.2 else "+" if corr > 0.1 else \
+                   "---" if corr < -0.3 else "--" if corr < -0.2 else "-" if corr < -0.1 else ""
+        print(f"{col:<45} {corr:>10.3f} {indicator}")
+
 
 if __name__ == '__main__':
     import argparse
@@ -1275,6 +1629,19 @@ LABELING:
     Open the CSV and fill in '_label' column:
         1 = valid section
         0 = false positive
+
+NEW FEATURES (v2):
+    - vertical_gap_from_prev_*: Distance from previous line (detects section breaks)
+    - newlines_before_section_num: Count of preceding newlines
+    - next_is_logical_successor: Bidirectional sequence check
+    - in_logical_sequence: Both prev->this AND this->next are logical
+    - sequence_fit_score: Kalman-style prediction confidence
+    - format_consistency_score: Does format match same-depth sections?
+    - title_quality_score: How "title-like" is the title?
+    - combined_confidence: Weighted combination of positive indicators
+    
+REMOVED FEATURES:
+    - is_sandwiched, sandwich_same_neighbors (negative correlation with validity)
         """
     )
     
