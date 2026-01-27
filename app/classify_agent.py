@@ -6,6 +6,12 @@ This agent classifies pages to find where actual content starts, handling:
 - No ToC: Title Page → Content directly  
 - No Title: Content starts on page 1
 - Stub documents: Single page redirects to another document
+- Short documents (≤5 pages): Assumed to have no TOC
+
+SHORT DOCUMENT RULE: Documents with 5 pages or fewer are assumed to NOT have
+a Table of Contents. Any page that would be classified as TOC is instead
+treated as content. This prevents false positives on short documents where
+numbered lists or section headers might be misidentified as a TOC.
 
 OPTIMIZATION: Uses regex-based fast-path detection for Table of Contents pages
 to reduce reliance on smaller LLMs. A page with 10+ section numbers (like 1.1.1,
@@ -586,6 +592,64 @@ def find_content_start_page(
     
     total_pages = len(pages)
     print(f"  - Document has {total_pages} page(s)")
+    
+    # ==========================================================================
+    # SHORT DOCUMENT RULE: Documents with 5 pages or fewer don't have TOC
+    # Skip TOC detection entirely - just find where content starts
+    # ==========================================================================
+    if total_pages <= 5:
+        print(f"  - Short document ({total_pages} pages) - skipping TOC detection")
+        page_classifications = []
+        
+        for page_id, page_text in pages:
+            # For short docs, only distinguish between TITLE_PAGE and CONTENT_BODY
+            # Never classify as TABLE_OF_CONTENTS
+            fast_result = fast_classify_page(page_text)
+            
+            # Override any TOC classification to CONTENT_BODY for short docs
+            if fast_result == 'TABLE_OF_CONTENTS':
+                fast_result = 'CONTENT_BODY'
+                print(f"    Page {page_id}: CONTENT_BODY [short doc override, was TOC]")
+                page_classifications.append({
+                    'page': page_id, 
+                    'type': 'CONTENT_BODY', 
+                    'method': 'fast',
+                    'note': 'TOC overridden for short document'
+                })
+            elif fast_result:
+                print(f"    Page {page_id}: {fast_result} [fast]")
+                page_classifications.append({
+                    'page': page_id, 
+                    'type': fast_result, 
+                    'method': 'fast'
+                })
+            else:
+                # Use LLM but override TOC results
+                page_type, method = classify_page_smart(page_text, llm_config)
+                if page_type == 'TABLE_OF_CONTENTS':
+                    page_type = 'CONTENT_BODY'
+                    print(f"    Page {page_id}: CONTENT_BODY [short doc override, LLM said TOC]")
+                    page_classifications.append({
+                        'page': page_id, 
+                        'type': 'CONTENT_BODY', 
+                        'method': method,
+                        'note': 'TOC overridden for short document'
+                    })
+                else:
+                    print(f"    Page {page_id}: {page_type} [{method}]")
+                    page_classifications.append({
+                        'page': page_id, 
+                        'type': page_type, 
+                        'method': method
+                    })
+        
+        # Sort and analyze
+        page_classifications.sort(key=lambda x: x['page'])
+        result = analyze_page_sequence(page_classifications)
+        # Force document_type to indicate no TOC for short docs
+        if result['document_type'] == 'standard':
+            result['document_type'] = 'no_toc'
+        return result
     
     # Special case: single page document - check if it's a stub
     if total_pages == 1:

@@ -472,6 +472,7 @@ def run_section_processing_on_file(
             json.dump([], f)
         return
 
+    # How does the discern whether it is a content page?
     content_pages = [(pid, pdict, pmeta) for pid, pdict, pmeta in pages_to_process if pid >= content_start_page]
     
     skipped_count = len(pages_to_process) - len(content_pages)
@@ -489,12 +490,15 @@ def run_section_processing_on_file(
     dropped_header_lines = 0
     dropped_footer_lines = 0
     
+    # These pages signal whether it is a content page?
     for page_id, page_dict, page_meta in content_pages:
         if page_meta:
             all_page_metadata[page_id] = page_meta
         
+        # I'm assuming this attempt to convert the document in to something that is read from top to bottom?
         lines = reconstruct_lines_with_bbox(page_dict)
         
+        # Header/foot logic seems correct
         for line_data in lines:
             line_text = line_data['text'].strip()
             if not line_text:
@@ -516,6 +520,7 @@ def run_section_processing_on_file(
                     continue
             # ---------------------
 
+            # Logic for determing if section like 1.1.1?
             is_header, section_num, topic, remainder = check_if_paragraph_is_header(line_text)
 
             if is_header:
@@ -528,7 +533,7 @@ def run_section_processing_on_file(
                     "bbox": line_bbox
                 })
                 
-                if remainder:
+                if remainder: # What is remainder? Extra text?
                     raw_elements.append({
                         "type": "unassigned_text_block",
                         "content": remainder,
@@ -536,6 +541,7 @@ def run_section_processing_on_file(
                         "bbox": line_bbox
                     })
             else:
+                # Seems correct to preserve all text
                 raw_elements.append({
                     "type": "unassigned_text_block",
                     "content": line_text,
@@ -543,6 +549,7 @@ def run_section_processing_on_file(
                     "bbox": line_bbox
                 })
     
+    # What is the purpose of this?
     final_elements = group_elements_with_bbox(raw_elements)
 
     output_data = {
