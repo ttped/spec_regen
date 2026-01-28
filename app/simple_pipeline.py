@@ -121,26 +121,46 @@ def extract_title_from_first_page(raw_input_path: str, output_path: str):
         json.dump([info] if info else [], f, indent=4)
 
 
-def filter_elements(elements: List[Dict], sections_to_keep: Set[Tuple[str, int]]) -> Tuple[List[Dict], int, int]:
-    """Filter elements, keeping only sections in sections_to_keep."""
-    filtered = []
-    kept = 0
-    removed = 0
+def reclassify_elements(elements: List[Dict], sections_to_keep: Set[Tuple[str, int]]) -> Tuple[List[Dict], int, int]:
+    """
+    Reclassify elements based on ML predictions.
+    
+    Sections predicted as false positives are converted to 'unassigned_text_block'
+    instead of being deleted, preserving all content.
+    """
+    result = []
+    kept_as_section = 0
+    reclassified = 0
     
     for elem in elements:
         if elem.get('type') != 'section':
-            filtered.append(elem)
+            # Keep non-section elements as-is
+            result.append(elem)
         else:
             sec_num = elem.get('section_number', '')
             page = elem.get('page_number', 0)
             
             if (sec_num, page) in sections_to_keep:
-                filtered.append(elem)
-                kept += 1
+                # Keep as section
+                result.append(elem)
+                kept_as_section += 1
             else:
-                removed += 1
+                # Convert to unassigned_text_block, preserving content
+                reclassified_elem = {
+                    'type': 'unassigned_text_block',
+                    'page_number': elem.get('page_number'),
+                    'content': elem.get('content', ''),
+                    'bbox': elem.get('bbox'),
+                    # Preserve original info for debugging
+                    '_original_type': 'section',
+                    '_original_section_number': sec_num,
+                    '_original_topic': elem.get('topic', ''),
+                    '_reclassified_by': 'ml_filter'
+                }
+                result.append(reclassified_elem)
+                reclassified += 1
     
-    return filtered, kept, removed
+    return result, kept_as_section, reclassified
 
 
 def main():
@@ -240,7 +260,7 @@ def main():
 
         # STEP 4: ML FILTER
         if args.step in ["ml_filter", "all"]:
-            print("[4: ML Filter]")
+            print("[4: ML Reclassify]")
             
             if stem not in sections_to_keep_by_doc:
                 print(f"  WARNING: '{stem}' not in predictions")
@@ -260,11 +280,11 @@ def main():
                     elements = data if isinstance(data, list) else []
                     page_metadata = {}
                 
-                filtered, kept, removed = filter_elements(elements, sections_to_keep)
-                print(f"  Kept {kept}, removed {removed}")
+                reclassified_elements, kept, converted = reclassify_elements(elements, sections_to_keep)
+                print(f"  Sections kept: {kept}, converted to text blocks: {converted}")
                 
                 with open(ml_filtered_out, 'w') as f:
-                    json.dump({'page_metadata': page_metadata, 'elements': filtered}, f, indent=4)
+                    json.dump({'page_metadata': page_metadata, 'elements': reclassified_elements}, f, indent=4)
 
         # STEP 5: ASSETS
         if args.step in ["assets", "all"]:
