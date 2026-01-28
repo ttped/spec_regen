@@ -240,7 +240,31 @@ def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[b
         context['rejection_reason'] = 'pure_alpha'
         return False, None, None, None, context
 
+    # ==========================================================================
+    # LOGICAL VALIDATION (Added for strict filtering)
+    # ==========================================================================
+    
     section_num = potential_num.strip().rstrip('.')
+    
+    # 1. Reject "all zero" sections (0, 0.0, 0.0.0)
+    #    Split by dot, check if all parts are 0
+    parts = section_num.split('.')
+    if all(p.isdigit() and int(p) == 0 for p in parts):
+        if debug:
+            print(f"      [DEBUG] Rejected (all zeros): '{section_num}'")
+        context['rejection_reason'] = 'zero_section'
+        return False, None, None, None, context
+
+    # 2. Reject major sections > 10 (Safety cap)
+    #    e.g., "12.1" or "52.2.1"
+    if parts and parts[0].isdigit():
+        major_section = int(parts[0])
+        if major_section > 10:
+            if debug:
+                print(f"      [DEBUG] Rejected (major section > 10): '{section_num}'")
+            context['rejection_reason'] = 'major_section_too_large'
+            return False, None, None, None, context
+
     topic, remainder = split_topic_at_period(full_topic)
     
     if debug:

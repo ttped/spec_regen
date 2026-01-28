@@ -7,9 +7,10 @@ Steps: classify -> title -> structure -> ml_filter -> assets -> tables -> write 
 import os
 import argparse
 import json
+import numpy as np
 from typing import List, Dict, Set, Tuple
 
-# Direct imports - will fail loudly if missing
+# Direct imports
 from classify_agent import run_classification_on_file, load_content_start_page, load_classification_result
 from title_agent import extract_title_page_info
 from asset_processor import run_asset_integration
@@ -48,60 +49,28 @@ def get_document_stems(input_dir: str) -> List[str]:
 def extract_title_from_first_page(raw_input_path: str, output_path: str):
     """Extract title page information from page 1."""
     print(f"  Loading: {raw_input_path}")
-    
     data = load_json_with_recovery(raw_input_path)
     
-    # Debug: show structure
-    print(f"  Data type: {type(data).__name__}")
-    if isinstance(data, list):
-        print(f"  List length: {len(data)}")
-        if len(data) > 0:
-            print(f"  First item keys: {list(data[0].keys()) if isinstance(data[0], dict) else 'not a dict'}")
-    elif isinstance(data, dict):
-        print(f"  Dict keys: {list(data.keys())[:5]}...")
-    
     page_text = ""
-    
     if isinstance(data, list) and len(data) > 0:
         data.sort(key=lambda x: int(x.get('page_num', 0) or x.get('page_Id', 0) or 0))
         first_item = data[0]
-        print(f"  First item keys: {list(first_item.keys()) if isinstance(first_item, dict) else type(first_item)}")
-        
         page_dict = first_item.get('page_dict', first_item)
-        print(f"  page_dict keys: {list(page_dict.keys()) if isinstance(page_dict, dict) else type(page_dict)}")
-        
         text_list = page_dict.get('text', [])
-        print(f"  text field type: {type(text_list).__name__}, length: {len(text_list) if hasattr(text_list, '__len__') else 'N/A'}")
-        
         if isinstance(text_list, list):
             page_text = " ".join([str(t) for t in text_list])
         else:
             page_text = str(text_list)
-            
     elif isinstance(data, dict):
         key = "1" if "1" in data else next(iter(data), None)
-        print(f"  Using key: {key}")
-        
         if key:
             page_obj = data[key]
-            print(f"  page_obj type: {type(page_obj).__name__}")
-            
             page_dict = page_obj.get('page_dict', page_obj) if isinstance(page_obj, dict) else page_obj
-            if isinstance(page_dict, dict):
-                print(f"  page_dict keys: {list(page_dict.keys())}")
-                text_list = page_dict.get('text', [])
-                print(f"  text field type: {type(text_list).__name__}")
-                
-                if isinstance(text_list, list):
-                    page_text = " ".join([str(t) for t in text_list])
-                else:
-                    page_text = str(text_list)
-
-    print(f"  Extracted text length: {len(page_text)} chars")
-    if page_text:
-        print(f"  Text preview: {page_text[:100]}...")
-    else:
-        print(f"  WARNING: No text extracted!")
+            text_list = page_dict.get('text', [])
+            if isinstance(text_list, list):
+                page_text = " ".join([str(t) for t in text_list])
+            else:
+                page_text = str(text_list)
 
     info = None
     if page_text.strip():
@@ -113,8 +82,8 @@ def extract_title_from_first_page(raw_input_path: str, output_path: str):
                 LLM_CONFIG['api_key'], 
                 LLM_CONFIG['provider']
             )
-        except Exception as e:
-            print(f"    [Error] Title extraction failed: {e}")
+        except Exception:
+            pass
     
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     with open(output_path, 'w', encoding='utf-8') as f:
@@ -122,32 +91,21 @@ def extract_title_from_first_page(raw_input_path: str, output_path: str):
 
 
 def reclassify_elements(elements: List[Dict], sections_to_keep: Set[Tuple[str, int]]) -> Tuple[List[Dict], int, int]:
-    """
-    Reclassify elements based on ML predictions.
-    
-    Sections predicted as false positives are converted to 'unassigned_text_block'
-    instead of being deleted, preserving all content.
-    """
     result = []
     kept_as_section = 0
     reclassified = 0
     
     for elem in elements:
         if elem.get('type') != 'section':
-            # Keep non-section elements as-is
             result.append(elem)
         else:
             sec_num = elem.get('section_number', '')
             page = elem.get('page_number', 0)
             
             if (sec_num, page) in sections_to_keep:
-                # Keep as section
                 result.append(elem)
                 kept_as_section += 1
             else:
-                # Convert to unassigned_text_block, preserving content.
-                # We must reconstruct the header text (Number + Topic) and prepend it,
-                # otherwise the text that triggered the section detection is lost.
                 topic = elem.get('topic', '')
                 header_text = f"{sec_num} {topic}".strip()
                 body_content = elem.get('content', '')
@@ -164,10 +122,7 @@ def reclassify_elements(elements: List[Dict], sections_to_keep: Set[Tuple[str, i
                     'page_number': elem.get('page_number'),
                     'content': full_content,
                     'bbox': elem.get('bbox'),
-                    # Preserve original info for debugging
                     '_original_type': 'section',
-                    '_original_section_number': sec_num,
-                    '_original_topic': topic,
                     '_reclassified_by': 'ml_filter'
                 }
                 result.append(reclassified_elem)
@@ -196,10 +151,11 @@ def main():
     # ML TRAINING (once, on full CSV)
     # ==========================================================================
     sections_to_keep_by_doc = {}
+    ml_metrics = None
     
     if args.step in ["ml_filter", "all"]:
         print("="*60)
-        print("ML TRAINING")
+        print("ML TRAINING & PREDICTION")
         print("="*60)
         
         features_path = os.path.join(args.results_dir, "training_features.csv")
@@ -210,7 +166,8 @@ def main():
                 f"Run: python feature_extractor.py --results_dir {args.results_dir}"
             )
         
-        sections_to_keep_by_doc = train_and_predict(features_path, args.ml_threshold)
+        # Now returns metrics as second tuple item
+        sections_to_keep_by_doc, ml_metrics = train_and_predict(features_path, args.ml_threshold)
         print()
 
     # ==========================================================================
@@ -236,10 +193,8 @@ def main():
         if args.step in ["classify", "all"]:
             print("[1: Classify]")
             run_classification_on_file(raw_input, classify_out, LLM_CONFIG, max_workers=4)
-            
             result = load_classification_result(classify_out)
             if result and result.get('is_stub'):
-                print("  STUB - Skipping")
                 continue
 
         # STEP 2: TITLE
@@ -247,51 +202,29 @@ def main():
             print("[2: Title]")
             result = load_classification_result(classify_out)
             doc_type = result.get('document_type', 'unknown') if result else 'unknown'
-            
             if doc_type == 'no_title':
-                with open(title_out, 'w') as f:
-                    json.dump([], f)
+                with open(title_out, 'w') as f: json.dump([], f)
             else:
-                try:
-                    extract_title_from_first_page(raw_input, title_out)
-                except json.JSONDecodeError as e:
-                    print(f"  [Error] Title JSON decode failed: {e}")
-                    print(f"  Continuing with empty title data...")
-                    with open(title_out, 'w') as f:
-                        json.dump([], f)
+                extract_title_from_first_page(raw_input, title_out)
 
         # STEP 3: STRUCTURE
         if args.step in ["structure", "all"]:
             print("[3: Structure]")
             content_start = load_content_start_page(classify_out, default=1)
-            run_section_processing_on_file(
-                raw_input, organized_out, 
-                content_start_page=content_start,
-                header_top_threshold=600,
-                footer_top_threshold=6100
-            )
+            run_section_processing_on_file(raw_input, organized_out, content_start_page=content_start)
 
         # STEP 4: ML FILTER
         if args.step in ["ml_filter", "all"]:
             print("[4: ML Reclassify]")
-            
             if stem not in sections_to_keep_by_doc:
-                print(f"  WARNING: '{stem}' not in predictions")
-                print(f"  Available: {list(sections_to_keep_by_doc.keys())[:3]}...")
                 import shutil
                 shutil.copy(organized_out, ml_filtered_out)
             else:
                 sections_to_keep = sections_to_keep_by_doc[stem]
+                with open(organized_out, 'r') as f: data = json.load(f)
                 
-                with open(organized_out, 'r') as f:
-                    data = json.load(f)
-                
-                if isinstance(data, dict) and 'elements' in data:
-                    elements = data['elements']
-                    page_metadata = data.get('page_metadata', {})
-                else:
-                    elements = data if isinstance(data, list) else []
-                    page_metadata = {}
+                elements = data.get('elements', []) if isinstance(data, dict) else data
+                page_metadata = data.get('page_metadata', {}) if isinstance(data, dict) else {}
                 
                 reclassified_elements, kept, converted = reclassify_elements(elements, sections_to_keep)
                 print(f"  Sections kept: {kept}, converted to text blocks: {converted}")
@@ -308,22 +241,13 @@ def main():
         # STEP 6: TABLES
         if args.step in ["tables", "all"]:
             print("[6: Tables]")
-            for candidate in [with_assets_out, ml_filtered_out, organized_out]:
-                if os.path.exists(candidate):
-                    input_file = candidate
-                    break
-            run_table_processing_on_file(
-                input_file, tables_out, args.figures_dir, stem, 
-                LLM_CONFIG, use_llm_ocr=not args.no_table_ocr
-            )
+            input_file = with_assets_out if os.path.exists(with_assets_out) else ml_filtered_out
+            run_table_processing_on_file(input_file, tables_out, args.figures_dir, stem, LLM_CONFIG, use_llm_ocr=not args.no_table_ocr)
 
         # STEP 7: WRITE
         if args.step in ["write", "all"]:
             print("[7: Write]")
-            for candidate in [tables_out, with_assets_out, ml_filtered_out, organized_out]:
-                if os.path.exists(candidate):
-                    input_file = candidate
-                    break
+            input_file = tables_out if os.path.exists(tables_out) else with_assets_out
             run_docx_creation(input_file, final_docx, args.figures_dir, stem, title_out)
 
         # STEP 8: VALIDATE
@@ -337,27 +261,52 @@ def main():
                     'toc_coverage': result.toc_coverage,
                     'precision': result.precision,
                 })
-
         print()
 
     # ==========================================================================
-    # SUMMARY
+    # FINAL SUMMARY
     # ==========================================================================
+    
+    # 1. TOC Validation Summary
     if validation_results:
         print("="*60)
-        print("VALIDATION SUMMARY")
+        print("TOC VALIDATION SUMMARY")
         print("="*60)
-        
         docs_with_toc = [r for r in validation_results if r['has_toc']]
-        
         if docs_with_toc:
             avg_cov = sum(r['toc_coverage'] for r in docs_with_toc) / len(docs_with_toc)
             avg_prec = sum(r['precision'] for r in docs_with_toc) / len(docs_with_toc)
-            
             print(f"Documents with TOC: {len(docs_with_toc)}")
-            print(f"Avg Coverage:  {avg_cov:.1f}%")
-            print(f"Avg Precision: {avg_prec:.1f}%")
+            print(f"Avg TOC Match:     {avg_cov:.1f}%")
+            print(f"Avg Precision:     {avg_prec:.1f}%")
 
+    # 2. ML Performance Summary
+    if ml_metrics:
+        val = ml_metrics.get('val', {})
+        train = ml_metrics.get('train', {})
+        
+        print("\n" + "="*60)
+        print("ML MODEL PERFORMANCE")
+        print("="*60)
+        
+        print("1. VALIDATION (80/20 SPLIT)")
+        print(f"   (How well the model generalizes to unseen data)")
+        print(f"   Accuracy:  {val.get('accuracy', 0):.1%}")
+        print(f"   Precision: {val.get('precision', 0):.3f}")
+        print(f"   Recall:    {val.get('recall', 0):.3f}")
+        print(f"   F1 Score:  {val.get('f1', 0):.3f}")
+        
+        if 'confusion' in val:
+            tn, fp, fn, tp = val['confusion'].ravel()
+            print(f"   Confusion: TP={tp} (Valid kept), FP={fp} (Junk kept)")
+            print(f"              TN={tn} (Junk removed), FN={fn} (Valid removed)")
+
+        print("\n2. FINAL MODEL (100% TRAINING DATA)")
+        print(f"   (The model actually used for processing {train.get('total_samples', 0)} labeled rows)")
+        print(f"   Precision: {train.get('precision', 0):.3f}")
+        print(f"   Recall:    {train.get('recall', 0):.3f}")
+        print(f"   F1 Score:  {train.get('f1', 0):.3f}")
+        
     print("\nDone!")
 
 

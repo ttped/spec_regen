@@ -6,10 +6,9 @@ import pandas as pd
 import numpy as np
 from xgboost import XGBClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
-from typing import List, Dict, Tuple, Set
+from sklearn.metrics import confusion_matrix, precision_recall_fscore_support, accuracy_score
+from typing import List, Dict, Tuple, Set, Any
 from dataclasses import dataclass
-
 
 # =============================================================================
 # CURATED FEATURE LIST
@@ -44,24 +43,19 @@ SELECTED_FEATURES = [
     'relative_height',
 ]
 
-
-@dataclass
-class TrainingResult:
-    model: XGBClassifier
-    feature_columns: List[str]
-    precision: float
-    recall: float
-    f1: float
-
-
 def train_and_predict(
     csv_path: str, 
     threshold: float = 0.5
-) -> Dict[str, Set[Tuple[str, int]]]:
+) -> Tuple[Dict[str, Set[Tuple[str, int]]], Dict[str, Any]]:
     """
     Train on labeled data, predict on ALL data.
     
-    Returns dict: {doc_name: set of (section_number, page) tuples to KEEP}
+    Performs two passes:
+    1. Validation Pass (80/20 split): To measure generalization performance.
+    2. Production Pass (100% labeled): Retrains on ALL labeled data for final predictions.
+    
+    Returns:
+        tuple: (result_dict, metrics_dict)
     """
     print(f"\n  Loading: {csv_path}")
     df = pd.read_csv(csv_path)
@@ -76,7 +70,7 @@ def train_and_predict(
     # Get labeled data
     labeled_df = df[df['_label'].notna()].copy()
     labeled_df['_label'] = pd.to_numeric(labeled_df['_label'], errors='coerce')
-    labeled_df = labeled_df[labeled_df['_label'] >= 0]
+    labeled_df = labeled_df[labeled_df['_label'].isin([0, 1])]
     
     pos_count = (labeled_df['_label'] == 1).sum()
     neg_count = (labeled_df['_label'] == 0).sum()
@@ -89,52 +83,79 @@ def train_and_predict(
     available = [f for f in SELECTED_FEATURES if f in df.columns]
     missing_feat = set(SELECTED_FEATURES) - set(available)
     print(f"  Features: {len(available)}/{len(SELECTED_FEATURES)}")
-    if missing_feat:
-        print(f"  Missing: {missing_feat}")
     
-    # Train
     X_labeled = labeled_df[available].fillna(0).replace([np.inf, -np.inf], 0)
     y_labeled = labeled_df['_label'].astype(int)
     
+    scale_weight = (neg_count / pos_count) * 1.5 if pos_count > 0 else 1
+
+    # Hyperparameters
+    params = {
+        'n_estimators': 150,
+        'max_depth': 3,
+        'learning_rate': 0.05,
+        'min_child_weight': 3,
+        'gamma': 0.1,
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'random_state': 42,
+        'reg_alpha': 0.1,
+        'reg_lambda': 1.0,
+        'scale_pos_weight': scale_weight
+    }
+
+    metrics = {}
+
+    # =========================================================================
+    # PASS 1: VALIDATION (80/20 Split) - How well does it generalize?
+    # =========================================================================
+    print(f"\n  --- Phase 1: Validation (80/20 Split) ---")
     X_train, X_test, y_train, y_test = train_test_split(
         X_labeled, y_labeled, test_size=0.2, random_state=42, stratify=y_labeled
     )
 
-    scale_weight = (neg_count / pos_count) * 1.5 if pos_count > 0 else 1
+    val_model = XGBClassifier(**params)
+    val_model.fit(X_train, y_train)
     
-    model = XGBClassifier(
-        n_estimators=150, 
-        max_depth=3,                 # Reduced from 4 -> 3 to prevent overfitting
-        learning_rate=0.05,          # Slower learning for better generalization
-        min_child_weight=3,          # Conservative: needs 3+ samples to make a rule
-        gamma=0.1,                   # Pruning parameter
-        subsample=0.8, 
-        colsample_bytree=0.8, 
-        random_state=42,
-        reg_alpha=0.1,               # L1 Regularization (noise removal)
-        reg_lambda=1.0,              # L2 Regularization
-        scale_pos_weight=scale_weight
-    )
-    model.fit(X_train, y_train)
+    val_pred = val_model.predict(X_test)
+    v_prec, v_rec, v_f1, _ = precision_recall_fscore_support(y_test, val_pred, average='binary', pos_label=1)
+    v_acc = accuracy_score(y_test, val_pred)
+    v_conf = confusion_matrix(y_test, val_pred)
     
-    # Evaluate
-    test_pred = model.predict(X_test)
-    precision, recall, f1, _ = precision_recall_fscore_support(
-        y_test, test_pred, average='binary', pos_label=1
-    )
-    conf = confusion_matrix(y_test, test_pred)
+    metrics['val'] = {
+        'precision': v_prec, 'recall': v_rec, 'f1': v_f1, 'accuracy': v_acc, 'confusion': v_conf
+    }
     
-    print(f"\n  === MODEL RESULTS ===")
-    print(f"  Precision: {precision:.3f}, Recall: {recall:.3f}, F1: {f1:.3f}")
-    print(f"  Confusion: TN={conf[0,0]}, FP={conf[0,1]}, FN={conf[1,0]}, TP={conf[1,1]}")
+    print(f"  Precision: {v_prec:.3f}, Recall: {v_rec:.3f}, F1: {v_f1:.3f}")
+    print(f"  Confusion (Test Set): TN={v_conf[0,0]}, FP={v_conf[0,1]}, FN={v_conf[1,0]}, TP={v_conf[1,1]}")
+
+    # =========================================================================
+    # PASS 2: PRODUCTION (100% Data) - Maximize knowledge
+    # =========================================================================
+    print(f"\n  --- Phase 2: Full Training (100% Labeled Data) ---")
+    final_model = XGBClassifier(**params)
+    final_model.fit(X_labeled, y_labeled)
     
-    # Predict on ALL
+    # Check training error (sanity check)
+    train_pred = final_model.predict(X_labeled)
+    t_prec, t_rec, t_f1, _ = precision_recall_fscore_support(y_labeled, train_pred, average='binary', pos_label=1)
+    t_acc = accuracy_score(y_labeled, train_pred)
+    t_conf = confusion_matrix(y_labeled, train_pred)
+
+    metrics['train'] = {
+        'precision': t_prec, 'recall': t_rec, 'f1': t_f1, 'accuracy': t_acc, 'confusion': t_conf,
+        'total_samples': len(labeled_df)
+    }
+
+    print(f"  Training Fit: Precision: {t_prec:.3f}, Recall: {t_rec:.3f}, F1: {t_f1:.3f}")
+    
+    # =========================================================================
+    # PREDICT ON EVERYTHING
+    # =========================================================================
     X_all = df[available].fillna(0).replace([np.inf, -np.inf], 0)
-    probs = model.predict_proba(X_all)[:, 1]
+    probs = final_model.predict_proba(X_all)[:, 1]
     
     print(f"\n  Predictions on {len(df)} rows:")
-    print(f"  Prob range: [{probs.min():.3f}, {probs.max():.3f}], mean: {probs.mean():.3f}")
-    
     df['_keep'] = probs >= threshold
     print(f"  Keep: {df['_keep'].sum()}, Remove: {(~df['_keep']).sum()}")
     
@@ -149,9 +170,7 @@ def train_and_predict(
             sections.add((sec_num, page))
         result[doc_name] = sections
     
-    print(f"  Documents: {len(result)}")
-    return result
-
+    return result, metrics
 
 if __name__ == '__main__':
     import sys
