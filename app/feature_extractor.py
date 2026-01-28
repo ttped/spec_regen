@@ -22,10 +22,11 @@ import json
 import re
 import csv
 import statistics
+import string
+from collections import Counter
 from typing import List, Dict, Tuple, Optional, Set, Any
 from dataclasses import dataclass, field
 from collections import defaultdict
-
 
 # =============================================================================
 # DEFAULT PATHS (same as simple_pipeline.py)
@@ -1586,63 +1587,125 @@ def print_feature_correlations(df: 'pd.DataFrame', min_samples: int = 50) -> Non
         print(f"{col:<45} {corr:>10.3f} {indicator}")
 
 
+def analyze_title_vocabulary(df: 'pd.DataFrame', top_n: int = 25):
+    """
+    Analyzes and prints the most common words in titles for valid (1) 
+    and invalid (0) sections.
+    """
+    if not HAS_PANDAS: return
+
+    print("\n" + "="*60)
+    print("VOCABULARY ANALYSIS")
+    print("="*60)
+    
+    # Filter labeled data (0 or 1)
+    labeled = df[df['_label'].isin([0, 1])].copy()
+    
+    if len(labeled) == 0:
+        print("No labeled data (0 or 1) found for vocabulary analysis.")
+        return
+
+    # Basic stopwords to ignore
+    stopwords = {
+        'the', 'a', 'an', 'and', 'or', 'of', 'to', 'in', 'on', 'for', 'with', 'by', 'at', 
+        'is', 'are', 'be', 'as', 'from', 'that', 'this', 'it', 'not', 'have', 'has'
+    }
+
+    def get_tokens(titles):
+        tokens = []
+        for t in titles:
+            if not isinstance(t, str): continue
+            # Remove punctuation (except internal hyphens sometimes useful, but let's strip all for now)
+            clean = t.lower().translate(str.maketrans('', '', string.punctuation))
+            # Split and filter
+            words = [w for w in clean.split() if w not in stopwords and len(w) > 2 and not w.isdigit()]
+            tokens.extend(words)
+        return tokens
+
+    # --- Valid Sections (Label = 1) ---
+    valid_titles = labeled[labeled['_label'] == 1]['_title']
+    valid_tokens = get_tokens(valid_titles)
+    valid_counts = Counter(valid_tokens).most_common(top_n)
+
+    print(f"\nTop {top_n} words in VALID sections (Label=1):")
+    print(f"Total valid sections analyzed: {len(valid_titles)}")
+    print("-" * 60)
+    print(f"{'Word':<20} {'Count':<10} {'Freq %':<10}")
+    print("-" * 60)
+    
+    total_valid = len(valid_titles) if len(valid_titles) > 0 else 1
+    for word, count in valid_counts:
+        pct = (count / total_valid) * 100
+        print(f"{word:<20} {count:<10} {pct:.1f}%")
+
+    # --- Invalid Sections (Label = 0) ---
+    invalid_titles = labeled[labeled['_label'] == 0]['_title']
+    invalid_tokens = get_tokens(invalid_titles)
+    invalid_counts = Counter(invalid_tokens).most_common(top_n)
+
+    print(f"\nTop {top_n} words in INVALID sections (Label=0):")
+    print(f"Total invalid sections analyzed: {len(invalid_titles)}")
+    print("-" * 60)
+    print(f"{'Word':<20} {'Count':<10} {'Freq %':<10}")
+    print("-" * 60)
+    
+    total_invalid = len(invalid_titles) if len(invalid_titles) > 0 else 1
+    for word, count in invalid_counts:
+        pct = (count / total_invalid) * 100
+        print(f"{word:<20} {count:<10} {pct:.1f}%")
+
+
+def print_feature_correlations(df: 'pd.DataFrame', min_samples: int = 20) -> None:
+    """
+    Print correlations of features with the _label column.
+    """
+    if not HAS_PANDAS:
+        raise ImportError("pandas is required")
+    
+    # Ensure we only have numeric types for correlation
+    # Filter for labels 0 and 1 (exclude -1 if it slipped through)
+    labeled = df[df['_label'].isin([0, 1])].copy()
+    
+    if len(labeled) < min_samples:
+        print(f"Need at least {min_samples} labeled samples (0 or 1), have {len(labeled)}")
+        return
+    
+    labeled['_label'] = labeled['_label'].astype(float)
+    
+    # Get feature columns (ignore metadata starting with _)
+    feature_cols = [c for c in df.columns if not c.startswith('_')]
+    
+    # Further filter to only numeric columns to avoid errors
+    numeric_cols = labeled[feature_cols].select_dtypes(include=['number']).columns
+    
+    correlations = []
+    
+    for col in numeric_cols:
+        if labeled[col].std() > 0:  # Skip constant columns
+            corr = labeled['_label'].corr(labeled[col])
+            correlations.append((col, corr))
+    
+    # Sort by absolute correlation
+    correlations.sort(key=lambda x: abs(x[1]), reverse=True)
+    
+    print("\n" + "="*60)
+    print("FEATURE CORRELATIONS (Label 0 vs 1)")
+    print("="*60)
+    print(f"{'Feature':<45} {'Correlation':>12}")
+    print("-" * 60)
+    
+    for col, corr in correlations:
+        indicator = "+++" if corr > 0.5 else "++" if corr > 0.3 else "+" if corr > 0.1 else \
+                   "---" if corr < -0.5 else "--" if corr < -0.3 else "-" if corr < -0.1 else ""
+        print(f"{col:<45} {corr:>10.3f} {indicator}")
+
+
 if __name__ == '__main__':
     import argparse
+    import numpy as np  # Needed for explicit numeric filtering if not imported
     
     parser = argparse.ArgumentParser(
-        description="Extract ML features from processed documents for training a section classifier.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-EXAMPLES:
-    # Use pipeline defaults
-    python feature_extractor.py
-    
-    # Use pipeline defaults, save to specific CSV
-    python feature_extractor.py -o training_data.csv
-    
-    # Custom directories
-    python feature_extractor.py --raw_ocr_dir ./my_ocr --results_dir ./my_results
-    
-    # Just print summary, don't save
-    python feature_extractor.py --no-save
-
-INTERACTIVE USAGE:
-    from feature_extractor import process_directory, load_training_data
-    
-    # Extract features (uses pipeline defaults)
-    df = process_directory()
-    
-    # Or with custom paths
-    df = process_directory('./my_results', './my_ocr')
-    
-    # Explore
-    df.head()
-    df.describe()
-    
-    # Save
-    df.to_csv('training_data.csv', index=False)
-    
-    # Reload later
-    df = load_training_data('training_data.csv')
-
-LABELING:
-    Open the CSV and fill in '_label' column:
-        1 = valid section
-        0 = false positive
-
-NEW FEATURES (v2):
-    - vertical_gap_from_prev_*: Distance from previous line (detects section breaks)
-    - newlines_before_section_num: Count of preceding newlines
-    - next_is_logical_successor: Bidirectional sequence check
-    - in_logical_sequence: Both prev->this AND this->next are logical
-    - sequence_fit_score: Kalman-style prediction confidence
-    - format_consistency_score: Does format match same-depth sections?
-    - title_quality_score: How "title-like" is the title?
-    - combined_confidence: Weighted combination of positive indicators
-    
-REMOVED FEATURES:
-    - is_sandwiched, sandwich_same_neighbors (negative correlation with validity)
-        """
+        description="Extract ML features from processed documents for training a section classifier."
     )
     
     parser.add_argument(
@@ -1682,7 +1745,30 @@ REMOVED FEATURES:
     # Run extraction
     df = process_directory(args.results_dir, args.raw_ocr_dir, output_csv)
     
-    # If not saving, offer interactive hint
-    if args.no_save and not df.empty:
-        print("\nDataFrame created but not saved (--no-save flag)")
-        print("To save: df.to_csv('output.csv', index=False)")
+    # =========================================================================
+    # POST-PROCESSING ANALYSIS
+    # =========================================================================
+    if not df.empty and '_label' in df.columns:
+        
+        # 1. Load data explicitly to ensure we have the latest (including preserved labels)
+        if output_csv and os.path.exists(output_csv):
+            analysis_df = pd.read_csv(output_csv)
+        else:
+            analysis_df = df
+            
+        # 2. Filter: Remove rows where label is missing or -1 (or any negative number)
+        #    We only want confirmed valid (1) and confirmed invalid (0)
+        labeled_df = analysis_df[analysis_df['_label'].isin([0, 1])]
+        
+        if not labeled_df.empty:
+            # Set pandas display to show everything if needed (though we print manually mostly)
+            pd.set_option('display.max_rows', None)
+            
+            # 3. Print correlations (automatically handles non-numeric removal inside function)
+            print_feature_correlations(labeled_df)
+            
+            # 4. Analyze vocabulary for valid vs invalid titles
+            analyze_title_vocabulary(labeled_df, top_n=25)
+            
+        else:
+            print("\n[Info] No labeled data (0 or 1) found. Open the CSV, label some rows, and run again to see analysis.")
