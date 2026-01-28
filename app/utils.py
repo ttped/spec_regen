@@ -6,62 +6,186 @@ from typing import Optional, Any, Dict, List
 from langchain_openai import OpenAI
 import openai
 
+
+def _find_balanced_json(text: str, start_char: str, end_char: str) -> Optional[str]:
+    """
+    Find a balanced JSON object or array by counting braces/brackets.
+    
+    Args:
+        text: The text to search
+        start_char: '{' for objects, '[' for arrays
+        end_char: '}' for objects, ']' for arrays
+    
+    Returns:
+        The balanced JSON string or None
+    """
+    start_idx = text.find(start_char)
+    if start_idx == -1:
+        return None
+    
+    depth = 0
+    in_string = False
+    escape_next = False
+    
+    for i, char in enumerate(text[start_idx:], start=start_idx):
+        if escape_next:
+            escape_next = False
+            continue
+            
+        if char == '\\' and in_string:
+            escape_next = True
+            continue
+            
+        if char == '"' and not escape_next:
+            in_string = not in_string
+            continue
+            
+        if in_string:
+            continue
+            
+        if char == start_char:
+            depth += 1
+        elif char == end_char:
+            depth -= 1
+            if depth == 0:
+                return text[start_idx:i+1]
+    
+    return None
+
+
+def _extract_json_from_llm_string(text: str) -> Optional[str]:
+    """
+    Attempts to extract a JSON string from LLM output.
+    Handles markdown code blocks and nested JSON structures.
+    """
+    if not text:
+        return None
+
+    text = text.strip()
+
+    # First, try to extract from markdown code blocks
+    # Look for ```json ... ``` blocks
+    json_block_match = re.search(r"```json\s*([\s\S]*?)\s*```", text)
+    if json_block_match:
+        content = json_block_match.group(1).strip()
+        if _is_valid_json(content):
+            return content
+        # If not valid, try to find balanced JSON within it
+        for start, end in [('{', '}'), ('[', ']')]:
+            balanced = _find_balanced_json(content, start, end)
+            if balanced and _is_valid_json(balanced):
+                return balanced
+
+    # Try generic ``` ... ``` blocks
+    generic_block_match = re.search(r"```\s*([\s\S]*?)\s*```", text)
+    if generic_block_match:
+        content = generic_block_match.group(1).strip()
+        if _is_valid_json(content):
+            return content
+        for start, end in [('{', '}'), ('[', ']')]:
+            balanced = _find_balanced_json(content, start, end)
+            if balanced and _is_valid_json(balanced):
+                return balanced
+
+    # Check if entire text is valid JSON
+    if _is_valid_json(text):
+        return text
+
+    # Try to find balanced JSON object in raw text
+    balanced_obj = _find_balanced_json(text, '{', '}')
+    if balanced_obj and _is_valid_json(balanced_obj):
+        return balanced_obj
+
+    # Try to find balanced JSON array in raw text
+    balanced_arr = _find_balanced_json(text, '[', ']')
+    if balanced_arr and _is_valid_json(balanced_arr):
+        return balanced_arr
+
+    # Last resort: try to repair common issues
+    repaired = _try_repair_json(text)
+    if repaired:
+        return repaired
+
+    print(f"Debug: Could not extract valid JSON from: '{text[:300]}...'")
+    return None
+
+
+def _try_repair_json(text: str) -> Optional[str]:
+    """
+    Try to repair common JSON issues from LLM output.
+    """
+    # Find potential JSON start
+    obj_start = text.find('{')
+    arr_start = text.find('[')
+    
+    if obj_start == -1 and arr_start == -1:
+        return None
+    
+    # Determine which comes first
+    if obj_start == -1:
+        start_idx = arr_start
+        end_char = ']'
+    elif arr_start == -1:
+        start_idx = obj_start
+        end_char = '}'
+    else:
+        start_idx = min(obj_start, arr_start)
+        end_char = '}' if obj_start < arr_start else ']'
+    
+    # Extract from start to end of text
+    potential = text[start_idx:]
+    
+    # Try adding missing closing brace/bracket
+    for num_closes in range(1, 4):
+        candidate = potential + (end_char * num_closes)
+        if _is_valid_json(candidate):
+            return candidate
+    
+    # Try removing trailing garbage after last valid close
+    for i in range(len(potential) - 1, 0, -1):
+        candidate = potential[:i+1]
+        if _is_valid_json(candidate):
+            return candidate
+    
+    return None
+
+
+def _is_valid_json(text: str) -> bool:
+    """Helper function to check if a string is valid JSON."""
+    if not text:
+        return False
+    try:
+        json.loads(text)
+        return True
+    except json.JSONDecodeError:
+        return False
+
+
 def _attempt_json_repair(json_string: str, error: json.JSONDecodeError) -> Optional[str]:
     """
     Tries to repair a JSON string by escaping an unescaped quote at the error position.
-    
-    Args:
-        json_string: The malformed JSON string.
-        error: The JSONDecodeError exception object.
-        
-    Returns:
-        A repaired JSON string or None if the error is not a simple quote issue.
     """
-    # The error message for an unescaped quote often includes "char".
-    # We focus on this common, fixable error.
     if "char" in error.msg:
-        # Point to the character that caused the error
         error_pos = error.pos
-        
-        # Insert a backslash before the problematic character (likely a quote)
         repaired_string = f"{json_string[:error_pos]}\\{json_string[error_pos:]}"
-        
         print(f"--- INFO: Attempting JSON repair at position {error_pos}. ---")
         return repaired_string
-        
     return None
+
 
 def save_results_to_json(results: List[Dict[str, Any]], file_path: str):
     """
     Saves the classification results to a JSON file.
-
-    Args:
-        results (List[Dict[str, Any]]): A list of dictionaries containing the classification results.
-        file_path (str): The path to the output JSON file.
     """
-    # Ensure the output directory exists
-    os.makedirs(os.path.dirname(file_path), exist_ok=True)
-    
-    # Write the results to the JSON file
+    os.makedirs(os.path.dirname(file_path) or '.', exist_ok=True)
     with open(file_path, 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=4)
-        
     print(f"Output successfully saved to {file_path}")
+
 
 def load_pages_from_json(file_path: str) -> Dict[str, str]:
     """
     Reads page data from a JSON file, intelligently handling two different formats.
-
-    Format 1 ("Old"): A top-level "pages" key containing a dictionary of page_num: page_text.
-    Format 2 ("New"): A root object where each key is a page number and the value is a
-                     dictionary containing a "page_text" key.
-
-    Args:
-        file_path: The path to the source OCR JSON file.
-
-    Returns:
-        A standardized dictionary mapping page numbers (str) to page text (str).
-        Returns an empty dictionary if the file is invalid or contains no pages.
     """
     if not os.path.exists(file_path):
         print(f"Error: File not found at {file_path}. Returning empty pages.")
@@ -86,11 +210,9 @@ def load_pages_from_json(file_path: str) -> Dict[str, str]:
         return pages_output
 
     # Check for Format 2 ("New" format with nested "page_text")
-    # This uses the logic from your original function.
     elif all(isinstance(val, dict) and "page_text" in val for val in data.values()):
         print(f"  - Detected nested 'page_text' format in {file_path}.")
         for page_num, content_dict in data.items():
-            # Use page_Id if available, otherwise use the key.
             page_key = str(content_dict.get('page_Id', page_num))
             pages_output[page_key] = content_dict.get("page_text", "")
         return pages_output
@@ -98,67 +220,6 @@ def load_pages_from_json(file_path: str) -> Dict[str, str]:
     else:
         print(f"Warning: Unrecognized JSON structure in {file_path}. No pages loaded.")
         return {}
-
-def _extract_json_from_llm_string(text: str) -> Optional[str]:
-    """
-    Attempts to extract a JSON string from LLM output.
-    Handles markdown code blocks and tries to find the main JSON object or array.
-    """
-    if not text:
-        return None
-
-    text = text.strip()
-
-    # Try to find complete JSON code blocks with proper closing
-    match_json_block = re.search(r"```json\s*(\[.*?\]|\{.*?\})\s*```", text, re.DOTALL)
-    if match_json_block:
-        return match_json_block.group(1).strip()
-
-    # Try to find incomplete JSON code blocks (missing closing backticks)
-    match_incomplete_json = re.search(r"```json\s*(\[.*?\]|\{.*?\})", text, re.DOTALL)
-    if match_incomplete_json:
-        potential_json = match_incomplete_json.group(1).strip()
-        if _is_valid_json(potential_json):
-            return potential_json
-
-    # Try generic code blocks
-    match_block = re.search(r"```\s*(\[.*?\]|\{.*?\})\s*```", text, re.DOTALL)
-    if match_block:
-        return match_block.group(1).strip()
-
-    # Check if entire text is valid JSON
-    if (text.startswith("{") and text.endswith("}")) or (text.startswith("[") and text.endswith("]")):
-        if _is_valid_json(text):
-            return text
-            
-    # Try to extract JSON object or array from anywhere in the text
-    # First try arrays
-    array_matches = re.finditer(r'\[.*?\]', text, re.DOTALL)
-    for match in array_matches:
-        potential_json = match.group(0).strip()
-        if _is_valid_json(potential_json):
-            return potential_json
-    
-    # Then try objects
-    object_matches = re.finditer(r'\{.*?\}', text, re.DOTALL)
-    for match in object_matches:
-        potential_json = match.group(0).strip()
-        if _is_valid_json(potential_json):
-            return potential_json
-        
-    print(f"Debug: Could not identify a clear JSON structure in text: '{text[:500]}...'")
-    return None
-
-
-def _is_valid_json(text: str) -> bool:
-    """Helper function to check if a string is valid JSON."""
-    if not text:
-        return False
-    try:
-        json.loads(text)
-        return True
-    except json.JSONDecodeError:
-        return False
 
 
 def call_llm(
@@ -170,16 +231,6 @@ def call_llm(
 ) -> Optional[str]:
     """
     Sends a prompt to either Ollama or Mission Assist API.
-    
-    Args:
-        prompt: The prompt to send
-        model_name: Model name to use
-        base_url: Base URL for the API
-        api_key: API key (required for mission_assist)
-        provider: Either "ollama" or "mission_assist"
-    
-    Returns:
-        Raw LLM response content as string
     """
     if provider == "ollama":
         return _call_ollama(prompt, model_name, base_url)
@@ -226,7 +277,6 @@ def _call_mission_assist(
     """
     Sends a prompt to Mission Assist API using the openai client and chat completions endpoint.
     """
-    # The URL for gpt-oss is a special case and does not contain a hyphen in its name.
     if model_name == "gpt-oss":
         url_model_segment = "gptoss"
     else:
@@ -241,13 +291,11 @@ def _call_mission_assist(
         base_url=api_url
     )
 
-    # Fetch the available model from the endpoint to ensure the correct ID is used.
     available_models = client.models.list()
     if not available_models.data:
         raise ValueError(f"No models available at endpoint: {api_url}")
     
     client_model_name = available_models.data[0].id
-    #print(f"Using Mission Assist model: {client_model_name}")
 
     system_prompt = """You are an expert-level JSON generation API. Your sole purpose is to respond with a single, valid JSON object or array.
 
