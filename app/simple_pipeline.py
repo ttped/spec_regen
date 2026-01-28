@@ -40,40 +40,58 @@ LLM_CONFIG = {
 
 def get_document_stems(input_dir: str) -> List[str]:
     stems = set()
-    for filename in os.listdir(input_dir):
-        if filename.endswith(".json"):
-            stems.add(os.path.splitext(filename)[0])
+    try:
+        for filename in os.listdir(input_dir):
+            if filename.endswith(".json"):
+                stems.add(os.path.splitext(filename)[0])
+    except FileNotFoundError:
+        print(f"Error: Input directory '{input_dir}' not found.")
+        return []
     return sorted(list(stems))
 
 
 def extract_title_from_first_page(raw_input_path: str, output_path: str):
     """Extract title page information from page 1."""
     print(f"  Loading: {raw_input_path}")
-    data = load_json_with_recovery(raw_input_path)
     
+    # 1. Safe Load
+    try:
+        data = load_json_with_recovery(raw_input_path)
+    except Exception as e:
+        print(f"  [Error] Failed to load raw OCR JSON: {e}")
+        # Create empty output to prevent downstream failures
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump([], f)
+        return
+
+    # 2. Extract Text
     page_text = ""
-    if isinstance(data, list) and len(data) > 0:
-        data.sort(key=lambda x: int(x.get('page_num', 0) or x.get('page_Id', 0) or 0))
-        first_item = data[0]
-        page_dict = first_item.get('page_dict', first_item)
-        text_list = page_dict.get('text', [])
-        if isinstance(text_list, list):
-            page_text = " ".join([str(t) for t in text_list])
-        else:
-            page_text = str(text_list)
-    elif isinstance(data, dict):
-        key = "1" if "1" in data else next(iter(data), None)
-        if key:
-            page_obj = data[key]
-            page_dict = page_obj.get('page_dict', page_obj) if isinstance(page_obj, dict) else page_obj
+    try:
+        if isinstance(data, list) and len(data) > 0:
+            data.sort(key=lambda x: int(x.get('page_num', 0) or x.get('page_Id', 0) or 0))
+            first_item = data[0]
+            page_dict = first_item.get('page_dict', first_item)
             text_list = page_dict.get('text', [])
             if isinstance(text_list, list):
                 page_text = " ".join([str(t) for t in text_list])
             else:
                 page_text = str(text_list)
+        elif isinstance(data, dict):
+            key = "1" if "1" in data else next(iter(data), None)
+            if key:
+                page_obj = data[key]
+                page_dict = page_obj.get('page_dict', page_obj) if isinstance(page_obj, dict) else page_obj
+                text_list = page_dict.get('text', [])
+                if isinstance(text_list, list):
+                    page_text = " ".join([str(t) for t in text_list])
+                else:
+                    page_text = str(text_list)
+    except Exception as e:
+        print(f"  [Warning] Error parsing page text structure: {e}")
 
+    # 3. LLM Extraction
     info = None
-    if page_text.strip():
+    if page_text and page_text.strip():
         try:
             info = extract_title_page_info(
                 page_text, 
@@ -82,9 +100,11 @@ def extract_title_from_first_page(raw_input_path: str, output_path: str):
                 LLM_CONFIG['api_key'], 
                 LLM_CONFIG['provider']
             )
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  [Warning] Title extraction LLM failure: {e}")
+            info = None
     
+    # 4. Safe Write
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump([info] if info else [], f, indent=4)
@@ -167,7 +187,12 @@ def main():
             )
         
         # Now returns metrics as second tuple item
-        sections_to_keep_by_doc, ml_metrics = train_and_predict(features_path, args.ml_threshold)
+        try:
+            sections_to_keep_by_doc, ml_metrics = train_and_predict(features_path, args.ml_threshold)
+        except Exception as e:
+            print(f"[Error] ML Training failed: {e}")
+            print("Continuing without ML filtering (all sections will be kept).")
+            sections_to_keep_by_doc = {}
         print()
 
     # ==========================================================================
@@ -192,75 +217,112 @@ def main():
         # STEP 1: CLASSIFY
         if args.step in ["classify", "all"]:
             print("[1: Classify]")
-            run_classification_on_file(raw_input, classify_out, LLM_CONFIG, max_workers=4)
-            result = load_classification_result(classify_out)
-            if result and result.get('is_stub'):
-                continue
-
+            try:
+                run_classification_on_file(raw_input, classify_out, LLM_CONFIG, max_workers=4)
+                result = load_classification_result(classify_out)
+                if result and result.get('is_stub'):
+                    print("  [Info] Document is a stub, skipping remaining steps.")
+                    continue
+            except Exception as e:
+                print(f"  [Error] Classification failed: {e}")
+                # We attempt to continue, but subsequent steps might fail if classify_out is missing
+                
         # STEP 2: TITLE
         if args.step in ["title", "all"]:
             print("[2: Title]")
-            result = load_classification_result(classify_out)
+            # Robust loading of classification result
+            try:
+                result = load_classification_result(classify_out)
+            except Exception as e:
+                print(f"  [Warning] Could not load classification for title step: {e}")
+                result = None
+            
             doc_type = result.get('document_type', 'unknown') if result else 'unknown'
+            
             if doc_type == 'no_title':
                 with open(title_out, 'w') as f: json.dump([], f)
             else:
+                # This function now has internal try/catch for JSON errors
                 extract_title_from_first_page(raw_input, title_out)
 
         # STEP 3: STRUCTURE
         if args.step in ["structure", "all"]:
             print("[3: Structure]")
-            content_start = load_content_start_page(classify_out, default=1)
-            run_section_processing_on_file(raw_input, organized_out, content_start_page=content_start)
+            try:
+                content_start = load_content_start_page(classify_out, default=1)
+                run_section_processing_on_file(raw_input, organized_out, content_start_page=content_start)
+            except Exception as e:
+                print(f"  [Error] Structure processing failed: {e}")
 
         # STEP 4: ML FILTER
         if args.step in ["ml_filter", "all"]:
             print("[4: ML Reclassify]")
-            if stem not in sections_to_keep_by_doc:
-                import shutil
-                shutil.copy(organized_out, ml_filtered_out)
+            if not os.path.exists(organized_out):
+                print(f"  [Skip] Organized output not found.")
             else:
-                sections_to_keep = sections_to_keep_by_doc[stem]
-                with open(organized_out, 'r') as f: data = json.load(f)
-                
-                elements = data.get('elements', []) if isinstance(data, dict) else data
-                page_metadata = data.get('page_metadata', {}) if isinstance(data, dict) else {}
-                
-                reclassified_elements, kept, converted = reclassify_elements(elements, sections_to_keep)
-                print(f"  Sections kept: {kept}, converted to text blocks: {converted}")
-                
-                with open(ml_filtered_out, 'w') as f:
-                    json.dump({'page_metadata': page_metadata, 'elements': reclassified_elements}, f, indent=4)
+                if stem not in sections_to_keep_by_doc:
+                    # If ML failed or this doc wasn't in training set, preserve original
+                    import shutil
+                    shutil.copy(organized_out, ml_filtered_out)
+                else:
+                    try:
+                        sections_to_keep = sections_to_keep_by_doc[stem]
+                        with open(organized_out, 'r') as f: data = json.load(f)
+                        
+                        elements = data.get('elements', []) if isinstance(data, dict) else data
+                        page_metadata = data.get('page_metadata', {}) if isinstance(data, dict) else {}
+                        
+                        reclassified_elements, kept, converted = reclassify_elements(elements, sections_to_keep)
+                        print(f"  Sections kept: {kept}, converted to text blocks: {converted}")
+                        
+                        with open(ml_filtered_out, 'w') as f:
+                            json.dump({'page_metadata': page_metadata, 'elements': reclassified_elements}, f, indent=4)
+                    except Exception as e:
+                        print(f"  [Error] ML Reclassify failed: {e}")
+                        import shutil
+                        shutil.copy(organized_out, ml_filtered_out)
 
         # STEP 5: ASSETS
         if args.step in ["assets", "all"]:
             print("[5: Assets]")
             input_file = ml_filtered_out if os.path.exists(ml_filtered_out) else organized_out
-            run_asset_integration(input_file, with_assets_out, args.figures_dir, stem, positioning_mode="bbox")
+            if os.path.exists(input_file):
+                run_asset_integration(input_file, with_assets_out, args.figures_dir, stem, positioning_mode="bbox")
+            else:
+                print(f"  [Skip] Input file for assets not found: {input_file}")
 
         # STEP 6: TABLES
         if args.step in ["tables", "all"]:
             print("[6: Tables]")
             input_file = with_assets_out if os.path.exists(with_assets_out) else ml_filtered_out
-            run_table_processing_on_file(input_file, tables_out, args.figures_dir, stem, LLM_CONFIG, use_llm_ocr=not args.no_table_ocr)
+            if os.path.exists(input_file):
+                run_table_processing_on_file(input_file, tables_out, args.figures_dir, stem, LLM_CONFIG, use_llm_ocr=not args.no_table_ocr)
+            else:
+                print(f"  [Skip] Input file for tables not found: {input_file}")
 
         # STEP 7: WRITE
         if args.step in ["write", "all"]:
             print("[7: Write]")
             input_file = tables_out if os.path.exists(tables_out) else with_assets_out
-            run_docx_creation(input_file, final_docx, args.figures_dir, stem, title_out)
+            if os.path.exists(input_file):
+                run_docx_creation(input_file, final_docx, args.figures_dir, stem, title_out)
+            else:
+                print(f"  [Skip] Input file for write not found: {input_file}")
 
         # STEP 8: VALIDATE
         if args.step in ["validate", "all"]:
             print("[8: Validate]")
-            result = run_validation_on_file(stem, args.raw_ocr_dir, args.results_dir)
-            if result:
-                validation_results.append({
-                    'document': stem,
-                    'has_toc': result.has_toc,
-                    'toc_coverage': result.toc_coverage,
-                    'precision': result.precision,
-                })
+            try:
+                result = run_validation_on_file(stem, args.raw_ocr_dir, args.results_dir)
+                if result:
+                    validation_results.append({
+                        'document': stem,
+                        'has_toc': result.has_toc,
+                        'toc_coverage': result.toc_coverage,
+                        'precision': result.precision,
+                    })
+            except Exception as e:
+                print(f"  [Warning] Validation failed: {e}")
         print()
 
     # ==========================================================================
