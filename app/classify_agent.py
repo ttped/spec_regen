@@ -28,7 +28,7 @@ from typing import Dict, List, Tuple, Optional, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
-    from .utils import _extract_json_from_llm_string, call_llm, save_results_to_json
+    from .utils import _extract_json_from_llm_string, call_llm, save_results_to_json, load_json_with_recovery
 except ImportError:
     from utils import _extract_json_from_llm_string, call_llm, save_results_to_json
 
@@ -515,8 +515,7 @@ def load_pages_for_classification(input_path: str) -> List[Tuple[int, str]]:
         return []
     
     try:
-        with open(input_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        data = load_json_with_recovery(input_path)
     except json.JSONDecodeError as e:
         print(f"  - [Error] Failed to load input file {input_path}: {e}")
         print(f"  - [Action] Skipping classification for this file.")

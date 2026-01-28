@@ -18,6 +18,7 @@ from docx_writer import run_docx_creation
 from section_processor import run_section_processing_on_file
 from section_classifier import train_and_predict
 from validation_agent import run_validation_on_file
+from utils import load_json_with_recovery
 
 
 # =============================================================================
@@ -46,30 +47,61 @@ def get_document_stems(input_dir: str) -> List[str]:
 
 def extract_title_from_first_page(raw_input_path: str, output_path: str):
     """Extract title page information from page 1."""
-    with open(raw_input_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+    print(f"  Loading: {raw_input_path}")
+    
+    data = load_json_with_recovery(raw_input_path)
+    
+    # Debug: show structure
+    print(f"  Data type: {type(data).__name__}")
+    if isinstance(data, list):
+        print(f"  List length: {len(data)}")
+        if len(data) > 0:
+            print(f"  First item keys: {list(data[0].keys()) if isinstance(data[0], dict) else 'not a dict'}")
+    elif isinstance(data, dict):
+        print(f"  Dict keys: {list(data.keys())[:5]}...")
     
     page_text = ""
     
     if isinstance(data, list) and len(data) > 0:
         data.sort(key=lambda x: int(x.get('page_num', 0) or x.get('page_Id', 0) or 0))
-        page_dict = data[0].get('page_dict', data[0])
+        first_item = data[0]
+        print(f"  First item keys: {list(first_item.keys()) if isinstance(first_item, dict) else type(first_item)}")
+        
+        page_dict = first_item.get('page_dict', first_item)
+        print(f"  page_dict keys: {list(page_dict.keys()) if isinstance(page_dict, dict) else type(page_dict)}")
+        
         text_list = page_dict.get('text', [])
+        print(f"  text field type: {type(text_list).__name__}, length: {len(text_list) if hasattr(text_list, '__len__') else 'N/A'}")
+        
         if isinstance(text_list, list):
             page_text = " ".join([str(t) for t in text_list])
         else:
             page_text = str(text_list)
+            
     elif isinstance(data, dict):
         key = "1" if "1" in data else next(iter(data), None)
+        print(f"  Using key: {key}")
+        
         if key:
             page_obj = data[key]
+            print(f"  page_obj type: {type(page_obj).__name__}")
+            
             page_dict = page_obj.get('page_dict', page_obj) if isinstance(page_obj, dict) else page_obj
             if isinstance(page_dict, dict):
+                print(f"  page_dict keys: {list(page_dict.keys())}")
                 text_list = page_dict.get('text', [])
+                print(f"  text field type: {type(text_list).__name__}")
+                
                 if isinstance(text_list, list):
                     page_text = " ".join([str(t) for t in text_list])
                 else:
                     page_text = str(text_list)
+
+    print(f"  Extracted text length: {len(page_text)} chars")
+    if page_text:
+        print(f"  Text preview: {page_text[:100]}...")
+    else:
+        print(f"  WARNING: No text extracted!")
 
     info = None
     if page_text.strip():
@@ -187,7 +219,13 @@ def main():
                 with open(title_out, 'w') as f:
                     json.dump([], f)
             else:
-                extract_title_from_first_page(raw_input, title_out)
+                try:
+                    extract_title_from_first_page(raw_input, title_out)
+                except json.JSONDecodeError as e:
+                    print(f"  [Error] Title JSON decode failed: {e}")
+                    print(f"  Continuing with empty title data...")
+                    with open(title_out, 'w') as f:
+                        json.dump([], f)
 
         # STEP 3: STRUCTURE
         if args.step in ["structure", "all"]:

@@ -7,6 +7,129 @@ from langchain_openai import OpenAI
 import openai
 
 
+def clean_json_string(text: str) -> str:
+    """Remove trailing commas from JSON (common OCR output issue)."""
+    # Remove trailing commas before closing braces/brackets
+    text = re.sub(r',(\s*[}\]])', r'\1', text)
+    return text
+
+
+def repair_unescaped_quotes(text: str, error_pos: int) -> str:
+    """
+    Attempt to fix an unescaped quote at or near the error position.
+    
+    This is a heuristic - it looks for quotes that appear to be inside
+    a string value (between structural quotes) and escapes them.
+    """
+    # Find the problematic area - look backwards for the opening quote
+    # and forwards for what should be the closing quote
+    
+    # Simple approach: escape the quote at error_pos if it looks like
+    # it's inside a string (preceded by text, not by : or [)
+    
+    if error_pos >= len(text):
+        return text
+    
+    # Look at character before the error position
+    # If we see a pattern like: "text "word" more" 
+    # The middle quotes need escaping
+    
+    search_start = max(0, error_pos - 100)
+    search_end = min(len(text), error_pos + 100)
+    
+    # Find all quotes in this region and try escaping the one at/near error_pos
+    region_start = text.rfind('"', search_start, error_pos)
+    if region_start == -1:
+        return text
+    
+    # Check if there's a quote right at or just before error_pos that needs escaping
+    for offset in range(0, 10):
+        check_pos = error_pos - offset
+        if check_pos < 0:
+            break
+        if text[check_pos] == '"' and check_pos > 0 and text[check_pos-1] != '\\':
+            # Check if this looks like a mid-string quote (not structural)
+            # Structural quotes are preceded by : , [ { or whitespace after these
+            prev_significant = check_pos - 1
+            while prev_significant > 0 and text[prev_significant] in ' \t\n\r':
+                prev_significant -= 1
+            
+            prev_char = text[prev_significant] if prev_significant >= 0 else ''
+            
+            # If preceded by a letter, number, or punctuation (not JSON structural)
+            # it's probably a quote inside text that needs escaping
+            if prev_char not in ':,[{':
+                # Escape this quote
+                return text[:check_pos] + '\\' + text[check_pos:]
+    
+    return text
+
+
+def load_json_with_recovery(file_path: str) -> Any:
+    """
+    Load JSON file, attempting to fix common issues like trailing commas
+    and unescaped quotes from OCR.
+    
+    Args:
+        file_path: Path to JSON file
+        
+    Returns:
+        Parsed JSON data
+        
+    Raises:
+        json.JSONDecodeError if parsing fails even after cleanup attempts
+    """
+    with open(file_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    # First try normal parsing
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        print(f"  [JSON] Parse error at position {e.pos}: {e.msg}")
+        
+        # Show context around error
+        start = max(0, e.pos - 50)
+        end = min(len(content), e.pos + 50)
+        context = content[start:end].replace('\n', '\\n').replace('\r', '\\r')
+        print(f"  [JSON] Context: ...{context}...")
+        
+        # Try cleaning trailing commas
+        print(f"  [JSON] Attempting repairs...")
+        cleaned = clean_json_string(content)
+        
+        try:
+            result = json.loads(cleaned)
+            print(f"  [JSON] Fixed with trailing comma removal")
+            return result
+        except json.JSONDecodeError as e2:
+            pass
+        
+        # Try fixing unescaped quotes (multiple attempts)
+        repaired = cleaned
+        for attempt in range(5):  # Try up to 5 quote repairs
+            try:
+                return json.loads(repaired)
+            except json.JSONDecodeError as eq:
+                if "Expecting ',' delimiter" in eq.msg or "Expecting ':' delimiter" in eq.msg:
+                    repaired = repair_unescaped_quotes(repaired, eq.pos)
+                else:
+                    break
+        
+        # Final attempt
+        try:
+            result = json.loads(repaired)
+            print(f"  [JSON] Fixed with quote escaping")
+            return result
+        except json.JSONDecodeError as e_final:
+            print(f"  [JSON] All repairs failed: {e_final.msg} at position {e_final.pos}")
+            start = max(0, e_final.pos - 50)
+            end = min(len(repaired), e_final.pos + 50)
+            context = repaired[start:end].replace('\n', '\\n').replace('\r', '\\r')
+            print(f"  [JSON] Final context: ...{context}...")
+            raise
+
+
 def _find_balanced_json(text: str, start_char: str, end_char: str) -> Optional[str]:
     """
     Find a balanced JSON object or array by counting braces/brackets.

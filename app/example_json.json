@@ -1,0 +1,108 @@
+{
+	"1": {
+		"page_Id": 1,
+		"page_dict": {
+			"level": [
+				1,2,3
+			],
+			"page_num": [
+				1,1,1
+			],
+			"block_num": [
+				0,1,1
+			],
+			"par_num": [
+				0,1,1
+			],
+			"line_num": [
+				0,0,0
+			],
+			"word_num": [
+				0,0,0
+			],
+			"left": [
+				0,100,120
+			],
+			"top": [
+				0,149,149
+			],
+			"width": [
+				5000,2800,2800
+			],
+			"height": [
+				6600,464,77
+			],
+			"conf": [
+				-1,23,93
+			],
+			"text": [
+				"", "Some", "text"
+			]
+		},
+		"image_meta": {
+			"render_raw": {
+				"stage": "render_raw_cv",
+				"width_px": 5052,
+				"height_px": 6600,
+				"channels": 3,
+				"dtype": "uint8",
+				"dpi_x": 300,
+				"dpi_y": 300,
+				"dpi_source": "render"
+			}
+		}
+	},
+	"2": {
+		"page_Id": 2,
+		"page_dict": {
+			"level": [
+				1,2,3
+			],
+			"page_num": [
+				2,2,2
+			],
+			"block_num": [
+				0,1,1
+			],
+			"par_num": [
+				0,1,1
+			],
+			"line_num": [
+				0,0,0
+			],
+			"word_num": [
+				0,0,0
+			],
+			"left": [
+				0,100,120
+			],
+			"top": [
+				0,149,149
+			],
+			"width": [
+				5000,2800,2800
+			],
+			"height": [
+				6600,464,77
+			],
+			"conf": [
+				-1,23,93
+			],
+			"text": [
+				"", "Some", "text"
+			]
+		},
+		"image_meta": {
+			"render_raw": {
+				"stage": "render_raw_cv",
+				"width_px": 5052,
+				"height_px": 6600,
+				"channels": 3,
+				"dtype": "uint8",
+				"dpi_x": 300,
+				"dpi_y": 300,
+				"dpi_source": "render"
+			}
+		}
+	}
+}
