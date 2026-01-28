@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import statistics
 from typing import List, Dict, Tuple, Optional, Any
 from json_repair import repair_json
 
@@ -140,13 +141,6 @@ def split_topic_at_period(text: str) -> Tuple[str, str]:
 def normalize_section_number(raw: str) -> str:
     """
     Normalize a section number by fixing common OCR separator errors.
-    
-    OCR commonly confuses separators:
-    - '1,1.3' should be '1.1.3'
-    - '1-1-3' should be '1.1.3'
-    - '3,2,1' should be '3.2.1'
-    
-    Returns the normalized section number string.
     """
     if not raw:
         return raw
@@ -157,8 +151,6 @@ def normalize_section_number(raw: str) -> str:
     normalized = normalized.replace(',', '.')
     
     # Replace hyphen with period, but only when between digits
-    # This avoids breaking things like "A-1" or "Phase-2"
-    # Use a loop to handle consecutive replacements like "3-2-1"
     while True:
         new_normalized = re.sub(r'(\d)-(\d)', r'\1.\2', normalized)
         if new_normalized == normalized:
@@ -174,25 +166,6 @@ def normalize_section_number(raw: str) -> str:
 def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[bool, Optional[str], Optional[str], Optional[str], Optional[Dict]]:
     """
     Checks if a line of text is a section header using regex.
-    
-    GREEDY VERSION: Captures more potential sections and stores context metadata
-    for ML-based filtering later. Only applies minimal filtering here.
-    
-    Args:
-        line_text: The text line to check
-        debug: If True, print why a line was rejected
-    
-    Returns:
-        Tuple of (is_header, section_number, topic, remainder, context)
-        
-        context dict contains:
-            - raw_section_number: Original string before normalization
-            - had_leading_whitespace: Was there whitespace before the number?
-            - leading_whitespace_len: How much whitespace?
-            - had_text_before_number: Was there non-whitespace text before the number?
-            - text_before_number: What text was before the number (if any)
-            - original_line: The full original line
-            - rejection_reason: If rejected, why (for debugging/features)
     """
     context = {
         'raw_section_number': None,
@@ -215,13 +188,8 @@ def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[b
     # GREEDY REGEX: Find section-number-like patterns ANYWHERE in the line
     # ==========================================================================
     
-    # Pattern 1: Section number at START of line (after optional whitespace)
-    # This is the most common and reliable case
     match_start = re.match(r'^(\s*)([0-9]+(?:[.\-,][0-9]+)*[.\-,]?[A-Za-z]?)\s+(.+)', line_text)
     match_start_no_title = re.match(r'^(\s*)([0-9]+(?:[.\-,][0-9]+)*[.\-,]?[A-Za-z]?)\s*$', line_text)
-    
-    # Pattern 2: Section number NOT at start (text before it) - GREEDY capture
-    # e.g., "See section 1.2.3 for details" or "Reference: 3.1 Overview"
     match_mid = re.search(r'(?:^|[:\s])([0-9]+(?:\.[0-9]+)+)\s+([A-Z][A-Za-z].*?)(?:\.|$)', line_text)
     
     potential_num = None
@@ -235,63 +203,42 @@ def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[b
         full_topic = ""
         context['had_text_before_number'] = False
     elif match_mid:
-        # Found section number mid-line - capture it but note the context
         potential_num, full_topic = match_mid.groups()
-        # Get text before the match
         match_start_pos = match_mid.start(1)
         text_before = line_text[:match_start_pos].strip()
         context['had_text_before_number'] = len(text_before) > 0
-        context['text_before_number'] = text_before[:50]  # Truncate
+        context['text_before_number'] = text_before[:50]
     else:
-        # No match at all
         if debug:
             print(f"      [DEBUG] Rejected (no regex match): '{line_text[:50]}...'")
         context['rejection_reason'] = 'no_regex_match'
         return False, None, None, None, context
     
-    # Store raw section number before normalization
     context['raw_section_number'] = potential_num
     
-    # Normalize the section number (fix OCR separator errors like 1,1.3 -> 1.1.3)
     original_num = potential_num
     potential_num = normalize_section_number(potential_num)
     
     if debug and original_num != potential_num:
         print(f"      [DEBUG] Normalized section number: '{original_num}' -> '{potential_num}'")
 
-    # ==========================================================================
-    # MINIMAL FILTERING - Let ML handle most decisions
-    # Only reject things that are DEFINITELY not section numbers
-    # ==========================================================================
-    
-    # 1. Must contain at least one digit
     if not any(c.isdigit() for c in potential_num):
         if debug:
             print(f"      [DEBUG] Rejected (no digits): '{potential_num}'")
         context['rejection_reason'] = 'no_digits'
         return False, None, None, None, context
 
-    # 2. Way too long to be a section number (like a sentence or paragraph)
     if len(potential_num) > 30:
         if debug:
             print(f"      [DEBUG] Rejected (too long > 30): '{potential_num}'")
         context['rejection_reason'] = 'too_long'
         return False, None, None, None, context
 
-    # 3. Pure alpha (no digits) - already caught by rule 1, but explicit
     if potential_num.replace('.', '').replace('-', '').replace(',', '').isalpha():
         if debug:
             print(f"      [DEBUG] Rejected (pure alpha): '{potential_num}'")
         context['rejection_reason'] = 'pure_alpha'
         return False, None, None, None, context
-
-    # ==========================================================================
-    # REMOVED FILTERS (now handled by ML features):
-    # - Month name check (now a feature)
-    # - Too many alpha characters (now a feature) 
-    # - Pure digits > 3 chars (now a feature)
-    # - Mixed alpha+digit without dots (now a feature)
-    # ==========================================================================
 
     section_num = potential_num.strip().rstrip('.')
     topic, remainder = split_topic_at_period(full_topic)
@@ -305,7 +252,6 @@ def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[b
 def check_if_paragraph_is_header_legacy(line_text: str, debug: bool = False) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
     """
     LEGACY VERSION: Original function signature for backward compatibility.
-    Wraps the new greedy function but returns the old tuple format.
     """
     is_header, section_num, topic, remainder, context = check_if_paragraph_is_header(line_text, debug)
     return is_header, section_num, topic, remainder
@@ -314,10 +260,6 @@ def check_if_paragraph_is_header_legacy(line_text: str, debug: bool = False) -> 
 def group_elements_with_bbox(elements: List[Dict]) -> List[Dict]:
     """
     Merges consecutive content blocks and attaches them to preceding section headers.
-    
-    IMPORTANT: Preserves the ORIGINAL bbox of the section header line.
-    Does NOT merge bboxes from content blocks into the section bbox.
-    This ensures accurate positioning based on where the section header actually appears.
     """
     if not elements:
         return []
@@ -330,8 +272,6 @@ def group_elements_with_bbox(elements: List[Dict]) -> List[Dict]:
         if current_element['type'] == 'section':
             content_pieces = []
             
-            # PRESERVE the original section header bbox - do NOT merge with content
-            # The bbox should represent where the section HEADER is, not the entire section content
             original_bbox = current_element.get('bbox')
             
             j = i + 1
@@ -340,8 +280,6 @@ def group_elements_with_bbox(elements: List[Dict]) -> List[Dict]:
                 j += 1
             
             current_element['content'] = "\n\n".join(content_pieces)
-            
-            # Keep the original bbox unchanged
             current_element['bbox'] = original_bbox
             
             merged_elements.append(current_element)
@@ -397,13 +335,6 @@ def get_page_dict_from_object(page_obj: Any) -> Optional[Dict]:
 def extract_page_metadata(page_dict: Dict, page_obj: Dict = None) -> Dict:
     """
     Extract useful metadata from a page_dict and page_obj for debugging and normalization.
-    
-    Args:
-        page_dict: The OCR data dict with 'text', 'left', 'top', etc.
-        page_obj: The full page object which may contain 'image_meta' with dimensions
-    
-    Returns:
-        Dict with page dimensions and other metadata
     """
     metadata = {}
     
@@ -491,7 +422,6 @@ def load_raw_ocr_pages(input_path: str) -> List[Tuple[int, Dict, Dict]]:
             try:
                 with open(input_path, 'r', encoding='utf-8') as f:
                     file_content = f.read()
-                    # repair_json returns a string of corrected JSON, so we parse it again
                     repaired_content = repair_json(file_content)
                     data = json.loads(repaired_content)
                 print(f"  - [Success] File repaired successfully.")
@@ -592,6 +522,17 @@ def run_section_processing_on_file(
         
         lines = reconstruct_lines_with_bbox(page_dict)
         
+        # --- NEW: Calculate Page-Level Font Stats ---
+        # We calculate the median line height for this specific page.
+        # Headers are usually > 1.1x the median height.
+        line_heights = []
+        for line in lines:
+            if line.get('bbox') and line['bbox'].get('height', 0) > 0:
+                line_heights.append(line['bbox']['height'])
+        
+        median_height = statistics.median(line_heights) if line_heights else 10.0
+        # --------------------------------------------
+        
         for line_data in lines:
             line_text = line_data['text'].strip()
             if not line_text:
@@ -614,40 +555,55 @@ def run_section_processing_on_file(
             # ---------------------
 
             is_header, section_num, topic, remainder, context = check_if_paragraph_is_header(line_text)
+            
+            # --- NEW: Calculate Visual Features ---
+            current_height = line_bbox['height'] if line_bbox and 'height' in line_bbox else median_height
+            relative_height = current_height / median_height if median_height > 0 else 1.0
+            # --------------------------------------
+
+            element_base = {
+                "page_number": page_id,
+                "bbox": line_bbox,
+                "ml_features": {
+                    "relative_height": relative_height,
+                    "is_bold": context.get('is_bold', False) if context else False, # Placeholder
+                    "line_length_chars": len(line_text),
+                }
+            }
 
             if is_header:
-                raw_elements.append({
-                    "type": "section",
-                    "section_number": section_num,
-                    "topic": topic,
-                    "content": "",
-                    "page_number": page_id,
-                    "bbox": line_bbox,
-                    # Store context for ML features
-                    "detection_context": {
-                        "raw_section_number": context.get('raw_section_number'),
-                        "had_leading_whitespace": context.get('had_leading_whitespace', False),
-                        "leading_whitespace_len": context.get('leading_whitespace_len', 0),
-                        "had_text_before_number": context.get('had_text_before_number', False),
-                        "text_before_number": context.get('text_before_number', ''),
-                        "original_line_length": context.get('line_length', 0),
-                    }
-                })
+                element_base["type"] = "section"
+                element_base["section_number"] = section_num
+                element_base["topic"] = topic
+                element_base["content"] = ""
+                # Store context for ML features
+                element_base["detection_context"] = {
+                    "raw_section_number": context.get('raw_section_number'),
+                    "had_leading_whitespace": context.get('had_leading_whitespace', False),
+                    "leading_whitespace_len": context.get('leading_whitespace_len', 0),
+                    "had_text_before_number": context.get('had_text_before_number', False),
+                    "text_before_number": context.get('text_before_number', ''),
+                    "original_line_length": context.get('line_length', 0),
+                }
+                raw_elements.append(element_base)
                 
                 if remainder:
-                    raw_elements.append({
+                    # The remainder is body text, so likely median height (rel height = 1.0)
+                    remainder_element = {
                         "type": "unassigned_text_block",
                         "content": remainder,
                         "page_number": page_id,
-                        "bbox": line_bbox
-                    })
+                        "bbox": line_bbox,
+                        "ml_features": {
+                            "relative_height": 1.0,
+                            "line_length_chars": len(remainder)
+                        }
+                    }
+                    raw_elements.append(remainder_element)
             else:
-                raw_elements.append({
-                    "type": "unassigned_text_block",
-                    "content": line_text,
-                    "page_number": page_id,
-                    "bbox": line_bbox
-                })
+                element_base["type"] = "unassigned_text_block"
+                element_base["content"] = line_text
+                raw_elements.append(element_base)
     
     final_elements = group_elements_with_bbox(raw_elements)
 

@@ -41,6 +41,7 @@ SELECTED_FEATURES = [
     'bbox_left_pct',
     'looks_like_date',
     'is_simple_number',
+    'relative_height',
 ]
 
 
@@ -98,12 +99,21 @@ def train_and_predict(
     X_train, X_test, y_train, y_test = train_test_split(
         X_labeled, y_labeled, test_size=0.2, random_state=42, stratify=y_labeled
     )
+
+    scale_weight = (neg_count / pos_count) * 1.5 if pos_count > 0 else 1
     
     model = XGBClassifier(
-        n_estimators=100, max_depth=4, learning_rate=0.1,
-        subsample=0.8, colsample_bytree=0.8, random_state=42,
-        eval_metric='logloss',
-        scale_pos_weight=neg_count / pos_count if pos_count > 0 else 1
+        n_estimators=150, 
+        max_depth=3,                 # Reduced from 4 -> 3 to prevent overfitting
+        learning_rate=0.05,          # Slower learning for better generalization
+        min_child_weight=3,          # Conservative: needs 3+ samples to make a rule
+        gamma=0.1,                   # Pruning parameter
+        subsample=0.8, 
+        colsample_bytree=0.8, 
+        random_state=42,
+        reg_alpha=0.1,               # L1 Regularization (noise removal)
+        reg_lambda=1.0,              # L2 Regularization
+        scale_pos_weight=scale_weight
     )
     model.fit(X_train, y_train)
     

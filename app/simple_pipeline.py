@@ -145,16 +145,29 @@ def reclassify_elements(elements: List[Dict], sections_to_keep: Set[Tuple[str, i
                 result.append(elem)
                 kept_as_section += 1
             else:
-                # Convert to unassigned_text_block, preserving content
+                # Convert to unassigned_text_block, preserving content.
+                # We must reconstruct the header text (Number + Topic) and prepend it,
+                # otherwise the text that triggered the section detection is lost.
+                topic = elem.get('topic', '')
+                header_text = f"{sec_num} {topic}".strip()
+                body_content = elem.get('content', '')
+                
+                if header_text and body_content:
+                    full_content = f"{header_text}\n\n{body_content}"
+                elif header_text:
+                    full_content = header_text
+                else:
+                    full_content = body_content
+
                 reclassified_elem = {
                     'type': 'unassigned_text_block',
                     'page_number': elem.get('page_number'),
-                    'content': elem.get('content', ''),
+                    'content': full_content,
                     'bbox': elem.get('bbox'),
                     # Preserve original info for debugging
                     '_original_type': 'section',
                     '_original_section_number': sec_num,
-                    '_original_topic': elem.get('topic', ''),
+                    '_original_topic': topic,
                     '_reclassified_by': 'ml_filter'
                 }
                 result.append(reclassified_elem)
