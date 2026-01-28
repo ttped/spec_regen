@@ -1,23 +1,24 @@
 """
-simple_pipeline.py - Streamlined document processing pipeline.
+simple_pipeline.py - Streamlined document processing pipeline with ML classification.
 
 Pipeline Steps:
 1. classify  - Determine where content starts (skip ToC)
 2. title     - Extract title page information  
 3. structure - Parse sections from content pages (preserving original page numbers)
-4. repair    - Validate section numbering and demote false positives (lists, tables)
+4. ml_filter - ML-based filtering of false positive sections (replaces manual repair)
 5. assets    - Integrate figures/tables at correct positions based on bbox
 6. tables    - OCR any table images into structured data (or skip with --no-table-ocr)
 7. write     - Generate final DOCX
 8. validate  - Compare extracted sections against TOC (optional, runs with --validate)
 
 Usage:
-    python simple_pipeline.py --step all
-    python simple_pipeline.py --step classify
-    python simple_pipeline.py --step structure --header-threshold 600
-    python simple_pipeline.py --step repair --repair-confidence 0.7
-    python simple_pipeline.py --step all --no-table-ocr  # Skip LLM table OCR, use images
-    python simple_pipeline.py --step all --validate      # Run validation at end
+    python simple_pipeline.py --step all --ml-model section_model.joblib
+    python simple_pipeline.py --step all --ml-model section_model.joblib --ml-threshold 0.6
+    python simple_pipeline.py --step ml_filter --ml-model section_model.joblib
+    python simple_pipeline.py --step all --no-table-ocr --validate
+    
+Training a model:
+    python section_classifier.py train -f training_features.csv -o section_model.joblib
 """
 
 import os
@@ -30,7 +31,6 @@ from typing import List, Optional
 try:
     from classify_agent import run_classification_on_file, load_content_start_page, load_classification_result
     from title_agent import extract_title_page_info
-    from section_repair_agent import run_section_repair
     from asset_processor import run_asset_integration
     from table_processor_agent import run_table_processing_on_file
     from docx_writer import run_docx_creation
@@ -39,6 +39,15 @@ except ImportError as e:
     print(f"Import Error: {e}")
     print("Make sure all agent modules are in the same directory or Python path.")
     exit(1)
+
+# ML classifier - optional but recommended
+try:
+    from section_classifier import run_ml_filtering_on_file, load_model
+    ML_AVAILABLE = True
+except ImportError:
+    ML_AVAILABLE = False
+    print("[Warning] section_classifier.py not found. ML filtering will be unavailable.")
+    print("  To enable: ensure section_classifier.py is in the same directory.")
 
 # Validation is optional - don't fail if not present
 try:
@@ -128,12 +137,32 @@ def extract_title_from_first_page(raw_input_path: str, output_path: str, llm_con
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Simple document processing pipeline")
+    parser = argparse.ArgumentParser(
+        description="Document processing pipeline with ML-based section classification",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    # Full pipeline with ML filtering
+    python simple_pipeline.py --step all --ml-model section_model.joblib
+    
+    # Adjust ML threshold (lower = keep more sections)
+    python simple_pipeline.py --step all --ml-model section_model.joblib --ml-threshold 0.3
+    
+    # Run without ML (sections will not be filtered)
+    python simple_pipeline.py --step all
+    
+    # Just run ML filtering step
+    python simple_pipeline.py --step ml_filter --ml-model section_model.joblib
+    
+    # Full pipeline with validation
+    python simple_pipeline.py --step all --ml-model section_model.joblib --validate
+        """
+    )
     parser.add_argument(
         "--step", 
         type=str, 
         default="all", 
-        choices=["classify", "title", "structure", "repair", "assets", "tables", "write", "validate", "all"],
+        choices=["classify", "title", "structure", "ml_filter", "assets", "tables", "write", "validate", "all"],
         help="Pipeline step to execute"
     )
     parser.add_argument(
@@ -179,16 +208,18 @@ def main():
         default=6100,
         help="Vertical (top) coordinate threshold for footer filtering. Text below this value (greater than) is dropped. Set to 0 to disable."
     )
+    # ML classifier arguments
     parser.add_argument(
-        "--repair-confidence",
-        type=float,
-        default=0.7,
-        help="Confidence threshold for section repair. Only violations with confidence >= this value are fixed. (default: 0.7)"
+        "--ml-model",
+        type=str,
+        default=None,
+        help="Path to trained ML model (.joblib) for section filtering. If not provided, no filtering is applied."
     )
     parser.add_argument(
-        "--skip-repair",
-        action="store_true",
-        help="Skip the section repair step (useful for debugging)"
+        "--ml-threshold",
+        type=float,
+        default=0.5,
+        help="Classification threshold for ML filtering (default: 0.5). Lower values keep more sections, higher values are more aggressive at removing false positives."
     )
     parser.add_argument(
         "--no-table-ocr",
@@ -205,6 +236,22 @@ def main():
     args = parser.parse_args()
     os.makedirs(args.results_dir, exist_ok=True)
 
+    # Check ML model availability
+    if args.ml_model:
+        if not ML_AVAILABLE:
+            print("[Error] ML model specified but section_classifier.py not available.")
+            print("  Make sure section_classifier.py is in the same directory.")
+            exit(1)
+        if not os.path.exists(args.ml_model):
+            print(f"[Error] ML model not found: {args.ml_model}")
+            print("  Train a model first with: python section_classifier.py train -f features.csv -o model.joblib")
+            exit(1)
+        print(f"ML Model: {args.ml_model}")
+        print(f"ML Threshold: {args.ml_threshold}")
+    else:
+        print("[Note] No ML model specified. Sections will not be filtered.")
+        print("  To enable ML filtering: --ml-model section_model.joblib")
+
     llm_config = {
         "provider": "mission_assist",
         "model_name": "gemma3", 
@@ -212,7 +259,7 @@ def main():
         "api_key": "aTOIT9hJM3DBYMQbEY"
     }
 
-    print(f"Looking for documents in: {args.raw_ocr_dir}")
+    print(f"\nLooking for documents in: {args.raw_ocr_dir}")
     doc_stems = get_document_stems(args.raw_ocr_dir)
     print(f"Found {len(doc_stems)} document(s).\n")
 
@@ -229,7 +276,7 @@ def main():
         classify_out = os.path.join(args.results_dir, f"{stem}_classification.json")
         title_out = os.path.join(args.results_dir, f"{stem}_title.json")
         organized_out = os.path.join(args.results_dir, f"{stem}_organized.json")
-        repaired_out = os.path.join(args.results_dir, f"{stem}_repaired.json")
+        ml_filtered_out = os.path.join(args.results_dir, f"{stem}_ml_filtered.json")
         with_assets_out = os.path.join(args.results_dir, f"{stem}_with_assets.json")
         tables_out = os.path.join(args.results_dir, f"{stem}_with_tables.json")
         final_docx = os.path.join(args.results_dir, f"{stem}.docx")
@@ -281,38 +328,47 @@ def main():
                 footer_top_threshold=args.footer_threshold
             )
 
-        # ========== STEP 4: REPAIR ==========
-        if args.step in ["repair", "all"] and not args.skip_repair:
-            print("\n[Step 4: Section Repair]")
-            if os.path.exists(organized_out):
-                run_section_repair(
-                    organized_out,
-                    repaired_out,
-                    confidence_threshold=args.repair_confidence,
-                    classification_path=classify_out,
-                    raw_ocr_path=raw_input
-                )
+        # ========== STEP 4: ML FILTER ==========
+        if args.step in ["ml_filter", "all"]:
+            print("\n[Step 4: ML Section Filtering]")
+            
+            if not args.ml_model:
+                print("  - No ML model specified, skipping filtering.")
+                print("  - To enable: --ml-model section_model.joblib")
+                # Copy organized to ml_filtered so downstream steps work
+                if os.path.exists(organized_out):
+                    import shutil
+                    shutil.copy(organized_out, ml_filtered_out)
+                    print(f"  - Copied organized -> ml_filtered (no filtering applied)")
+            elif not ML_AVAILABLE:
+                print("  - [Error] ML classifier not available")
+                if os.path.exists(organized_out):
+                    import shutil
+                    shutil.copy(organized_out, ml_filtered_out)
             else:
-                print(f"  [Skipping] Missing organized file: {organized_out}")
-        elif args.skip_repair and args.step == "all":
-            print("\n[Step 4: Section Repair] SKIPPED (--skip-repair flag)")
-            # Copy organized to repaired so downstream steps work
-            if os.path.exists(organized_out):
-                import shutil
-                shutil.copy(organized_out, repaired_out)
-                print(f"  - Copied {organized_out} to {repaired_out}")
+                if os.path.exists(organized_out):
+                    run_ml_filtering_on_file(
+                        organized_out,
+                        ml_filtered_out,
+                        args.ml_model,
+                        threshold=args.ml_threshold,
+                        verbose=True
+                    )
+                else:
+                    print(f"  - [Skipping] Missing organized file: {organized_out}")
 
         # ========== STEP 5: ASSETS ==========
         if args.step in ["assets", "all"]:
             print("\n[Step 5: Asset Integration (Figures/Tables)]")
-            # Prefer repaired file, fall back to organized
-            if os.path.exists(repaired_out):
-                input_for_assets = repaired_out
+            
+            # Prefer ML filtered file, fall back to organized
+            if os.path.exists(ml_filtered_out):
+                input_for_assets = ml_filtered_out
             elif os.path.exists(organized_out):
                 input_for_assets = organized_out
-                print("  [Note] Using organized file (no repair step)")
+                print("  - [Note] Using organized file (no ML filtering)")
             else:
-                print(f"  [Skipping] Missing input file")
+                print(f"  - [Skipping] Missing input file")
                 input_for_assets = None
             
             if input_for_assets:
@@ -334,14 +390,14 @@ def main():
             # Prefer file with assets, fall back through the chain
             if os.path.exists(with_assets_out):
                 input_for_tables = with_assets_out
-            elif os.path.exists(repaired_out):
-                input_for_tables = repaired_out
-                print("  [Note] Using repaired file (no asset integration)")
+            elif os.path.exists(ml_filtered_out):
+                input_for_tables = ml_filtered_out
+                print("  - [Note] Using ML filtered file (no asset integration)")
             elif os.path.exists(organized_out):
                 input_for_tables = organized_out
-                print("  [Note] Using organized file (no repair or asset integration)")
+                print("  - [Note] Using organized file (no ML filtering or asset integration)")
             else:
-                print(f"  [Skipping] No input file available")
+                print(f"  - [Skipping] No input file available")
                 input_for_tables = None
             
             if input_for_tables:
@@ -351,7 +407,7 @@ def main():
                     args.figures_dir, 
                     stem, 
                     llm_config,
-                    use_llm_ocr=not args.no_table_ocr  # Pass the flag
+                    use_llm_ocr=not args.no_table_ocr
                 )
 
         # ========== STEP 7: WRITE DOCX ==========
@@ -363,15 +419,15 @@ def main():
                 input_for_docx = tables_out
             elif os.path.exists(with_assets_out):
                 input_for_docx = with_assets_out
-                print("  [Note] Using file with assets (no table OCR)")
-            elif os.path.exists(repaired_out):
-                input_for_docx = repaired_out
-                print("  [Note] Using repaired file (no assets or table OCR)")
+                print("  - [Note] Using file with assets (no table OCR)")
+            elif os.path.exists(ml_filtered_out):
+                input_for_docx = ml_filtered_out
+                print("  - [Note] Using ML filtered file (no assets or table OCR)")
             elif os.path.exists(organized_out):
                 input_for_docx = organized_out
-                print("  [Note] Using organized file (no repair, assets, or table OCR)")
+                print("  - [Note] Using organized file (no ML filtering, assets, or table OCR)")
             else:
-                print("  [Error] No input file for DOCX creation")
+                print("  - [Error] No input file for DOCX creation")
                 continue
             
             run_docx_creation(
@@ -387,7 +443,7 @@ def main():
             print("\n[Step 8: Validation]")
             
             if not VALIDATION_AVAILABLE:
-                print("  [Warning] validation_agent.py not found. Skipping validation.")
+                print("  - [Warning] validation_agent.py not found. Skipping validation.")
             else:
                 result = run_validation_on_file(stem, args.raw_ocr_dir, args.results_dir)
                 if result:
@@ -451,6 +507,8 @@ def main():
                 'documents_without_toc': len(docs_without_toc),
                 'average_toc_coverage': round(avg_coverage, 2) if docs_with_toc else None,
                 'average_precision': round(avg_precision, 2) if docs_with_toc else None,
+                'ml_model_used': args.ml_model,
+                'ml_threshold': args.ml_threshold if args.ml_model else None,
                 'documents': validation_results
             }, f, indent=2)
         print(f"\nValidation summary saved to: {summary_path}")
