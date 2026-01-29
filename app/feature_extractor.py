@@ -15,6 +15,12 @@ UPDATES (v2):
 - Added newlines_before_section_num: Count of newlines preceding the section number
 - Removed is_sandwiched and sandwich_same_neighbors (negative correlation)
 - Added manual labeling helper features (see MANUAL LABELING FEATURES section)
+
+UPDATES (v3):
+- Added SpaCy linguistic features for title vs sentence detection
+- Added enhanced blank/empty title features
+- Added relative position within page features (for late-page junk detection)
+- Added height-based features to detect text that spans multiple lines
 """
 
 import os
@@ -27,6 +33,13 @@ from collections import Counter
 from typing import List, Dict, Tuple, Optional, Set, Any
 from dataclasses import dataclass, field
 from collections import defaultdict
+
+# =============================================================================
+# SPACY INITIALIZATION (required for linguistic features)
+# =============================================================================
+
+import spacy
+_nlp = spacy.load("en_core_web_sm")
 
 # =============================================================================
 # DEFAULT PATHS (same as simple_pipeline.py)
@@ -755,6 +768,188 @@ def extract_features_for_section(
     features['title_has_multiple_sentences'] = 1 if sentence_breaks > 0 else 0
     
     # =========================================================================
+    # LINGUISTIC FEATURES (SpaCy) - Title vs Sentence Detection
+    # =========================================================================
+    # These features help distinguish real section titles from sentences/phrases
+    # that happened to start with a number-like pattern.
+    #
+    # Key insight: Section titles are typically noun phrases ("Scope", "System Overview")
+    # while false positives are often sentences ("This system shall...", "Send data...")
+    
+    if title.strip():
+        doc = _nlp(title.strip()[:200])  # Limit length for efficiency
+        
+        # 1. ROOT POS: Titles are usually NOUN/PROPN. Sentences have VERB/AUX roots.
+        # "Scope" -> Root is NOUN (Good)
+        # "This system shall..." -> Root is VERB (Bad)
+        root_tokens = [token for token in doc if token.dep_ == "ROOT"]
+        root_pos = root_tokens[0].pos_ if root_tokens else "NOUN"
+        
+        features['lang_root_is_verb'] = 1 if root_pos in ["VERB", "AUX"] else 0
+        features['lang_root_is_noun'] = 1 if root_pos in ["NOUN", "PROPN"] else 0
+        
+        # 2. FINITE VERBS: Titles rarely have conjugated verbs.
+        # "shall be", "must verify", "is connected" -> likely a sentence
+        has_finite_verb = any(
+            t.pos_ in ["VERB", "AUX"] and t.tag_ in ["VB", "VBD", "VBP", "VBZ", "MD"]
+            for t in doc
+        )
+        features['lang_has_finite_verb'] = 1 if has_finite_verb else 0
+        
+        # Also check for any verb (including infinitives)
+        features['lang_has_verb'] = 1 if any(t.pos_ in ["VERB", "AUX"] for t in doc) else 0
+        
+        # 3. STARTS WITH DETERMINER: "The", "A", "This"
+        # Titles CAN start with "The" but it's a mild negative signal
+        features['lang_starts_det'] = 1 if doc[0].pos_ == "DET" else 0
+        
+        # 4. IMPERATIVE CHECK: "Send serial data..." (Starts with verb base form)
+        # If first word is VERB and has no subject, it's likely an instruction
+        first_token = doc[0]
+        is_imperative = (
+            first_token.pos_ == "VERB" and 
+            first_token.tag_ == "VB" and
+            not any(t.dep_ == "nsubj" for t in doc)
+        )
+        features['lang_starts_imperative'] = 1 if is_imperative else 0
+        
+        # 5. SUBJECT-VERB STRUCTURE: Full sentences have subjects
+        has_subject = any(t.dep_ in ["nsubj", "nsubjpass"] for t in doc)
+        features['lang_has_subject'] = 1 if has_subject else 0
+        
+        # 6. SENTENCE COMPLETENESS: Does it look like a complete sentence?
+        # (Has subject AND verb AND potentially object)
+        features['lang_is_complete_sentence'] = 1 if (has_subject and has_finite_verb) else 0
+        
+        # 7. MODAL VERBS: "shall", "must", "should" indicate requirements, not titles
+        has_modal = any(t.tag_ == "MD" for t in doc)
+        features['lang_has_modal'] = 1 if has_modal else 0
+        
+        # 8. Word count from spaCy (excludes punctuation)
+        word_tokens = [t for t in doc if not t.is_punct and not t.is_space]
+        features['lang_word_count'] = len(word_tokens)
+    else:
+        # Empty title - set all linguistic features to 0
+        features['lang_root_is_verb'] = 0
+        features['lang_root_is_noun'] = 0
+        features['lang_has_finite_verb'] = 0
+        features['lang_has_verb'] = 0
+        features['lang_starts_det'] = 0
+        features['lang_starts_imperative'] = 0
+        features['lang_has_subject'] = 0
+        features['lang_is_complete_sentence'] = 0
+        features['lang_has_modal'] = 0
+        features['lang_word_count'] = 0
+    
+    # =========================================================================
+    # ENHANCED BLANK/EMPTY TITLE FEATURES
+    # =========================================================================
+    # Sections with blank titles are almost always false positives
+    # These features help the model strongly penalize blank titles
+    
+    title_stripped = title.strip()
+    
+    # Various "empty" conditions
+    features['title_is_whitespace_only'] = 1 if title and not title_stripped else 0
+    features['title_is_truly_empty'] = 1 if not title else 0
+    features['title_is_blank'] = 1 if not title_stripped else 0  # Combined: empty or whitespace
+    
+    # Very short titles (1-2 chars) are suspicious
+    features['title_is_very_short'] = 1 if 0 < len(title_stripped) <= 2 else 0
+    
+    # Title is just punctuation or symbols
+    features['title_is_punctuation_only'] = 1 if title_stripped and all(c in string.punctuation for c in title_stripped) else 0
+    
+    # Title is just numbers (might be a misidentified number)
+    features['title_is_numeric_only'] = 1 if title_stripped and title_stripped.replace('.', '').replace('-', '').isdigit() else 0
+    
+    # Combined "useless title" flag
+    features['title_is_useless'] = 1 if (
+        features['title_is_blank'] or 
+        features['title_is_very_short'] or 
+        features['title_is_punctuation_only'] or
+        features['title_is_numeric_only']
+    ) else 0
+    
+    # =========================================================================
+    # RELATIVE HEIGHT FEATURES (Multi-line text detection)
+    # =========================================================================
+    # True section headers are typically single-line
+    # False positives that capture paragraphs span multiple lines
+    # This uses bbox height relative to typical line height
+    
+    bbox = section.get('bbox', {})
+    if bbox and doc_stats.section_heights:
+        section_height = bbox.get('height', 0)
+        median_height = statistics.median(doc_stats.section_heights)
+        
+        if median_height > 0:
+            features['relative_height'] = section_height / median_height
+            features['height_is_multiline'] = 1 if section_height > median_height * 1.8 else 0
+            features['height_is_very_tall'] = 1 if section_height > median_height * 3 else 0
+        else:
+            features['relative_height'] = 1.0
+            features['height_is_multiline'] = 0
+            features['height_is_very_tall'] = 0
+    else:
+        features['relative_height'] = 1.0
+        features['height_is_multiline'] = 0
+        features['height_is_very_tall'] = 0
+    
+    # =========================================================================
+    # POSITION WITHIN PAGE FEATURES (Late-page junk detection)
+    # =========================================================================
+    # Observation: After section 6-ish, there tends to be more junk numbers
+    # (page numbers, table data, reference numbers, etc.)
+    # 
+    # Simple approach: track vertical position within the page
+    # Sections in the bottom half of a page are more likely to be false positives
+    # (especially if they don't fit the sequence pattern)
+    
+    if bbox and doc_stats.page_height > 0:
+        y_pos = bbox.get('top', 0)
+        
+        # Vertical position as percentage of page (0 = top, 1 = bottom)
+        features['page_position_y_pct'] = y_pos / doc_stats.page_height
+        
+        # Is this in the bottom third of the page?
+        features['is_in_bottom_third'] = 1 if features['page_position_y_pct'] > 0.67 else 0
+        
+        # Is this in the bottom quarter?
+        features['is_in_bottom_quarter'] = 1 if features['page_position_y_pct'] > 0.75 else 0
+        
+        # Combined risk: late in page AND doesn't fit sequence
+        late_page = features['page_position_y_pct'] > 0.67
+        bad_sequence = features.get('is_logical_next', 1) == 0 and features.get('next_is_logical_successor', 1) == 0
+        features['late_page_bad_sequence'] = 1 if (late_page and bad_sequence) else 0
+        
+        # Late page with blank/useless title = very suspicious
+        features['late_page_useless_title'] = 1 if (late_page and features.get('title_is_useless', 0)) else 0
+    else:
+        features['page_position_y_pct'] = 0.5  # Default to middle
+        features['is_in_bottom_third'] = 0
+        features['is_in_bottom_quarter'] = 0
+        features['late_page_bad_sequence'] = 0
+        features['late_page_useless_title'] = 0
+    
+    # =========================================================================
+    # SECTION NUMBER MAGNITUDE FEATURES
+    # =========================================================================
+    # Major sections > 6 are less common and numbers after that are more likely
+    # to be false positives (page numbers, figure numbers, etc.)
+    # 
+    # NOTE: This is a soft signal, not a hard rule. Some docs have 10+ major sections.
+    
+    if major is not None:
+        features['major_section_gt_6'] = 1 if major > 6 else 0
+        features['major_section_gt_10'] = 1 if major > 10 else 0
+        features['major_section_gt_20'] = 1 if major > 20 else 0  # Almost certainly wrong
+    else:
+        features['major_section_gt_6'] = 0
+        features['major_section_gt_10'] = 0
+        features['major_section_gt_20'] = 0
+    
+    # =========================================================================
     # CONTENT FEATURES (if available)
     # =========================================================================
     content = section.get('content', '') or ''
@@ -1107,10 +1302,14 @@ def _compute_combined_confidence(features: Dict) -> float:
     """
     Compute a combined confidence score from multiple positive indicators.
     This serves as a "manual labeling helper" feature.
+    
+    Updated v3: Added linguistic features, blank title penalties, and late-page penalties.
     """
     score = 0.0
     
-    # Positive indicators
+    # =======================================================================
+    # POSITIVE INDICATORS
+    # =======================================================================
     if features.get('is_logical_next'):
         score += 0.15
     if features.get('next_is_logical_successor'):
@@ -1128,7 +1327,13 @@ def _compute_combined_confidence(features: Dict) -> float:
     if not features.get('had_text_before_number'):
         score += 0.1
     
-    # Negative indicators
+    # Linguistic positive: root is noun (title-like)
+    if features.get('lang_root_is_noun'):
+        score += 0.05
+    
+    # =======================================================================
+    # NEGATIVE INDICATORS
+    # =======================================================================
     if features.get('looks_like_date'):
         score -= 0.3
     if features.get('title_absurdly_long'):
@@ -1139,6 +1344,42 @@ def _compute_combined_confidence(features: Dict) -> float:
         score -= 0.1
     if features.get('has_small_vertical_gap'):
         score -= 0.05
+    
+    # --- BLANK TITLE PENALTIES (new in v3) ---
+    if features.get('title_is_blank'):
+        score -= 0.3  # Strong penalty for blank titles
+    if features.get('title_is_useless'):
+        score -= 0.2  # Penalty for useless titles (punctuation only, etc.)
+    
+    # --- LINGUISTIC PENALTIES (new in v3) ---
+    if features.get('lang_root_is_verb'):
+        score -= 0.1  # Likely a sentence, not a title
+    if features.get('lang_has_finite_verb'):
+        score -= 0.1  # Has conjugated verb
+    if features.get('lang_is_complete_sentence'):
+        score -= 0.15  # Definitely looks like a sentence
+    if features.get('lang_has_modal'):
+        score -= 0.1  # "shall", "must" = requirement text, not title
+    if features.get('lang_starts_imperative'):
+        score -= 0.1  # Instruction, not title
+    
+    # --- LATE PAGE PENALTIES (new in v3) ---
+    if features.get('late_page_bad_sequence'):
+        score -= 0.15  # Late in page AND doesn't fit sequence
+    if features.get('late_page_useless_title'):
+        score -= 0.2  # Late in page with blank/useless title
+    
+    # --- HEIGHT PENALTIES (new in v3) ---
+    if features.get('height_is_multiline'):
+        score -= 0.1  # Spans multiple lines = probably not a header
+    if features.get('height_is_very_tall'):
+        score -= 0.15  # Very tall = definitely not a single-line header
+    
+    # --- MAJOR SECTION PENALTIES (new in v3) ---
+    if features.get('major_section_gt_20'):
+        score -= 0.2  # Major section > 20 is almost certainly wrong
+    elif features.get('major_section_gt_10'):
+        score -= 0.1  # Major section > 10 is suspicious
     
     return max(0, min(1, score))
 

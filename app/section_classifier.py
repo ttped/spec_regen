@@ -1,5 +1,7 @@
 """
 section_classifier.py - ML-based section classification using XGBoost.
+
+Updated v3: Added linguistic features, enhanced blank title features, and position features.
 """
 
 import pandas as pd
@@ -11,10 +13,18 @@ from typing import List, Dict, Tuple, Set, Any
 from dataclasses import dataclass
 
 # =============================================================================
-# CURATED FEATURE LIST
+# CURATED FEATURE LIST (v3)
 # =============================================================================
+# These features are selected based on correlation analysis and domain knowledge.
+# New in v3:
+#   - Linguistic features (lang_*): SpaCy-based title vs sentence detection
+#   - Enhanced blank title features (title_is_blank, title_is_useless)
+#   - Position features (is_in_bottom_third, late_page_*)
+#   - Height features (relative_height, height_is_multiline)
+#   - Major section magnitude features (major_section_gt_*)
 
 SELECTED_FEATURES = [
+    # === EXISTING HIGH-VALUE FEATURES ===
     'combined_confidence',
     'parent_exists',
     'extended_sequence_score',
@@ -41,6 +51,45 @@ SELECTED_FEATURES = [
     'looks_like_date',
     'is_simple_number',
     'relative_height',
+    
+    # === NEW: LINGUISTIC FEATURES (SpaCy) ===
+    # These help distinguish section titles from sentences
+    'lang_root_is_verb',        # Root word is verb -> likely sentence, not title
+    'lang_root_is_noun',        # Root word is noun -> likely title
+    'lang_has_finite_verb',     # Has conjugated verb -> likely sentence
+    'lang_has_verb',            # Has any verb
+    'lang_starts_det',          # Starts with determiner (the, a, this)
+    'lang_starts_imperative',   # Starts with imperative verb (command)
+    'lang_has_subject',         # Has grammatical subject -> sentence structure
+    'lang_is_complete_sentence', # Has subject + verb -> definitely sentence
+    'lang_has_modal',           # Has modal verb (shall, must) -> requirement text
+    
+    # === NEW: ENHANCED BLANK TITLE FEATURES ===
+    # Strong signals that a section is invalid
+    'title_is_blank',           # Empty or whitespace only
+    'title_is_useless',         # Blank, very short, or punctuation only
+    'title_is_very_short',      # 1-2 characters only
+    'title_is_punctuation_only', # Only punctuation/symbols
+    'title_is_numeric_only',    # Title is just numbers
+    
+    # === NEW: POSITION WITHIN PAGE FEATURES ===
+    # Late-page numbers are often junk (page numbers, table data, etc.)
+    'page_position_y_pct',      # Vertical position (0=top, 1=bottom)
+    'is_in_bottom_third',       # In bottom 33% of page
+    'is_in_bottom_quarter',     # In bottom 25% of page
+    'late_page_bad_sequence',   # Late page AND doesn't fit sequence
+    'late_page_useless_title',  # Late page with blank/useless title
+    
+    # === NEW: HEIGHT FEATURES ===
+    # Multi-line text blocks are not section headers
+    'height_is_multiline',      # Bbox height > 1.8x median
+    'height_is_very_tall',      # Bbox height > 3x median
+    
+    # === NEW: MAJOR SECTION MAGNITUDE ===
+    # High major section numbers are suspicious
+    'major_section_gt_6',       # Major section > 6 (soft signal)
+    'major_section_gt_10',      # Major section > 10 (stronger signal)
+    'major_section_gt_20',      # Major section > 20 (almost certainly wrong)
 ]
 
 def train_and_predict(
