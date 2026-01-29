@@ -70,11 +70,19 @@ def train_and_predict(
     # Get labeled data
     labeled_df = df[df['_label'].notna()].copy()
     labeled_df['_label'] = pd.to_numeric(labeled_df['_label'], errors='coerce')
+    
+    # Convert -1 labels to 0: these are valid numbers that appear inside tables,
+    # so they should be treated as false positives (not real sections)
+    table_section_count = (labeled_df['_label'] == -1).sum()
+    labeled_df.loc[labeled_df['_label'] == -1, '_label'] = 0
+    
     labeled_df = labeled_df[labeled_df['_label'].isin([0, 1])]
     
     pos_count = (labeled_df['_label'] == 1).sum()
     neg_count = (labeled_df['_label'] == 0).sum()
     print(f"  Labeled: {len(labeled_df)} ({pos_count} valid, {neg_count} false positive)")
+    if table_section_count > 0:
+        print(f"  (Converted {table_section_count} table sections [-1] to false positives [0])")
     
     if len(labeled_df) < 20:
         raise ValueError(f"Need >= 20 labeled rows, have {len(labeled_df)}")

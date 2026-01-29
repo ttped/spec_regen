@@ -69,7 +69,9 @@ class ParsedSection:
         
         while '..' in normalized:
             normalized = normalized.replace('..', '.')
-        normalized = normalized.rstrip('.')
+        
+        # Strip leading and trailing dots (handles cases like ".3.0" -> "3.0")
+        normalized = normalized.strip('.')
         
         if not normalized:
             return "", []
@@ -1395,10 +1397,13 @@ def process_directory(
                 if len(labeled_df) > 0:
                     print(f"  Found {len(labeled_df)} existing labels to preserve")
                     
-                    # Create composite key for matching
-                    primary_key_cols = ['_doc_name', '_index', '_section_number_raw', '_page']
+                    # Create composite key for matching using CONTENT-BASED keys only
+                    # NOTE: We intentionally exclude '_index' because it shifts when sections
+                    # are added/removed, causing labels to be applied to wrong rows.
+                    # Using content-based keys ensures labels survive re-runs of the pipeline.
+                    primary_key_cols = ['_doc_name', '_section_number_raw', '_page', '_title']
                     
-                    # Check which key columns exist in both
+                    # Check which key columns exist in both dataframes
                     old_key_cols = []
                     for col in primary_key_cols:
                         if col in existing_df.columns:
@@ -1407,19 +1412,32 @@ def process_directory(
                             # Handle old column name
                             old_key_cols.append('_section_number')
                     
-                    if len(old_key_cols) >= 3:  # Need at least 3 key columns to match
+                    new_key_cols = [c for c in primary_key_cols if c in df.columns]
+                    
+                    if len(old_key_cols) >= 3 and len(new_key_cols) >= 3:
                         # Create composite key for existing labels
                         labeled_df = labeled_df.copy()
-                        labeled_df['_merge_key'] = labeled_df[old_key_cols].astype(str).agg('|'.join, axis=1)
-                        label_map = dict(zip(labeled_df['_merge_key'], labeled_df['_label']))
+                        labeled_df['_merge_key'] = labeled_df[old_key_cols].fillna('').astype(str).agg('|'.join, axis=1)
+                        
+                        # For duplicates in labeled data, they should have the same label
+                        # Use first label encountered for each key (duplicates should match anyway)
+                        label_map = {}
+                        for _, row in labeled_df.iterrows():
+                            key = row['_merge_key']
+                            if key not in label_map:
+                                label_map[key] = row['_label']
                         
                         # Create composite key for new data
-                        new_key_cols = [c for c in primary_key_cols if c in df.columns]
-                        df['_merge_key'] = df[new_key_cols].astype(str).agg('|'.join, axis=1)
+                        df['_merge_key'] = df[new_key_cols].fillna('').astype(str).agg('|'.join, axis=1)
                         
-                        # Merge labels
+                        # Count labels before merge
                         labels_before = df['_label'].notna().sum() if '_label' in df.columns else 0
-                        df['_label'] = df['_merge_key'].map(label_map).fillna(df['_label'])
+                        
+                        # Apply labels - this preserves ALL rows, just adds labels where keys match
+                        df['_label'] = df['_merge_key'].map(label_map).fillna(
+                            df['_label'] if '_label' in df.columns else pd.NA
+                        )
+                        
                         labels_after = df['_label'].notna().sum()
                         
                         # Clean up merge key
@@ -1428,10 +1446,16 @@ def process_directory(
                         preserved = labels_after - labels_before
                         print(f"  Preserved {preserved} labels from existing file")
                         
-                        # Check for labels that couldn't be matched (rows removed)
-                        unmatched = len(labeled_df) - preserved
-                        if unmatched > 0:
-                            print(f"  Warning: {unmatched} labeled rows from old file no longer exist in new data")
+                        # Check for labels that couldn't be matched
+                        unique_old_keys = set(labeled_df['_merge_key'])
+                        unique_new_keys = set(df[new_key_cols].fillna('').astype(str).agg('|'.join, axis=1))
+                        unmatched_keys = unique_old_keys - unique_new_keys
+                        
+                        if unmatched_keys:
+                            print(f"  Warning: {len(unmatched_keys)} labeled rows from old file could not be matched")
+                            print(f"           (sections may have been removed or changed)")
+                    else:
+                        print(f"  Warning: Not enough key columns for matching (old: {old_key_cols}, new: {new_key_cols})")
                 else:
                     print("  No existing labels found to preserve")
             else:
