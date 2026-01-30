@@ -1,0 +1,1 @@
+https://github.com/explosion/spacy-models/releases/tag/en_core_web_sm-3.7.1
