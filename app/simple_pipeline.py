@@ -157,7 +157,7 @@ class Config:
     figures_dir = DEFAULT_FIGURES_DIR
     results_dir = DEFAULT_RESULTS_DIR
     ml_threshold = 0.5
-    no_table_ocr = False
+    no_table_ocr = True  # Disabled - too slow and not effective yet
 
 
 def main():
