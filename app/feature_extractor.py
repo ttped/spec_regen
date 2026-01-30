@@ -1813,6 +1813,401 @@ def summary_by_document(df: 'pd.DataFrame') -> 'pd.DataFrame':
 
 
 # =============================================================================
+# FEATURE SELECTION
+# =============================================================================
+
+def run_feature_selection(
+    df: 'pd.DataFrame',
+    min_samples: int = 30,
+    top_n: int = 50,
+    correlation_threshold: float = 0.05,
+    variance_threshold: float = 0.01,
+    redundancy_threshold: float = 0.90,
+) -> Dict[str, Any]:
+    """
+    Run comprehensive feature selection analysis on labeled data.
+    
+    Uses multiple techniques:
+    1. Correlation with label (point-biserial)
+    2. Mutual Information (non-linear relationships)
+    3. Feature Importance (from XGBoost)
+    4. Variance filtering (remove near-constant features)
+    5. Redundancy detection (highly correlated feature pairs)
+    
+    Args:
+        df: DataFrame with features and _label column
+        min_samples: Minimum labeled samples required
+        top_n: Number of top features to recommend
+        correlation_threshold: Min |correlation| to consider useful
+        variance_threshold: Min variance to keep feature
+        redundancy_threshold: Max correlation between features before flagging
+        
+    Returns:
+        Dict with analysis results and recommended feature list
+    """
+    import numpy as np
+    from sklearn.feature_selection import mutual_info_classif
+    from sklearn.ensemble import RandomForestClassifier
+    
+    try:
+        from xgboost import XGBClassifier
+        HAS_XGB = True
+    except ImportError:
+        HAS_XGB = False
+    
+    print("\n" + "=" * 70)
+    print("FEATURE SELECTION ANALYSIS")
+    print("=" * 70)
+    
+    # Filter to labeled data (0 or 1 only)
+    labeled = df[df['_label'].isin([0, 1])].copy()
+    labeled['_label'] = labeled['_label'].astype(int)
+    
+    if len(labeled) < min_samples:
+        print(f"ERROR: Need at least {min_samples} labeled samples, have {len(labeled)}")
+        return {}
+    
+    # Get feature columns
+    feature_cols = [c for c in df.columns if not c.startswith('_')]
+    numeric_cols = labeled[feature_cols].select_dtypes(include=['number']).columns.tolist()
+    
+    print(f"\nDataset: {len(labeled)} labeled samples ({(labeled['_label']==1).sum()} valid, {(labeled['_label']==0).sum()} invalid)")
+    print(f"Features: {len(numeric_cols)} numeric features to analyze")
+    
+    # Prepare data
+    X = labeled[numeric_cols].fillna(0).replace([np.inf, -np.inf], 0)
+    y = labeled['_label']
+    
+    results = {
+        'correlations': {},
+        'mutual_info': {},
+        'xgb_importance': {},
+        'rf_importance': {},
+        'variances': {},
+        'low_variance': [],
+        'redundant_pairs': [],
+        'recommended': [],
+    }
+    
+    # =========================================================================
+    # 1. CORRELATION ANALYSIS
+    # =========================================================================
+    print("\n--- 1. Correlation Analysis ---")
+    correlations = []
+    for col in numeric_cols:
+        if X[col].std() > 0:
+            corr = y.corr(X[col])
+            correlations.append((col, corr))
+            results['correlations'][col] = corr
+    
+    correlations.sort(key=lambda x: abs(x[1]), reverse=True)
+    
+    print(f"Top 15 by |correlation|:")
+    for col, corr in correlations[:15]:
+        direction = "+" if corr > 0 else "-"
+        print(f"  {col:<45} {corr:>7.3f} ({direction})")
+    
+    # =========================================================================
+    # 2. MUTUAL INFORMATION (captures non-linear relationships)
+    # =========================================================================
+    print("\n--- 2. Mutual Information ---")
+    try:
+        mi_scores = mutual_info_classif(X, y, random_state=42, n_neighbors=5)
+        mi_results = list(zip(numeric_cols, mi_scores))
+        mi_results.sort(key=lambda x: x[1], reverse=True)
+        
+        for col, score in mi_results:
+            results['mutual_info'][col] = score
+        
+        print(f"Top 15 by mutual information:")
+        for col, score in mi_results[:15]:
+            print(f"  {col:<45} {score:>7.4f}")
+    except Exception as e:
+        print(f"  Skipped (error: {e})")
+    
+    # =========================================================================
+    # 3. FEATURE IMPORTANCE (XGBoost)
+    # =========================================================================
+    print("\n--- 3. XGBoost Feature Importance ---")
+    if HAS_XGB:
+        try:
+            xgb = XGBClassifier(
+                n_estimators=100, max_depth=4, learning_rate=0.1,
+                random_state=42, verbosity=0
+            )
+            xgb.fit(X, y)
+            importances = xgb.feature_importances_
+            xgb_results = list(zip(numeric_cols, importances))
+            xgb_results.sort(key=lambda x: x[1], reverse=True)
+            
+            for col, imp in xgb_results:
+                results['xgb_importance'][col] = imp
+            
+            print(f"Top 15 by XGBoost importance:")
+            for col, imp in xgb_results[:15]:
+                print(f"  {col:<45} {imp:>7.4f}")
+        except Exception as e:
+            print(f"  Skipped (error: {e})")
+    else:
+        print("  Skipped (xgboost not installed)")
+    
+    # =========================================================================
+    # 4. RANDOM FOREST IMPORTANCE (different perspective)
+    # =========================================================================
+    print("\n--- 4. Random Forest Feature Importance ---")
+    try:
+        rf = RandomForestClassifier(
+            n_estimators=100, max_depth=6, random_state=42, n_jobs=-1
+        )
+        rf.fit(X, y)
+        importances = rf.feature_importances_
+        rf_results = list(zip(numeric_cols, importances))
+        rf_results.sort(key=lambda x: x[1], reverse=True)
+        
+        for col, imp in rf_results:
+            results['rf_importance'][col] = imp
+        
+        print(f"Top 15 by Random Forest importance:")
+        for col, imp in rf_results[:15]:
+            print(f"  {col:<45} {imp:>7.4f}")
+    except Exception as e:
+        print(f"  Skipped (error: {e})")
+    
+    # =========================================================================
+    # 5. VARIANCE ANALYSIS (flag near-constant features)
+    # =========================================================================
+    print("\n--- 5. Low Variance Features (candidates for removal) ---")
+    low_var_features = []
+    for col in numeric_cols:
+        var = X[col].var()
+        results['variances'][col] = var
+        if var < variance_threshold:
+            low_var_features.append((col, var))
+    
+    results['low_variance'] = [f[0] for f in low_var_features]
+    
+    if low_var_features:
+        print(f"Features with variance < {variance_threshold}:")
+        for col, var in sorted(low_var_features, key=lambda x: x[1]):
+            print(f"  {col:<45} var={var:.6f}")
+    else:
+        print(f"  No features with variance < {variance_threshold}")
+    
+    # =========================================================================
+    # 6. REDUNDANCY DETECTION (highly correlated feature pairs)
+    # =========================================================================
+    print("\n--- 6. Redundant Feature Pairs (correlation > {:.0%}) ---".format(redundancy_threshold))
+    
+    corr_matrix = X.corr()
+    redundant_pairs = []
+    seen = set()
+    
+    for i, col1 in enumerate(numeric_cols):
+        for j, col2 in enumerate(numeric_cols):
+            if i >= j:
+                continue
+            pair_corr = abs(corr_matrix.loc[col1, col2])
+            if pair_corr > redundancy_threshold:
+                if (col1, col2) not in seen and (col2, col1) not in seen:
+                    redundant_pairs.append((col1, col2, pair_corr))
+                    seen.add((col1, col2))
+    
+    redundant_pairs.sort(key=lambda x: x[2], reverse=True)
+    results['redundant_pairs'] = redundant_pairs
+    
+    if redundant_pairs:
+        print(f"Found {len(redundant_pairs)} highly correlated pairs:")
+        for col1, col2, corr in redundant_pairs[:20]:
+            print(f"  {col1:<30} <-> {col2:<30} r={corr:.3f}")
+        if len(redundant_pairs) > 20:
+            print(f"  ... and {len(redundant_pairs) - 20} more pairs")
+    else:
+        print(f"  No pairs with correlation > {redundancy_threshold}")
+    
+    # =========================================================================
+    # 7. AGGREGATE RANKING & RECOMMENDATIONS
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("FEATURE RANKING (Aggregate Score)")
+    print("=" * 70)
+    
+    # Compute aggregate score for each feature
+    # Normalize each metric to [0, 1] and combine
+    scores = {}
+    
+    for col in numeric_cols:
+        score = 0
+        count = 0
+        
+        # Correlation (use absolute value, normalize by max)
+        if results['correlations']:
+            max_corr = max(abs(v) for v in results['correlations'].values()) or 1
+            score += abs(results['correlations'].get(col, 0)) / max_corr
+            count += 1
+        
+        # Mutual Information
+        if results['mutual_info']:
+            max_mi = max(results['mutual_info'].values()) or 1
+            score += results['mutual_info'].get(col, 0) / max_mi
+            count += 1
+        
+        # XGBoost Importance
+        if results['xgb_importance']:
+            max_xgb = max(results['xgb_importance'].values()) or 1
+            score += results['xgb_importance'].get(col, 0) / max_xgb
+            count += 1
+        
+        # Random Forest Importance
+        if results['rf_importance']:
+            max_rf = max(results['rf_importance'].values()) or 1
+            score += results['rf_importance'].get(col, 0) / max_rf
+            count += 1
+        
+        # Average
+        scores[col] = score / count if count > 0 else 0
+    
+    # Sort by aggregate score
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    
+    # Build recommended list (exclude low-variance, handle redundancy)
+    recommended = []
+    included_features = set()
+    redundant_with = defaultdict(list)
+    
+    for col1, col2, _ in results['redundant_pairs']:
+        redundant_with[col1].append(col2)
+        redundant_with[col2].append(col1)
+    
+    print(f"\n{'Rank':<5} {'Feature':<45} {'Score':>7} {'Corr':>7} {'MI':>7} {'XGB':>7} {'RF':>7} {'Notes'}")
+    print("-" * 105)
+    
+    for rank, (col, agg_score) in enumerate(ranked[:60], 1):
+        corr = results['correlations'].get(col, 0)
+        mi = results['mutual_info'].get(col, 0)
+        xgb_imp = results['xgb_importance'].get(col, 0)
+        rf_imp = results['rf_importance'].get(col, 0)
+        
+        notes = []
+        skip = False
+        
+        # Check if low variance
+        if col in results['low_variance']:
+            notes.append("LOW_VAR")
+            skip = True
+        
+        # Check if redundant with already-included feature
+        for other in redundant_with.get(col, []):
+            if other in included_features:
+                notes.append(f"~{other[:15]}")
+                # Don't skip, but note it
+        
+        # Check correlation threshold
+        if abs(corr) < correlation_threshold and mi < 0.01:
+            notes.append("WEAK")
+            skip = True
+        
+        notes_str = ", ".join(notes) if notes else ""
+        marker = "  " if not skip else "X "
+        
+        print(f"{marker}{rank:<3} {col:<45} {agg_score:>7.3f} {corr:>7.3f} {mi:>7.4f} {xgb_imp:>7.4f} {rf_imp:>7.4f} {notes_str}")
+        
+        if not skip and len(recommended) < top_n:
+            recommended.append(col)
+            included_features.add(col)
+    
+    results['recommended'] = recommended
+    
+    # =========================================================================
+    # 8. OUTPUT: Copy-pasteable SELECTED_FEATURES list
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("RECOMMENDED FEATURES (copy-paste into SELECTED_FEATURES)")
+    print("=" * 70)
+    print(f"\n# Top {len(recommended)} features by aggregate ranking")
+    print("SELECTED_FEATURES = [")
+    
+    # Group by category for readability
+    categories = {
+        'combined_': 'Confidence',
+        'toc_': 'TOC',
+        'sequence_': 'Sequence',
+        'format_': 'Format',
+        'section_': 'Section Number',
+        'title_': 'Title',
+        'bbox_': 'Bounding Box',
+        'lang_': 'Linguistic',
+        'page_': 'Page Position',
+        'height_': 'Height',
+        'major_section_': 'Major Section',
+        'x_': 'X Position',
+        'parent_': 'Hierarchy',
+        'content_': 'Content',
+        'has_': 'Boolean Flags',
+        'is_': 'Boolean Flags',
+        'late_': 'Late Page',
+    }
+    
+    categorized = defaultdict(list)
+    uncategorized = []
+    
+    for feat in recommended:
+        matched = False
+        for prefix, cat in categories.items():
+            if feat.startswith(prefix):
+                categorized[cat].append(feat)
+                matched = True
+                break
+        if not matched:
+            uncategorized.append(feat)
+    
+    # Print by category
+    for cat in sorted(categorized.keys()):
+        print(f"    # {cat}")
+        for feat in categorized[cat]:
+            corr = results['correlations'].get(feat, 0)
+            direction = "positive" if corr > 0 else "negative"
+            print(f"    '{feat}',  # corr={corr:.3f} ({direction})")
+    
+    if uncategorized:
+        print(f"    # Other")
+        for feat in uncategorized:
+            corr = results['correlations'].get(feat, 0)
+            print(f"    '{feat}',  # corr={corr:.3f}")
+    
+    print("]")
+    
+    # =========================================================================
+    # 9. NEGATIVE CORRELATION FEATURES (likely to indicate FALSE positives)
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("NEGATIVE CORRELATION FEATURES (indicate FALSE positives when high)")
+    print("=" * 70)
+    
+    negative_features = [(col, corr) for col, corr in correlations if corr < -0.05]
+    negative_features.sort(key=lambda x: x[1])
+    
+    print("\nFeatures where HIGH value = more likely FALSE positive:")
+    for col, corr in negative_features[:20]:
+        print(f"  {col:<45} {corr:>7.3f}")
+    
+    # =========================================================================
+    # 10. POSITIVE CORRELATION FEATURES (likely to indicate VALID sections)
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("POSITIVE CORRELATION FEATURES (indicate VALID sections when high)")
+    print("=" * 70)
+    
+    positive_features = [(col, corr) for col, corr in correlations if corr > 0.05]
+    positive_features.sort(key=lambda x: x[1], reverse=True)
+    
+    print("\nFeatures where HIGH value = more likely VALID section:")
+    for col, corr in positive_features[:20]:
+        print(f"  {col:<45} {corr:>7.3f}")
+    
+    return results
+
+
+# =============================================================================
 # CLI
 # =============================================================================
 
@@ -1997,9 +2392,47 @@ if __name__ == '__main__':
         action="store_true",
         help="Don't save to CSV, just print summary"
     )
+    parser.add_argument(
+        "--feature-selection",
+        action="store_true",
+        help="Run comprehensive feature selection analysis (requires labeled data)"
+    )
+    parser.add_argument(
+        "--feature-selection-only",
+        type=str,
+        metavar="CSV_PATH",
+        help="Run feature selection on an existing CSV file (skips extraction)"
+    )
+    parser.add_argument(
+        "--top-n",
+        type=int,
+        default=50,
+        help="Number of top features to recommend (default: 50)"
+    )
     
     args = parser.parse_args()
     
+    # =========================================================================
+    # MODE 1: Feature selection only (on existing CSV)
+    # =========================================================================
+    if args.feature_selection_only:
+        print(f"Loading existing CSV: {args.feature_selection_only}")
+        analysis_df = pd.read_csv(args.feature_selection_only)
+        
+        labeled_count = analysis_df['_label'].isin([0, 1]).sum() if '_label' in analysis_df.columns else 0
+        print(f"Found {labeled_count} labeled rows (0 or 1)")
+        
+        if labeled_count >= 30:
+            results = run_feature_selection(analysis_df, top_n=args.top_n)
+        else:
+            print("\nERROR: Need at least 30 labeled samples for feature selection.")
+            print("Label more rows in the CSV with 0 (false positive) or 1 (valid section).")
+        
+        exit(0)
+    
+    # =========================================================================
+    # MODE 2: Normal extraction (optionally with feature selection)
+    # =========================================================================
     # Determine output path
     if args.no_save:
         output_csv = None
@@ -2036,5 +2469,11 @@ if __name__ == '__main__':
             # 4. Analyze vocabulary for valid vs invalid titles
             analyze_title_vocabulary(labeled_df, top_n=25)
             
+            # 5. Run feature selection if requested
+            if args.feature_selection:
+                results = run_feature_selection(analysis_df, top_n=args.top_n)
+            
         else:
             print("\n[Info] No labeled data (0 or 1) found. Open the CSV, label some rows, and run again to see analysis.")
+            if args.feature_selection:
+                print("[Info] Feature selection requires labeled data. Skipping.")
