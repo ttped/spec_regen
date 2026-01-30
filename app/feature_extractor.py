@@ -39,8 +39,8 @@ from collections import defaultdict
 # =============================================================================
 
 import spacy
-#_nlp = spacy.load("en_core_web_sm")
-_nlp = spacy.load(os.path.join(os.path.dirname(__file__), "model_en"))
+_nlp = spacy.load("en_core_web_sm")
+#_nlp = spacy.load(os.path.join(os.path.dirname(__file__), "model_en"))
 
 # =============================================================================
 # DEFAULT PATHS (same as simple_pipeline.py)
