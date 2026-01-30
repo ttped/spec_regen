@@ -119,22 +119,73 @@ def reconstruct_lines_with_bbox(page_dict: Dict[str, List]) -> List[Dict]:
     return lines
 
 
-def split_topic_at_period(text: str) -> Tuple[str, str]:
+def split_topic_at_separator(text: str) -> Tuple[str, str]:
     """
-    Splits text at the first period that appears to end a title.
+    Splits text at the first separator that appears to end a title.
+    
+    Handles common patterns where OCR doesn't have newlines after titles:
+    - "Scope -- The something something"
+    - "Scope - something something"
+    - "Scope ~ Something"
+    - "Scope = Something"
+    - "Scope. Something" (period followed by space and capital)
+    
+    Returns:
+        tuple: (title, remainder)
     """
     if not text:
         return "", ""
     
-    period_match = re.search(r'\.(?=\s+[A-Z0-9]|$)', text)
+    # Pattern 1: Double dash separator (highest priority)
+    # Matches: "Title -- rest" or "Title — rest" (em-dash)
+    double_dash = re.search(r'\s+(?:--|—|––)\s+', text)
+    if double_dash:
+        title = text[:double_dash.start()].strip()
+        remainder = text[double_dash.end():].strip()
+        return title, remainder
     
+    # Pattern 2: Single separator characters (with spaces around them)
+    # Matches: "Title - rest", "Title ~ rest", "Title = rest"
+    # Must have space before AND after to avoid matching hyphenated words
+    single_sep = re.search(r'\s+[-~=]\s+', text)
+    if single_sep:
+        # Make sure we're not splitting too early (title should be at least a few chars)
+        if single_sep.start() >= 3:
+            title = text[:single_sep.start()].strip()
+            remainder = text[single_sep.end():].strip()
+            return title, remainder
+    
+    # Pattern 3: Period followed by space and capital letter (sentence start)
+    # Matches: "Title. The rest of the sentence"
+    # But NOT: "Dr. Smith" or "U.S. Army" (abbreviations)
+    period_match = re.search(r'\.(?=\s+[A-Z][a-z])', text)
     if period_match:
-        split_pos = period_match.end()
-        topic = text[:split_pos].strip()
-        remainder = text[split_pos:].strip()
-        return topic, remainder
+        # Check it's not an abbreviation (single capital letter before period)
+        before_period = text[:period_match.start()]
+        # Skip if it looks like an abbreviation (ends with single letter or common abbrev)
+        abbrev_pattern = re.search(r'(?:^|\s)(?:[A-Z]|Dr|Mr|Mrs|Ms|Jr|Sr|Inc|Ltd|etc|vs|Vol|No|Fig)$', before_period)
+        if not abbrev_pattern:
+            title = text[:period_match.end()].strip()
+            remainder = text[period_match.end():].strip()
+            return title, remainder
     
+    # Pattern 4: Period at end of text or followed by end
+    period_end = re.search(r'\.\s*$', text)
+    if period_end:
+        return text.strip(), ""
+    
+    # No separator found - return whole text as title
     return text.strip(), ""
+
+
+def split_topic_at_period(text: str) -> Tuple[str, str]:
+    """
+    Splits text at the first period that appears to end a title.
+    
+    DEPRECATED: Use split_topic_at_separator instead.
+    This function is kept for backward compatibility.
+    """
+    return split_topic_at_separator(text)
 
 
 
@@ -163,6 +214,34 @@ def normalize_section_number(raw: str) -> str:
     
     return normalized
 
+def clean_leading_junk(text: str) -> Tuple[str, str]:
+    """
+    Remove common OCR artifacts that appear before section numbers.
+    
+    Handles patterns like:
+    - ". 1. Scope" -> "1. Scope"
+    - "` 1 Scope" -> "1 Scope"
+    - "' 1.2 Title" -> "1.2 Title"
+    - "- 1 Scope" -> "1 Scope"
+    - ": 1.1 Scope" -> "1.1 Scope"
+    
+    Returns:
+        tuple: (cleaned_text, removed_junk)
+    """
+    if not text:
+        return text, ""
+    
+    # Pattern: punctuation/symbol + optional space + digit
+    # Common junk: . ` ' " - : ; | ! * # @ ^
+    junk_match = re.match(r'^(\s*[.`\'":\-;|!*#@^,]+\s*)(?=\d)', text)
+    if junk_match:
+        junk = junk_match.group(1)
+        cleaned = text[len(junk):]
+        return cleaned, junk
+    
+    return text, ""
+
+
 def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[bool, Optional[str], Optional[str], Optional[str], Optional[Dict]]:
     """
     Checks if a line of text is a section header using regex.
@@ -176,6 +255,7 @@ def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[b
         'original_line': line_text,
         'rejection_reason': None,
         'line_length': len(line_text),
+        'leading_junk_removed': '',
     }
     
     # Check for leading whitespace
@@ -184,13 +264,21 @@ def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[b
     context['had_leading_whitespace'] = leading_ws > 0
     context['leading_whitespace_len'] = leading_ws
     
+    # Clean leading junk (like ". 1.2" or "` 1")
+    cleaned_text, junk_removed = clean_leading_junk(line_text)
+    if junk_removed:
+        context['leading_junk_removed'] = junk_removed.strip()
+        if debug:
+            print(f"      [DEBUG] Removed leading junk: '{junk_removed.strip()}' from '{line_text[:30]}...'")
+    
     # ==========================================================================
     # GREEDY REGEX: Find section-number-like patterns ANYWHERE in the line
     # ==========================================================================
     
-    match_start = re.match(r'^(\s*)([0-9]+(?:[.\-,][0-9]+)*[.\-,]?[A-Za-z]?)\s+(.+)', line_text)
-    match_start_no_title = re.match(r'^(\s*)([0-9]+(?:[.\-,][0-9]+)*[.\-,]?[A-Za-z]?)\s*$', line_text)
-    match_mid = re.search(r'(?:^|[:\s])([0-9]+(?:\.[0-9]+)+)\s+([A-Z][A-Za-z].*?)(?:\.|$)', line_text)
+    # Use cleaned text for matching
+    match_start = re.match(r'^(\s*)([0-9]+(?:[.\-,][0-9]+)*[.\-,]?[A-Za-z]?)\s+(.+)', cleaned_text)
+    match_start_no_title = re.match(r'^(\s*)([0-9]+(?:[.\-,][0-9]+)*[.\-,]?[A-Za-z]?)\s*$', cleaned_text)
+    match_mid = re.search(r'(?:^|[:\s])([0-9]+(?:\.[0-9]+)+)\s+([A-Z][A-Za-z].*?)(?:\.|$)', cleaned_text)
     
     potential_num = None
     full_topic = ""
@@ -205,7 +293,7 @@ def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[b
     elif match_mid:
         potential_num, full_topic = match_mid.groups()
         match_start_pos = match_mid.start(1)
-        text_before = line_text[:match_start_pos].strip()
+        text_before = cleaned_text[:match_start_pos].strip()
         context['had_text_before_number'] = len(text_before) > 0
         context['text_before_number'] = text_before[:50]
     else:
@@ -265,10 +353,13 @@ def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[b
             context['rejection_reason'] = 'major_section_too_large'
             return False, None, None, None, context
 
-    topic, remainder = split_topic_at_period(full_topic)
+    # Split title at separator (handles "--", "-", "~", "=", "." patterns)
+    topic, remainder = split_topic_at_separator(full_topic)
     
     if debug:
         print(f"      [DEBUG] ACCEPTED: section='{section_num}' topic='{topic[:30] if topic else ''}...'")
+        if remainder:
+            print(f"      [DEBUG] Split off remainder: '{remainder[:50]}...'")
     
     return True, section_num, topic.strip(), remainder.strip(), context
 

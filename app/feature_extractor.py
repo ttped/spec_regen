@@ -1639,72 +1639,126 @@ def process_directory(
                 if len(labeled_df) > 0:
                     print(f"  Found {len(labeled_df)} existing labels to preserve")
                     
-                    # Create composite key for matching using CONTENT-BASED keys only
-                    # NOTE: We intentionally exclude '_index' because it shifts when sections
-                    # are added/removed, causing labels to be applied to wrong rows.
-                    # Using content-based keys ensures labels survive re-runs of the pipeline.
-                    primary_key_cols = ['_doc_name', '_section_number_raw', '_page', '_title']
+                    # =========================================================
+                    # LABEL PRESERVATION STRATEGY:
+                    # 
+                    # Problem: Rows can have duplicate keys (e.g., repeated 
+                    # headers/footers like "1 | Mar-25" on every page).
+                    # 
+                    # Solution: Use TWO-PASS matching:
+                    # 1. EXACT match: doc + section + page + title + index
+                    #    (handles unique rows perfectly)
+                    # 2. CONTENT match: doc + section + title (no page/index)
+                    #    (propagates labels to ALL similar rows - your insight
+                    #    that same section/title = same validity)
+                    # =========================================================
                     
-                    # Check which key columns exist in both dataframes
-                    old_key_cols = []
-                    for col in primary_key_cols:
+                    labeled_df = labeled_df.copy()
+                    
+                    # PASS 1: Exact matching (includes page and index for precision)
+                    exact_key_cols_old = ['_doc_name', '_section_number_raw', '_page', '_title']
+                    if '_index' in existing_df.columns:
+                        exact_key_cols_old.append('_index')
+                    
+                    # Handle old column names
+                    exact_key_cols_old_actual = []
+                    for col in exact_key_cols_old:
                         if col in existing_df.columns:
-                            old_key_cols.append(col)
+                            exact_key_cols_old_actual.append(col)
                         elif col == '_section_number_raw' and '_section_number' in existing_df.columns:
-                            # Handle old column name
-                            old_key_cols.append('_section_number')
+                            exact_key_cols_old_actual.append('_section_number')
                     
-                    new_key_cols = [c for c in primary_key_cols if c in df.columns]
+                    exact_key_cols_new = [c for c in exact_key_cols_old if c in df.columns]
                     
-                    if len(old_key_cols) >= 3 and len(new_key_cols) >= 3:
-                        # Create composite key for existing labels
-                        labeled_df = labeled_df.copy()
-                        labeled_df['_merge_key'] = labeled_df[old_key_cols].fillna('').astype(str).agg('|'.join, axis=1)
+                    # PASS 2: Content matching (section + title only, ignores page/index)
+                    # This propagates labels to repeated headers/footers
+                    content_key_cols = ['_doc_name', '_section_number_raw', '_title']
+                    content_key_cols_old = []
+                    for col in content_key_cols:
+                        if col in existing_df.columns:
+                            content_key_cols_old.append(col)
+                        elif col == '_section_number_raw' and '_section_number' in existing_df.columns:
+                            content_key_cols_old.append('_section_number')
+                    
+                    content_key_cols_new = [c for c in content_key_cols if c in df.columns]
+                    
+                    if len(content_key_cols_new) >= 2:
+                        # Build label maps
+                        exact_label_map = {}
+                        content_label_map = {}
                         
-                        # For duplicates in labeled data, they should have the same label
-                        # Use first label encountered for each key (duplicates should match anyway)
-                        label_map = {}
+                        # Build exact key map
+                        if len(exact_key_cols_old_actual) >= 3:
+                            labeled_df['_exact_key'] = labeled_df[exact_key_cols_old_actual].fillna('').astype(str).agg('|'.join, axis=1)
+                            for _, row in labeled_df.iterrows():
+                                key = row['_exact_key']
+                                if key not in exact_label_map:
+                                    exact_label_map[key] = row['_label']
+                        
+                        # Build content key map (for propagating to duplicates)
+                        labeled_df['_content_key'] = labeled_df[content_key_cols_old].fillna('').astype(str).agg('|'.join, axis=1)
                         for _, row in labeled_df.iterrows():
-                            key = row['_merge_key']
-                            if key not in label_map:
-                                label_map[key] = row['_label']
+                            key = row['_content_key']
+                            if key not in content_label_map:
+                                content_label_map[key] = row['_label']
                         
-                        # Create composite key for new data
-                        df['_merge_key'] = df[new_key_cols].fillna('').astype(str).agg('|'.join, axis=1)
+                        # Create keys for new data
+                        if len(exact_key_cols_new) >= 3:
+                            df['_exact_key'] = df[exact_key_cols_new].fillna('').astype(str).agg('|'.join, axis=1)
+                        df['_content_key'] = df[content_key_cols_new].fillna('').astype(str).agg('|'.join, axis=1)
                         
-                        # Count labels before merge
+                        # Count labels before
                         labels_before = df['_label'].notna().sum() if '_label' in df.columns else 0
                         
-                        # Apply labels - this preserves ALL rows, just adds labels where keys match
-                        df['_label'] = df['_merge_key'].map(label_map).fillna(
-                            df['_label'] if '_label' in df.columns else pd.NA
-                        )
+                        # Apply labels: exact match takes priority, then content match
+                        def get_label(row):
+                            # Try exact match first
+                            if '_exact_key' in row and row['_exact_key'] in exact_label_map:
+                                return exact_label_map[row['_exact_key']]
+                            # Fall back to content match (propagates to all similar rows)
+                            if row['_content_key'] in content_label_map:
+                                return content_label_map[row['_content_key']]
+                            # Keep existing label if any
+                            if '_label' in row and pd.notna(row.get('_label', None)):
+                                return row['_label']
+                            return pd.NA
+                        
+                        df['_label'] = df.apply(get_label, axis=1)
                         
                         labels_after = df['_label'].notna().sum()
                         
-                        # Clean up merge key
-                        df = df.drop(columns=['_merge_key'])
+                        # Clean up merge keys
+                        if '_exact_key' in df.columns:
+                            df = df.drop(columns=['_exact_key'])
+                        df = df.drop(columns=['_content_key'])
                         
                         preserved = labels_after - labels_before
                         print(f"  Preserved {preserved} labels from existing file")
                         
-                        # Check for labels that couldn't be matched
-                        unique_old_keys = set(labeled_df['_merge_key'])
-                        unique_new_keys = set(df[new_key_cols].fillna('').astype(str).agg('|'.join, axis=1))
-                        unmatched_keys = unique_old_keys - unique_new_keys
+                        # Count how many came from content matching (propagated)
+                        exact_matches = len([k for k in exact_label_map.keys()])
+                        content_matches = len([k for k in content_label_map.keys()])
+                        print(f"  (Exact key matches: {exact_matches}, Content key patterns: {content_matches})")
+                        
+                        # Check for labels that couldn't be matched at all
+                        unique_old_content_keys = set(labeled_df['_content_key'])
+                        unique_new_content_keys = set(df[content_key_cols_new].fillna('').astype(str).agg('|'.join, axis=1))
+                        unmatched_keys = unique_old_content_keys - unique_new_content_keys
                         
                         if unmatched_keys:
-                            print(f"  Warning: {len(unmatched_keys)} labeled rows from old file could not be matched")
+                            print(f"  Warning: {len(unmatched_keys)} labeled patterns from old file could not be matched")
                             print(f"           (sections may have been removed or changed)")
                     else:
-                        print(f"  Warning: Not enough key columns for matching (old: {old_key_cols}, new: {new_key_cols})")
+                        print(f"  Warning: Not enough key columns for matching (need at least 2)")
                 else:
                     print("  No existing labels found to preserve")
             else:
                 print("  Existing file has no _label column")
                 
         except Exception as e:
+            import traceback
             print(f"  Warning: Could not load existing CSV for label preservation: {e}")
+            traceback.print_exc()
     
     # Print summary
     print(f"\n{'='*60}")
@@ -2362,118 +2416,37 @@ def print_feature_correlations(df: 'pd.DataFrame', min_samples: int = 20) -> Non
 
 
 if __name__ == '__main__':
-    import argparse
-    import numpy as np  # Needed for explicit numeric filtering if not imported
-    
-    parser = argparse.ArgumentParser(
-        description="Extract ML features from processed documents for training a section classifier."
-    )
-    
-    parser.add_argument(
-        "--raw_ocr_dir",
-        type=str,
-        default=DEFAULT_RAW_OCR_DIR,
-        help=f"Directory containing raw OCR JSON files (default: {DEFAULT_RAW_OCR_DIR})"
-    )
-    parser.add_argument(
-        "--results_dir",
-        type=str,
-        default=DEFAULT_RESULTS_DIR,
-        help=f"Directory containing pipeline results (default: {DEFAULT_RESULTS_DIR})"
-    )
-    parser.add_argument(
-        "-o", "--output",
-        type=str,
-        default=None,
-        help="Output CSV path (default: <results_dir>/training_features.csv)"
-    )
-    parser.add_argument(
-        "--no-save",
-        action="store_true",
-        help="Don't save to CSV, just print summary"
-    )
-    parser.add_argument(
-        "--feature-selection",
-        action="store_true",
-        help="Run comprehensive feature selection analysis (requires labeled data)"
-    )
-    parser.add_argument(
-        "--feature-selection-only",
-        type=str,
-        metavar="CSV_PATH",
-        help="Run feature selection on an existing CSV file (skips extraction)"
-    )
-    parser.add_argument(
-        "--top-n",
-        type=int,
-        default=50,
-        help="Number of top features to recommend (default: 50)"
-    )
-    
-    args = parser.parse_args()
-    
-    # =========================================================================
-    # MODE 1: Feature selection only (on existing CSV)
-    # =========================================================================
-    if args.feature_selection_only:
-        print(f"Loading existing CSV: {args.feature_selection_only}")
-        analysis_df = pd.read_csv(args.feature_selection_only)
-        
-        labeled_count = analysis_df['_label'].isin([0, 1]).sum() if '_label' in analysis_df.columns else 0
-        print(f"Found {labeled_count} labeled rows (0 or 1)")
-        
-        if labeled_count >= 30:
-            results = run_feature_selection(analysis_df, top_n=args.top_n)
-        else:
-            print("\nERROR: Need at least 30 labeled samples for feature selection.")
-            print("Label more rows in the CSV with 0 (false positive) or 1 (valid section).")
-        
-        exit(0)
-    
-    # =========================================================================
-    # MODE 2: Normal extraction (optionally with feature selection)
-    # =========================================================================
-    # Determine output path
-    if args.no_save:
-        output_csv = None
-    elif args.output:
-        output_csv = args.output
-    else:
-        output_csv = os.path.join(args.results_dir, "training_features.csv")
+    # Configuration - edit these as needed
+    raw_ocr_dir = DEFAULT_RAW_OCR_DIR
+    results_dir = DEFAULT_RESULTS_DIR
+    output_csv = os.path.join(results_dir, "training_features.csv")
+    top_n_features = 50
     
     # Run extraction
-    df = process_directory(args.results_dir, args.raw_ocr_dir, output_csv)
+    df = process_directory(results_dir, raw_ocr_dir, output_csv)
     
-    # =========================================================================
-    # POST-PROCESSING ANALYSIS
-    # =========================================================================
+    # Post-processing analysis
     if not df.empty and '_label' in df.columns:
-        
-        # 1. Load data explicitly to ensure we have the latest (including preserved labels)
+        # Load data to ensure we have the latest (including preserved labels)
         if output_csv and os.path.exists(output_csv):
             analysis_df = pd.read_csv(output_csv)
         else:
             analysis_df = df
-            
-        # 2. Filter: Remove rows where label is missing or -1 (or any negative number)
-        #    We only want confirmed valid (1) and confirmed invalid (0)
+        
+        # Filter to confirmed labels only (0 or 1)
         labeled_df = analysis_df[analysis_df['_label'].isin([0, 1])]
         
         if not labeled_df.empty:
-            # Set pandas display to show everything if needed (though we print manually mostly)
             pd.set_option('display.max_rows', None)
             
-            # 3. Print correlations (automatically handles non-numeric removal inside function)
+            # Print correlations
             print_feature_correlations(labeled_df)
             
-            # 4. Analyze vocabulary for valid vs invalid titles
+            # Analyze vocabulary
             analyze_title_vocabulary(labeled_df, top_n=25)
             
-            # 5. Run feature selection if requested
-            if args.feature_selection:
-                results = run_feature_selection(analysis_df, top_n=args.top_n)
-            
+            # Run feature selection
+            run_feature_selection(analysis_df, top_n=top_n_features)
         else:
-            print("\n[Info] No labeled data (0 or 1) found. Open the CSV, label some rows, and run again to see analysis.")
-            if args.feature_selection:
-                print("[Info] Feature selection requires labeled data. Skipping.")
+            print("\n[Info] No labeled data (0 or 1) found.")
+            print("Open the CSV, label some rows, and run again to see analysis.")
