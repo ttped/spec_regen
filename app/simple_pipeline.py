@@ -5,7 +5,6 @@ Steps: classify -> title -> structure -> ml_filter -> assets -> tables -> write 
 """
 
 import os
-import argparse
 import json
 import numpy as np
 from typing import List, Dict, Set, Tuple
@@ -151,17 +150,20 @@ def reclassify_elements(elements: List[Dict], sections_to_keep: Set[Tuple[str, i
     return result, kept_as_section, reclassified
 
 
+class Config:
+    """Pipeline configuration - edit these values as needed."""
+    step = "all"  # Options: "classify", "title", "structure", "ml_filter", "assets", "tables", "write", "validate", "all"
+    raw_ocr_dir = DEFAULT_RAW_OCR_DIR
+    figures_dir = DEFAULT_FIGURES_DIR
+    results_dir = DEFAULT_RESULTS_DIR
+    ml_threshold = 0.5
+    no_table_ocr = False
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Document processing pipeline")
-    parser.add_argument("--step", type=str, default="all", 
-        choices=["classify", "title", "structure", "ml_filter", "assets", "tables", "write", "validate", "all"])
-    parser.add_argument("--raw_ocr_dir", type=str, default=DEFAULT_RAW_OCR_DIR)
-    parser.add_argument("--figures_dir", type=str, default=DEFAULT_FIGURES_DIR)
-    parser.add_argument("--results_dir", type=str, default=DEFAULT_RESULTS_DIR)
-    parser.add_argument("--ml-threshold", type=float, default=0.5)
-    parser.add_argument("--no-table-ocr", action="store_true")
+    # Configuration - edit Config class above or override here
+    args = Config()
     
-    args = parser.parse_args()
     os.makedirs(args.results_dir, exist_ok=True)
 
     doc_stems = get_document_stems(args.raw_ocr_dir)
@@ -186,13 +188,8 @@ def main():
                 f"Run: python feature_extractor.py --results_dir {args.results_dir}"
             )
         
-        # Now returns metrics as second tuple item
-        try:
-            sections_to_keep_by_doc, ml_metrics = train_and_predict(features_path, args.ml_threshold)
-        except Exception as e:
-            print(f"[Error] ML Training failed: {e}")
-            print("Continuing without ML filtering (all sections will be kept).")
-            sections_to_keep_by_doc = {}
+        # No try/except - let ML failures crash loudly so we see what's wrong
+        sections_to_keep_by_doc, ml_metrics = train_and_predict(features_path, args.ml_threshold)
         print()
 
     # ==========================================================================
