@@ -36,6 +36,7 @@ CLASSES = {
     1: "Image", 
     2: "Chart",
     3: "Diagram",
+    4: "Text",  # Negative class - helps model learn what's NOT a table/image
 }
 
 # Train/validation split ratio

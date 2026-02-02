@@ -39,6 +39,7 @@ CLASSES = {
     1: ("Image", "#4ECDC4", "i"),      # Teal for images
     2: ("Chart", "#FFE66D", "c"),      # Yellow for charts (optional)
     3: ("Diagram", "#95E1D3", "d"),    # Green for diagrams (optional)
+    4: ("Text", "#888888", "x"),       # Gray for text blocks (negative class)
 }
 
 # Reverse lookup: key -> class_id

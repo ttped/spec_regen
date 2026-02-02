@@ -42,6 +42,7 @@ COLORS = {
     1: ("#4ECDC4", "Image"),      # Teal
     2: ("#FFE66D", "Chart"),      # Yellow
     3: ("#95E1D3", "Diagram"),    # Green
+    4: ("#888888", "Text"),       # Gray - negative class
 }
 
 DEFAULT_COLOR = ("#888888", "Unknown")
