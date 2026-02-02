@@ -71,14 +71,17 @@ def process_pdfs():
             for i, image in enumerate(images):
                 # Format: Folder_Filename_Page01.jpg
                 page_num = f"{i + 1:03d}" 
-                out_filename = f"{flat_name}_page{page_num}.{FORMAT}"
+                # We can still use .jpg for the filename extension
+                out_filename = f"{flat_name}_page{page_num}.jpg" 
                 out_path = OUTPUT_DIR / out_filename
 
                 # Save the image
-                image.save(out_path, FORMAT.upper())
+                # FIXED: Explicitly use "JPEG" (Standard PIL format name)
+                image.save(out_path, "JPEG") 
 
         except Exception as e:
-            print(f"\n[Error] Failed to process {pdf_path.name}: {e}")
+            # Added repr(e) to see the full error type if it happens again
+            print(f"\n[Error] Failed to process {pdf_path.name}: {repr(e)}")
 
     print(f"\nDone! Images saved to {OUTPUT_DIR}")
 
