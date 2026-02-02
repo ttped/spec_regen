@@ -1,0 +1,29 @@
+Paint Points in Process:
+
+-Text does not cleanly copy paste
+-All tables must be manually made
+-All headings and Styles must be manually made
+-Equations must be manually inputted
+
+Ideal Automated Tool:
+
+Structural Automation:
+-Automatically detect headings and apply correct word styles (Done?)
+-Auto Generate TOC/List of tables
+    -(Partially done, have to manually use word to create the reference but it will auto populate. Low amount of time to do manually.)
+
+Table Extraction:
+-Identify Tables in PDF
+-Recreate Tables with correct formatting maintained
+
+Figures/Equations:
+-Identify figures/Equations
+-Flag by writing name / "Add Equation" in red
+
+Formatting Rules:
+-Apply standard paragraph, spacing, and indent Rules
+-Clean up rouge styles (I don't think we can do this VIA the OCR results)
+-Enforce template formatting requirements
+
+QC Flags:
+-Highlight sections where the program is uncertain
