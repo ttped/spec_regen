@@ -1,24 +1,31 @@
 """
-YOLO Visual Testing Tool
-=========================
-Place test images in the yolo_test folder, run this script,
-and check yolo_test_results for annotated images showing detections.
+DocLayout-YOLO Visual Testing Tool
+===================================
+Uses DocLayout-YOLO for document layout analysis - optimized for detecting
+tables, figures, text blocks, and other document elements.
+
+Installation:
+    pip install doclayout-yolo
 
 Usage:
-    python test_yolo_visual.py
-    
-    # Or specify a custom model:
-    python test_yolo_visual.py --model path/to/best.pt
+    python test_yolo_visual_doclayout.py
     
     # Adjust confidence threshold:
-    python test_yolo_visual.py --conf 0.5
+    python test_yolo_visual_doclayout.py --conf 0.3
+    
+    # Use a local model file (for offline use):
+    python test_yolo_visual_doclayout.py --model path/to/model.pt
+
+Security Note:
+    This runs entirely locally. After the initial model download from HuggingFace,
+    no data is sent externally. For fully offline operation, download the model
+    once and use --model to point to the local file.
 """
 
-from ultralytics import YOLO
+from doclayout_yolo import YOLOv10
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 import os
-import sys
 import argparse
 from datetime import datetime
 
@@ -29,23 +36,31 @@ def get_paths():
     project_root = script_dir.parent
     
     return {
-        'test_input': project_root / "docs_images",         # Same images used for training
-        'test_output': project_root / "yolo_test_results",  # Annotated images saved here
-        'default_model': script_dir / "runs" / "detect" / "doc_elements" / "weights" / "best.pt",
+        'test_input': project_root / "docs_images",
+        'test_output': project_root / "doclayout_test_results",
     }
 
 PATHS = get_paths()
 
-# Visual settings for annotations
-COLORS = {
-    0: ("#FF6B6B", "Table"),      # Red
-    1: ("#4ECDC4", "Image"),      # Teal
-    2: ("#FFE66D", "Chart"),      # Yellow
-    3: ("#95E1D3", "Diagram"),    # Green
-    4: ("#888888", "Text"),       # Gray - negative class
+# DocLayout-YOLO DocStructBench model classes (10 classes)
+# These are the classes detected by the pre-trained DocStructBench model
+DOCLAYOUT_COLORS = {
+    0: ("#FF6B6B", "title"),
+    1: ("#4ECDC4", "plain text"),
+    2: ("#FFE66D", "abandon"),
+    3: ("#95E1D3", "figure"),
+    4: ("#A8E6CF", "figure_caption"),
+    5: ("#DDA0DD", "table"),
+    6: ("#87CEEB", "table_caption"),
+    7: ("#F0E68C", "table_footnote"),
+    8: ("#FFA07A", "isolate_formula"),
+    9: ("#98D8C8", "formula_caption"),
 }
 
 DEFAULT_COLOR = ("#888888", "Unknown")
+
+# HuggingFace model identifier for automatic download
+HUGGINGFACE_MODEL = "juliozhao/DocLayout-YOLO-DocStructBench"
 # =================================================
 
 
@@ -55,55 +70,60 @@ def hex_to_rgb(hex_color: str) -> tuple:
     return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
 
-def draw_detections(image_path: Path, results, output_path: Path, conf_threshold: float = 0.25):
-    """
-    Draw bounding boxes and labels on an image.
-    
-    Returns: (num_detections, detection_summary)
-    """
-    # Open image
-    img = Image.open(image_path).convert("RGB")
-    draw = ImageDraw.Draw(img)
-    
-    # Try to load a nice font, fall back to default
+def get_font():
+    """Try to load a nice font, fall back to default."""
     try:
-        # Try common system fonts
         font_paths = [
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
             "/System/Library/Fonts/Helvetica.ttc",
             "C:/Windows/Fonts/arial.ttf",
         ]
-        font = None
         for fp in font_paths:
             if os.path.exists(fp):
-                font = ImageFont.truetype(fp, 16)
-                break
-        if font is None:
-            font = ImageFont.load_default()
+                return ImageFont.truetype(fp, 16)
+        return ImageFont.load_default()
     except:
-        font = ImageFont.load_default()
+        return ImageFont.load_default()
+
+
+def draw_detections(image_path: Path, results, output_path: Path, conf_threshold: float = 0.25):
+    """
+    Draw bounding boxes and labels on an image.
     
-    # Track detections
+    Returns: (num_detections, detection_summary)
+    """
+    img = Image.open(image_path).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    font = get_font()
+    
     detections = []
     boxes = results[0].boxes
+    
+    # Get class names from model results
+    class_names = results[0].names
     
     for box in boxes:
         confidence = float(box.conf)
         
-        # Skip low confidence detections
         if confidence < conf_threshold:
             continue
         
         class_id = int(box.cls)
         x1, y1, x2, y2 = box.xyxy[0].tolist()
         
-        # Get color and label
-        color_hex, class_name = COLORS.get(class_id, DEFAULT_COLOR)
+        # Get color and label - use model's class names
+        if class_id in DOCLAYOUT_COLORS:
+            color_hex, _ = DOCLAYOUT_COLORS[class_id]
+        else:
+            color_hex, _ = DEFAULT_COLOR
+        
+        # Use the class name from the model
+        class_name = class_names.get(class_id, f"class_{class_id}")
         color_rgb = hex_to_rgb(color_hex)
         
         # Draw bounding box (thick outline)
-        for i in range(3):  # Draw multiple rectangles for thickness
+        for i in range(3):
             draw.rectangle(
                 [x1 - i, y1 - i, x2 + i, y2 + i],
                 outline=color_rgb,
@@ -144,7 +164,7 @@ def draw_detections(image_path: Path, results, output_path: Path, conf_threshold
         counts = {}
         for d in detections:
             counts[d['class']] = counts.get(d['class'], 0) + 1
-        summary_parts = [f"{v} {k}{'s' if v > 1 else ''}" for k, v in counts.items()]
+        summary_parts = [f"{v} {k}" for k, v in sorted(counts.items())]
         summary_text += f" ({', '.join(summary_parts)})"
     
     # Draw summary background
@@ -158,14 +178,15 @@ def draw_detections(image_path: Path, results, output_path: Path, conf_threshold
     return len(detections), detections
 
 
-def create_summary_report(results_dir: Path, all_results: list):
+def create_summary_report(results_dir: Path, all_results: list, model_info: str):
     """Create a text summary report of all detections."""
     report_path = results_dir / "detection_report.txt"
     
     with open(report_path, 'w') as f:
-        f.write("YOLO Detection Report\n")
+        f.write("DocLayout-YOLO Detection Report\n")
         f.write("=" * 60 + "\n")
         f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Model: {model_info}\n")
         f.write(f"Total images processed: {len(all_results)}\n")
         
         # Aggregate stats
@@ -206,10 +227,8 @@ def create_comparison_grid(results_dir: Path, image_results: list, max_images: i
     if not image_results:
         return None
     
-    # Limit number of images in grid
     images_to_show = image_results[:max_images]
     
-    # Load annotated images
     annotated_images = []
     for r in images_to_show:
         img_path = results_dir / f"annotated_{r['filename']}"
@@ -220,34 +239,25 @@ def create_comparison_grid(results_dir: Path, image_results: list, max_images: i
     if not annotated_images:
         return None
     
-    # Calculate grid dimensions
     n = len(annotated_images)
     cols = min(3, n)
     rows = (n + cols - 1) // cols
     
-    # Thumbnail size
     thumb_w, thumb_h = 400, 500
     
-    # Create grid image
     grid_w = cols * thumb_w + (cols + 1) * 10
     grid_h = rows * thumb_h + (rows + 1) * 10 + 30
     grid = Image.new('RGB', (grid_w, grid_h), color=(40, 40, 40))
     draw = ImageDraw.Draw(grid)
     
-    # Add title
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
-    except:
-        font = ImageFont.load_default()
+    font = get_font()
     
-    draw.text((10, 5), f"YOLO Test Results - {len(image_results)} images processed", fill=(255, 255, 255), font=font)
+    draw.text((10, 5), f"DocLayout-YOLO Results - {len(image_results)} images", fill=(255, 255, 255), font=font)
     
-    # Paste thumbnails
     for i, (img, filename) in enumerate(annotated_images):
         row = i // cols
         col = i % cols
         
-        # Resize to thumbnail
         img.thumbnail((thumb_w - 10, thumb_h - 25), Image.Resampling.LANCZOS)
         
         x = col * thumb_w + (col + 1) * 10
@@ -255,11 +265,9 @@ def create_comparison_grid(results_dir: Path, image_results: list, max_images: i
         
         grid.paste(img, (x, y))
         
-        # Add filename below
         name_short = filename[:30] + "..." if len(filename) > 30 else filename
         draw.text((x, y + img.height + 2), name_short, fill=(200, 200, 200), font=font)
     
-    # Save grid
     grid_path = results_dir / "results_grid.jpg"
     grid.save(grid_path, quality=90)
     
@@ -267,29 +275,31 @@ def create_comparison_grid(results_dir: Path, image_results: list, max_images: i
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Test YOLO model on images")
-    parser.add_argument('--model', type=str, default=None, help="Path to model weights")
+    parser = argparse.ArgumentParser(description="Test DocLayout-YOLO on document images")
+    parser.add_argument('--model', type=str, default=None, 
+                       help="Path to local model weights (optional - will download from HuggingFace if not provided)")
     parser.add_argument('--conf', type=float, default=0.25, help="Confidence threshold (0-1)")
+    parser.add_argument('--imgsz', type=int, default=1024, help="Inference image size (default 1024)")
     parser.add_argument('--input', type=str, default=None, help="Input folder path")
     parser.add_argument('--output', type=str, default=None, help="Output folder path")
+    parser.add_argument('--device', type=str, default='cpu', help="Device: 'cpu', 'cuda:0', or 'mps'")
     args = parser.parse_args()
     
-    # Setup paths
     input_dir = Path(args.input) if args.input else PATHS['test_input']
     output_dir = Path(args.output) if args.output else PATHS['test_output']
-    model_path = Path(args.model) if args.model else PATHS['default_model']
     
-    print("="*60)
-    print("YOLO VISUAL TESTING")
-    print("="*60)
+    print("=" * 60)
+    print("DOCLAYOUT-YOLO VISUAL TESTING")
+    print("=" * 60)
     print(f"\nInput folder:  {input_dir}")
     print(f"Output folder: {output_dir}")
-    print(f"Model:         {model_path}")
+    print(f"Device:        {args.device}")
+    print(f"Image size:    {args.imgsz}")
     print(f"Confidence:    {args.conf:.0%}")
     
     # Check input directory
     if not input_dir.exists():
-        print(f"\n❌ Input folder not found: {input_dir}")
+        print(f"\n✗ Input folder not found: {input_dir}")
         print("  Run prepare_images.py first to convert PDFs to images.")
         return
     
@@ -301,38 +311,27 @@ def main():
     ]
     
     if not test_images:
-        print(f"\n❌ No images found in {input_dir}")
-        print(f"   Supported formats: {', '.join(image_extensions)}")
+        print(f"\n✗ No images found in {input_dir}")
         return
     
     print(f"\nFound {len(test_images)} test images")
     
-    # Check model
-    if not model_path.exists():
-        # Try alternative locations
-        alt_paths = [
-            Path("runs/detect/doc_elements/weights/best.pt"),
-            Path("runs/detect/train/weights/best.pt"),
-            Path("best.pt"),
-        ]
-        
-        for alt in alt_paths:
-            if alt.exists():
-                model_path = alt
-                print(f"  Using model: {model_path}")
-                break
-        else:
-            print(f"\n❌ Model not found: {model_path}")
-            print("   Train a model first with: python train_yolo.py")
-            print("   Or specify a model: python test_yolo_visual.py --model path/to/best.pt")
-            return
+    # Load model
+    print(f"\nLoading DocLayout-YOLO model...")
+    if args.model and Path(args.model).exists():
+        print(f"  Using local model: {args.model}")
+        model = YOLOv10(args.model)
+        model_info = args.model
+    else:
+        print(f"  Loading from HuggingFace: {HUGGINGFACE_MODEL}")
+        print("  (This will be cached locally for future offline use)")
+        model = YOLOv10.from_pretrained(HUGGINGFACE_MODEL)
+        model_info = HUGGINGFACE_MODEL
+    
+    print("  Model loaded successfully!")
     
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Load model
-    print(f"\nLoading model...")
-    model = YOLO(str(model_path))
     
     # Process images
     print(f"\nProcessing images...")
@@ -341,11 +340,17 @@ def main():
     all_results = []
     
     for i, img_path in enumerate(sorted(test_images), 1):
-        print(f"  [{i}/{len(test_images)}] {img_path.name}...", end=" ")
+        print(f"  [{i}/{len(test_images)}] {img_path.name}...", end=" ", flush=True)
         
         try:
             # Run inference
-            results = model.predict(str(img_path), verbose=False)
+            results = model.predict(
+                str(img_path),
+                imgsz=args.imgsz,
+                conf=args.conf,
+                device=args.device,
+                verbose=False
+            )
             
             # Draw and save annotated image
             output_path = output_dir / f"annotated_{img_path.name}"
@@ -373,7 +378,7 @@ def main():
     print("-" * 60)
     
     # Create summary report
-    report_path = create_summary_report(output_dir, all_results)
+    report_path = create_summary_report(output_dir, all_results, model_info)
     print(f"\n✓ Report saved: {report_path}")
     
     # Create comparison grid
@@ -385,9 +390,9 @@ def main():
     total_detections = sum(r['count'] for r in all_results)
     images_with_detections = sum(1 for r in all_results if r['count'] > 0)
     
-    print(f"\n" + "="*60)
+    print(f"\n" + "=" * 60)
     print("SUMMARY")
-    print("="*60)
+    print("=" * 60)
     print(f"  Images processed:        {len(all_results)}")
     print(f"  Images with detections:  {images_with_detections}")
     print(f"  Total detections:        {total_detections}")
@@ -406,6 +411,12 @@ def main():
     
     print(f"\n✓ Results saved to: {output_dir}")
     print(f"\n  Open the folder to see annotated images!")
+    
+    # Security reminder
+    print(f"\n" + "-" * 60)
+    print("SECURITY NOTE: All processing was done locally.")
+    print("No image data was transmitted externally.")
+    print("-" * 60)
 
 
 if __name__ == "__main__":
