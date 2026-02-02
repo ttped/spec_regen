@@ -3,11 +3,33 @@ from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
 import os
 import glob
+from pathlib import Path
 
 # ================= CONFIGURATION =================
-IMAGE_DIR = "../docs_images"
-OUTPUT_LABELS_DIR = "../docs_labels"  # Saves YOLO .txt files here
-OUTPUT_CROPS_DIR = "../docs_crops"    # Saves actual images here
+def get_paths():
+    """
+    Calculates paths relative to this script file.
+    Assumes directory structure:
+    /project
+      /src (where this script is)
+      /docs_images
+      /docs_labels
+      /docs_crops
+    """
+    # Get the directory where THIS script is located
+    script_dir = Path(__file__).resolve().parent
+    
+    # Go one level up to the project root
+    project_root = script_dir.parent
+    
+    return (
+        project_root / "docs_images",
+        project_root / "docs_labels",
+        project_root / "docs_crops"
+    )
+
+IMAGE_DIR, OUTPUT_LABELS_DIR, OUTPUT_CROPS_DIR = get_paths()
+
 CLASSES = {
     "t": (0, "Table"),  # Press 't' for Table
     "i": (1, "Image")   # Press 'i' for Image
@@ -20,13 +42,24 @@ class SimpleTagger:
         self.root.title("Simple PDF Tagger (Press 't' for Table, 'i' for Image)")
         
         # Setup Directories
-        os.makedirs(OUTPUT_LABELS_DIR, exist_ok=True)
-        os.makedirs(OUTPUT_CROPS_DIR, exist_ok=True)
+        # Convert Path objects to strings for compatibility
+        self.img_dir = str(IMAGE_DIR)
+        self.lbl_dir = str(OUTPUT_LABELS_DIR)
+        self.crop_dir = str(OUTPUT_CROPS_DIR)
+
+        os.makedirs(self.lbl_dir, exist_ok=True)
+        os.makedirs(self.crop_dir, exist_ok=True)
         
         # Load Images
-        self.image_list = sorted(glob.glob(os.path.join(IMAGE_DIR, "*.jpg")))
+        if not os.path.exists(self.img_dir):
+             messagebox.showerror("Error", f"Image directory not found:\n{self.img_dir}")
+             return
+
+        # Use glob to find .jpg (case insensitive for safety)
+        self.image_list = sorted(glob.glob(os.path.join(self.img_dir, "*.[jJ][pP][gG]")))
+        
         if not self.image_list:
-            messagebox.showerror("Error", f"No .jpg images found in {IMAGE_DIR}")
+            messagebox.showerror("Error", f"No .jpg images found in:\n{self.img_dir}")
             return
             
         self.current_index = 0
@@ -118,19 +151,23 @@ class SimpleTagger:
         
         # 2. Append to Text File (YOLO Format)
         txt_filename = os.path.splitext(os.path.basename(self.img_path))[0] + ".txt"
-        txt_path = os.path.join(OUTPUT_LABELS_DIR, txt_filename)
+        txt_path = os.path.join(self.lbl_dir, txt_filename)
         
         with open(txt_path, "a") as f:
             f.write(f"{class_id} {center_x:.6f} {center_y:.6f} {width:.6f} {height:.6f}\n")
             
         # 3. Save the Actual Crop (For immediate use)
         crop_img = self.original_image.crop((x1, y1, x2, y2))
-        crop_name = f"{os.path.splitext(txt_filename)[0]}_{class_name}_{len(os.listdir(OUTPUT_CROPS_DIR))}.jpg"
-        crop_img.save(os.path.join(OUTPUT_CROPS_DIR, crop_name))
+        
+        # Count existing crops to make unique filename
+        existing_crops = len(os.listdir(self.crop_dir))
+        crop_name = f"{os.path.splitext(txt_filename)[0]}_{class_name}_{existing_crops}.jpg"
+        
+        crop_img.save(os.path.join(self.crop_dir, crop_name))
         
         # Visual Feedback
         self.canvas.create_rectangle(self.start_x, self.start_y, self.end_x, self.end_y, outline='green', width=2)
-        self.update_status(f"Saved {class_name}!")
+        self.update_status(f"Saved {class_name}! ({width:.2f}x{height:.2f})")
         self.rect = None # Reset active rect
 
     def next_image(self, event=None):
