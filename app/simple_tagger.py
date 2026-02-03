@@ -352,10 +352,9 @@ class DocLayoutTagger:
         self.root.bind("<a>", lambda e: self.auto_label())
         self.root.bind("<A>", lambda e: self.auto_label())
         
-        # Class selection keys (1-9 and 0)
+        # Class selection keys (1-9 and 0) - bind directly to the key characters
         for key, class_id in KEY_TO_CLASS.items():
-            self.root.bind(f"<Key-{key}>", lambda e, cid=class_id: self._select_class(cid))
-            self.root.bind(f"<KeyPad-{key}>", lambda e, cid=class_id: self._select_class(cid))
+            self.root.bind(key, lambda e, cid=class_id: self._select_class(cid))
         
         # Canvas bindings
         self.canvas.bind("<ButtonPress-1>", self._on_mouse_down)
