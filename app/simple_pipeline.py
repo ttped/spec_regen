@@ -35,13 +35,8 @@ from section_classifier import train_and_predict
 from validation_agent import run_validation_on_file
 from utils import load_json_with_recovery
 
-# New YOLO import
-try:
-    from yolo_asset_extractor import run_yolo_extraction, get_yolo_exports_dir
-    YOLO_AVAILABLE = True
-except ImportError:
-    YOLO_AVAILABLE = False
-    print("[Warning] yolo_asset_extractor not available. YOLO extraction disabled.")
+
+from yolo_asset_extractor import run_yolo_extraction, get_yolo_exports_dir
 
 
 # =============================================================================
@@ -193,7 +188,7 @@ class Config:
     
     # Directories
     raw_ocr_dir = DEFAULT_RAW_OCR_DIR
-    figures_dir = DEFAULT_FIGURES_DIR      # Manual exports (fallback)
+    #figures_dir = DEFAULT_FIGURES_DIR      # Manual exports (fallback)
     images_dir = DEFAULT_IMAGES_DIR        # Page images for YOLO
     yolo_exports_dir = DEFAULT_YOLO_EXPORTS_DIR  # YOLO output
     results_dir = DEFAULT_RESULTS_DIR
@@ -214,19 +209,15 @@ def main():
     
     os.makedirs(args.results_dir, exist_ok=True)
     
-    # Determine which figures directory to use
-    if args.use_yolo and YOLO_AVAILABLE:
-        figures_dir = args.yolo_exports_dir
-        print(f"[Mode] Using YOLO-extracted assets from: {figures_dir}")
-    else:
-        figures_dir = args.figures_dir
-        print(f"[Mode] Using manual exports from: {figures_dir}")
+    # Determine which figures directory to use (Always YOLO)
+    figures_dir = args.yolo_exports_dir
+    print(f"[Mode] Using YOLO-extracted assets from: {figures_dir}")
     print()
 
     # ==========================================================================
     # YOLO EXTRACTION (before processing documents)
     # ==========================================================================
-    if args.step in ["yolo", "all"] and args.use_yolo and YOLO_AVAILABLE:
+    if args.step in ["yolo", "all"]:
         print("=" * 60)
         print("YOLO ASSET EXTRACTION")
         print("=" * 60)
@@ -456,8 +447,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Document processing pipeline with YOLO integration")
     parser.add_argument('--step', type=str, default='all',
                        help="Step to run: classify, title, structure, ml_filter, yolo, assets, tables, write, validate, all")
-    parser.add_argument('--skip-yolo', action='store_true',
-                       help="Skip YOLO extraction (use manual exports)")
     parser.add_argument('--yolo-conf', type=float, default=0.25,
                        help="YOLO confidence threshold")
     parser.add_argument('--yolo-device', type=str, default='cpu',
@@ -469,7 +458,6 @@ if __name__ == '__main__':
     
     # Apply CLI args to config
     Config.step = args.step
-    Config.use_yolo = not args.skip_yolo
     Config.yolo_confidence = args.yolo_conf
     Config.yolo_device = args.yolo_device
     Config.skip_yolo_if_exists = not args.force_yolo

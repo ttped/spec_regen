@@ -23,14 +23,8 @@ from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 from collections import defaultdict
 
-try:
-    from doclayout_yolo import YOLOv10
-    from PIL import Image
-    YOLO_AVAILABLE = True
-except ImportError:
-    YOLO_AVAILABLE = False
-    print("[Warning] doclayout-yolo not installed. Run: pip install doclayout-yolo")
-
+from doclayout_yolo import YOLOv10
+from PIL import Image
 
 # =============================================================================
 # CONFIGURATION
@@ -82,10 +76,11 @@ def get_paths():
     }
 
 
-def load_model(local_path: str = None) -> Optional['YOLOv10']:
-    """Load DocLayout-YOLO model."""
-    if not YOLO_AVAILABLE:
-        return None
+def load_model(local_path: str = None) -> 'YOLOv10':
+    """Load DocLayout-YOLO model with default local path."""
+    # Default to the specific model one folder up if no path provided
+    if local_path is None:
+        local_path = str(Path(__file__).resolve().parent.parent / "doclayout_yolo_docstructbench_imgsz1024.pt")
     
     if local_path and Path(local_path).exists():
         print(f"  Loading local model: {local_path}")
@@ -381,10 +376,6 @@ def run_yolo_extraction(
     Returns:
         Dict mapping doc_stem -> list of asset metadata
     """
-    if not YOLO_AVAILABLE:
-        print("[Error] doclayout-yolo not installed. Run: pip install doclayout-yolo")
-        return {}
-    
     # Get default paths if not provided
     paths = get_paths()
     images_dir = Path(images_dir) if images_dir else paths['images_dir']
@@ -460,7 +451,6 @@ def run_yolo_extraction(
     print(f"  Output: {output_dir}")
     
     return results
-
 
 # =============================================================================
 # PIPELINE INTEGRATION HELPER
