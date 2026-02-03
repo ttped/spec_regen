@@ -763,21 +763,36 @@ class DocLayoutTagger:
         if MODEL_PATH:
             search_paths.append(Path(MODEL_PATH))
         
-        # Same directory as script
-        script_dir = Path(__file__).resolve().parent
-        search_paths.extend([
-            script_dir / "doclayout_yolo_docstructbench_imgsz1024.pt",
-            script_dir / "doclayout_yolo_docstructbench.pt",
-            script_dir / "best.pt",
-            script_dir / "models" / "doclayout_yolo_docstructbench_imgsz1024.pt",
-        ])
+        # Try to get script directory safely
+        try:
+            script_dir = Path(__file__).resolve().parent
+        except NameError:
+            script_dir = Path.cwd()
         
-        # Project root
-        project_root = script_dir.parent
-        search_paths.extend([
-            project_root / "models" / "doclayout_yolo_docstructbench_imgsz1024.pt",
-            project_root / "doclayout_yolo_docstructbench_imgsz1024.pt",
-        ])
+        # Common model filenames to search for
+        model_names = [
+            "doclayout_yolo_docstructbench_imgsz1024.pt",
+            "doclayout_yolo_docstructbench.pt",
+            "best.pt",
+        ]
+        
+        # Search in script directory
+        for name in model_names:
+            search_paths.append(script_dir / name)
+        search_paths.append(script_dir / "models" / "doclayout_yolo_docstructbench_imgsz1024.pt")
+        
+        # Search in current working directory
+        cwd = Path.cwd()
+        for name in model_names:
+            search_paths.append(cwd / name)
+        search_paths.append(cwd / "models" / "doclayout_yolo_docstructbench_imgsz1024.pt")
+        
+        # Search in image directory's parent (project root)
+        if self.img_dir and os.path.exists(self.img_dir):
+            project_root = Path(self.img_dir).parent
+            for name in model_names:
+                search_paths.append(project_root / name)
+            search_paths.append(project_root / "models" / "doclayout_yolo_docstructbench_imgsz1024.pt")
         
         # Try each path
         for model_path in search_paths:
@@ -808,10 +823,13 @@ class DocLayoutTagger:
     
     def _select_model_file(self):
         """Open dialog to select model file."""
+        # Use current working directory or image directory as starting point
+        start_dir = self.img_dir if os.path.exists(self.img_dir) else os.getcwd()
+        
         file_path = filedialog.askopenfilename(
             title="Select DocLayout-YOLO Model",
             filetypes=[("PyTorch Model", "*.pt"), ("All Files", "*.*")],
-            initialdir=Path(__file__).resolve().parent
+            initialdir=start_dir
         )
         if file_path:
             self._load_model(file_path)
