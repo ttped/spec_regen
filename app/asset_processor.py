@@ -3,12 +3,11 @@ asset_processor.py - Handles loading and positioning of figures and tables.
 
 This module:
 1. Loads figure/table metadata from exported JSON files
-2. Uses raw bbox coordinates as-is (no scaling/normalization)
-3. Integrates assets into the document element stream
-4. Preserves the original order of OCR elements (sections/text)
-5. Inserts assets at the end of their respective pages
+2. Filters out OCR text that lies INSIDE these assets (Double OCR Fix)
+3. Integrates assets into the document element stream based on VISUAL POSITION
+4. Interleaves assets between text blocks based on vertical (Y-axis) coordinates
 
-The OCR element order is authoritative - assets are inserted without disrupting it.
+The goal is to recreate the visual flow: Section 1.1 -> Image -> Section 1.2
 """
 
 import os
@@ -32,11 +31,6 @@ def extract_asset_bbox_raw(meta: Dict) -> Optional[Dict]:
     """
     Extract bbox from asset metadata WITHOUT any scaling or normalization.
     Returns the raw bbox values as they appear in the metadata.
-    
-    Compatible with:
-    - YOLO output (bbox.pixels = [x, y, w, h])
-    - Manual exports (bbox.pdf_units = [x, y, w, h])
-    - Simple lists (bbox = [x, y, w, h])
     """
     bbox_data = meta.get('bbox', {})
     
@@ -129,6 +123,85 @@ def load_all_assets(exports_dir: str, doc_stem: str) -> List[Dict]:
     return assets
 
 
+def calculate_overlap_ratio(text_bbox: Dict, asset_bbox: Dict) -> float:
+    """
+    Calculates what fraction of the text block is covered by the asset block.
+    Returns float 0.0 to 1.0.
+    """
+    # Determine intersection rectangle
+    x_left = max(text_bbox['left'], asset_bbox['left'])
+    y_top = max(text_bbox['top'], asset_bbox['top'])
+    x_right = min(text_bbox['right'], asset_bbox['right'])
+    y_bottom = min(text_bbox['bottom'], asset_bbox['bottom'])
+
+    if x_right < x_left or y_bottom < y_top:
+        return 0.0
+
+    intersection_area = (x_right - x_left) * (y_bottom - y_top)
+    text_area = text_bbox['width'] * text_bbox['height']
+    
+    if text_area <= 0:
+        return 0.0
+        
+    return intersection_area / text_area
+
+
+def filter_overlapped_text(elements: List[Dict], assets: List[Dict]) -> Tuple[List[Dict], int]:
+    """
+    Removes text elements that are significantly overlapped by an asset (figure/table).
+    This prevents "double OCR" where the text appears both in the image and as raw text.
+    """
+    if not assets:
+        return elements, 0
+        
+    # Group assets by page for faster lookup
+    assets_by_page = {}
+    for asset in assets:
+        page = asset.get('page_number', 9999)
+        if page not in assets_by_page:
+            assets_by_page[page] = []
+        assets_by_page[page].append(asset)
+        
+    filtered_elements = []
+    removed_count = 0
+    
+    for elem in elements:
+        # Skip elements that don't have bboxes or aren't text/sections
+        if 'bbox' not in elem or not elem['bbox']:
+            filtered_elements.append(elem)
+            continue
+            
+        page = elem.get('page_number', 9999)
+        if page not in assets_by_page:
+            filtered_elements.append(elem)
+            continue
+            
+        # Check against all assets on this page
+        is_overlapped = False
+        text_bbox = elem['bbox']
+        
+        for asset in assets_by_page[page]:
+            asset_bbox = asset.get('bbox')
+            if not asset_bbox:
+                continue
+                
+            # Check overlap
+            overlap_ratio = calculate_overlap_ratio(text_bbox, asset_bbox)
+            
+            # THRESHOLD: If >60% of text area is inside the image, assume it's part of the image
+            if overlap_ratio > 0.60:
+                is_overlapped = True
+                # print(f"      [Filter] Dropped text on p{page} (overlap {overlap_ratio:.2f} with {asset.get('asset_id')})")
+                break
+        
+        if is_overlapped:
+            removed_count += 1
+        else:
+            filtered_elements.append(elem)
+            
+    return filtered_elements, removed_count
+
+
 def integrate_assets_with_elements(
     elements: List[Dict], 
     assets: List[Dict],
@@ -138,15 +211,21 @@ def integrate_assets_with_elements(
     Merge assets into the element stream by INTERLEAVING them based on vertical position.
     
     Algorithm:
-    1. Sort assets for a page by their 'top' (Y) coordinate.
-    2. Iterate through text elements.
-    3. If an asset's 'top' is LESS than the current text element's 'top', insert it BEFORE.
-    4. Any remaining assets for the page are appended at the end of the page.
+    1. Filter out text elements that are visually covered by assets (Double OCR fix).
+    2. Sort assets for a page by their 'top' (Y) coordinate.
+    3. Iterate through text elements.
+    4. If an asset's 'top' is LESS than the current text element's 'top', insert it BEFORE.
+    5. Any remaining assets for the page are appended at the end of the page.
     """
     if not assets:
         return elements
+
+    # --- STEP 1: Filter Double OCR Text ---
+    clean_elements, removed_count = filter_overlapped_text(elements, assets)
+    if removed_count > 0:
+        print(f"    Filtered out {removed_count} text blocks overlapping with assets (Double OCR fix).")
     
-    # 1. Group assets by page and SORT by Top position
+    # --- STEP 2: Group assets by page and SORT by Top position ---
     assets_by_page: Dict[int, List[Dict]] = {}
     for asset in assets:
         # Robust page parsing
@@ -167,8 +246,8 @@ def integrate_assets_with_elements(
     result = []
     current_page = None
     
-    # 2. Iterate through existing text elements
-    for element in elements:
+    # --- STEP 3: Iterate through existing text elements ---
+    for element in clean_elements:
         elem_page = element.get('page_number', 9999)
         if isinstance(elem_page, str) and elem_page.isdigit():
             elem_page = int(elem_page)
@@ -179,11 +258,10 @@ def integrate_assets_with_elements(
                 remaining_assets = assets_by_page.pop(current_page)
                 if remaining_assets:
                     result.extend(remaining_assets)
-                    # print(f"      + Flushed {len(remaining_assets)} assets at end of page {current_page}")
         
         current_page = elem_page
         
-        # 3. Check if any assets on CURRENT page belong BEFORE this element
+        # --- STEP 4: Check if any assets on CURRENT page belong BEFORE this element ---
         if current_page in assets_by_page:
             page_assets = assets_by_page[current_page]
             
@@ -191,12 +269,12 @@ def integrate_assets_with_elements(
             elem_top = element.get('bbox', {}).get('top', float('inf'))
             
             # Identify assets that appear visibly "above" this text block
-            # We use a slight buffer (e.g. -10) just in case they overlap slightly
             assets_to_insert = []
             while page_assets:
                 next_asset = page_assets[0]
                 asset_top = next_asset.get('bbox', {}).get('top', 9999)
                 
+                # If asset is definitely above the text, insert it now
                 if asset_top < elem_top:
                     assets_to_insert.append(page_assets.pop(0))
                 else:
@@ -205,18 +283,16 @@ def integrate_assets_with_elements(
             
             if assets_to_insert:
                 result.extend(assets_to_insert)
-                # print(f"      + Interleaved {len(assets_to_insert)} assets before text at Y={elem_top}")
 
         # Add the text element itself
         result.append(element)
     
-    # 4. Handle assets for the very last page processed
+    # --- STEP 5: Handle assets for the very last page processed ---
     if current_page is not None and current_page in assets_by_page:
         remaining = assets_by_page.pop(current_page)
         result.extend(remaining)
-        # print(f"      + Flushed {len(remaining)} assets at end of doc")
     
-    # 5. Handle orphaned assets (pages with no text elements at all)
+    # --- STEP 6: Handle orphaned assets (pages with no text elements at all) ---
     for page in sorted(assets_by_page.keys()):
         page_assets = assets_by_page[page]
         result.extend(page_assets)
@@ -280,7 +356,7 @@ if __name__ == '__main__':
         input_file = sys.argv[1]
         output_file = sys.argv[2]
         exports_dir = sys.argv[3]
-        doc_stem = sys.argv[4] if len(sys.argv) > 4 else os.path.splitext(os.path.basename(input_file))[0].replace('_organized', '')
+        doc_stem = sys.argv[4] if len(sys.argv) > 4 else "unknown_doc"
         
         run_asset_integration(input_file, output_file, exports_dir, doc_stem)
     else:
