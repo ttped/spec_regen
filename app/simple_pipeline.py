@@ -1,15 +1,30 @@
 """
-simple_pipeline.py - Document processing pipeline with ML classification.
+simple_pipeline_yolo.py - Document processing pipeline with YOLO-based asset extraction.
 
-Steps: classify -> title -> structure -> ml_filter -> assets -> tables -> write -> validate
+This is an enhanced version of simple_pipeline.py that adds automatic figure/table
+detection using DocLayout-YOLO. The YOLO step replaces the need for manually
+exported figures.
+
+Steps: 
+    classify -> title -> structure -> ml_filter -> [yolo_extract] -> assets -> tables -> write -> validate
+
+New step:
+    yolo_extract: Runs YOLO on page images to detect and crop figures/tables
+
+Usage:
+    python simple_pipeline_yolo.py                    # Run full pipeline with YOLO
+    python simple_pipeline_yolo.py --skip-yolo        # Skip YOLO (use manual exports)
+    python simple_pipeline_yolo.py --step yolo        # Run only YOLO extraction
 """
 
 import os
 import json
+import shutil
 import numpy as np
-from typing import List, Dict, Set, Tuple
+from pathlib import Path
+from typing import List, Dict, Set, Tuple, Optional
 
-# Direct imports
+# Direct imports (existing)
 from classify_agent import run_classification_on_file, load_content_start_page, load_classification_result
 from title_agent import extract_title_page_info
 from asset_processor import run_asset_integration
@@ -20,13 +35,23 @@ from section_classifier import train_and_predict
 from validation_agent import run_validation_on_file
 from utils import load_json_with_recovery
 
+# New YOLO import
+try:
+    from yolo_asset_extractor import run_yolo_extraction, get_yolo_exports_dir
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO_AVAILABLE = False
+    print("[Warning] yolo_asset_extractor not available. YOLO extraction disabled.")
+
 
 # =============================================================================
 # CONFIG
 # =============================================================================
 
 DEFAULT_RAW_OCR_DIR = os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "raw_data_advanced")
-DEFAULT_FIGURES_DIR = os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "exports")
+DEFAULT_FIGURES_DIR = os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "exports")  # Manual exports
+DEFAULT_IMAGES_DIR = "docs_images"  # Page images for YOLO
+DEFAULT_YOLO_EXPORTS_DIR = "yolo_exports"  # YOLO-extracted assets
 DEFAULT_RESULTS_DIR = "results_simple"
 
 LLM_CONFIG = {
@@ -49,21 +74,34 @@ def get_document_stems(input_dir: str) -> List[str]:
     return sorted(list(stems))
 
 
+def get_document_stems_from_images(images_dir: str) -> List[str]:
+    """Get document stems from page images directory."""
+    import re
+    stems = set()
+    
+    if not os.path.exists(images_dir):
+        return []
+    
+    for filename in os.listdir(images_dir):
+        match = re.match(r'^(.+)_page\d+\.[a-zA-Z]+$', filename)
+        if match:
+            stems.add(match.group(1))
+    
+    return sorted(list(stems))
+
+
 def extract_title_from_first_page(raw_input_path: str, output_path: str):
     """Extract title page information from page 1."""
     print(f"  Loading: {raw_input_path}")
     
-    # 1. Safe Load
     try:
         data = load_json_with_recovery(raw_input_path)
     except Exception as e:
         print(f"  [Error] Failed to load raw OCR JSON: {e}")
-        # Create empty output to prevent downstream failures
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump([], f)
         return
 
-    # 2. Extract Text
     page_text = ""
     try:
         if isinstance(data, list) and len(data) > 0:
@@ -88,7 +126,6 @@ def extract_title_from_first_page(raw_input_path: str, output_path: str):
     except Exception as e:
         print(f"  [Warning] Error parsing page text structure: {e}")
 
-    # 3. LLM Extraction
     info = None
     if page_text and page_text.strip():
         try:
@@ -103,7 +140,6 @@ def extract_title_from_first_page(raw_input_path: str, output_path: str):
             print(f"  [Warning] Title extraction LLM failure: {e}")
             info = None
     
-    # 4. Safe Write
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump([info] if info else [], f, indent=4)
@@ -152,33 +188,89 @@ def reclassify_elements(elements: List[Dict], sections_to_keep: Set[Tuple[str, i
 
 class Config:
     """Pipeline configuration - edit these values as needed."""
-    step = "all"  # Options: "classify", "title", "structure", "ml_filter", "assets", "tables", "write", "validate", "all"
+    # Pipeline control
+    step = "all"  # Options: "classify", "title", "structure", "ml_filter", "yolo", "assets", "tables", "write", "validate", "all"
+    
+    # Directories
     raw_ocr_dir = DEFAULT_RAW_OCR_DIR
-    figures_dir = DEFAULT_FIGURES_DIR
+    figures_dir = DEFAULT_FIGURES_DIR      # Manual exports (fallback)
+    images_dir = DEFAULT_IMAGES_DIR        # Page images for YOLO
+    yolo_exports_dir = DEFAULT_YOLO_EXPORTS_DIR  # YOLO output
     results_dir = DEFAULT_RESULTS_DIR
+    
+    # ML settings
     ml_threshold = 0.5
-    no_table_ocr = True  # Disabled - too slow and not effective yet
+    no_table_ocr = True
+    
+    # YOLO settings
+    use_yolo = True           # Use YOLO for asset extraction
+    yolo_confidence = 0.25    # Confidence threshold
+    yolo_device = 'cpu'       # 'cpu', 'cuda:0', or 'mps'
+    skip_yolo_if_exists = True  # Skip YOLO if exports already exist
 
 
 def main():
-    # Configuration - edit Config class above or override here
     args = Config()
     
     os.makedirs(args.results_dir, exist_ok=True)
+    
+    # Determine which figures directory to use
+    if args.use_yolo and YOLO_AVAILABLE:
+        figures_dir = args.yolo_exports_dir
+        print(f"[Mode] Using YOLO-extracted assets from: {figures_dir}")
+    else:
+        figures_dir = args.figures_dir
+        print(f"[Mode] Using manual exports from: {figures_dir}")
+    print()
 
+    # ==========================================================================
+    # YOLO EXTRACTION (before processing documents)
+    # ==========================================================================
+    if args.step in ["yolo", "all"] and args.use_yolo and YOLO_AVAILABLE:
+        print("=" * 60)
+        print("YOLO ASSET EXTRACTION")
+        print("=" * 60)
+        
+        # Check if we should skip
+        if args.skip_yolo_if_exists and os.path.exists(args.yolo_exports_dir):
+            existing_docs = [d for d in os.listdir(args.yolo_exports_dir) 
+                          if os.path.isdir(os.path.join(args.yolo_exports_dir, d))]
+            if existing_docs:
+                print(f"  [Skip] YOLO exports already exist for {len(existing_docs)} documents")
+                print(f"  Set skip_yolo_if_exists=False to re-run extraction")
+                print()
+            else:
+                run_yolo_extraction(
+                    images_dir=Path(args.images_dir),
+                    output_dir=Path(args.yolo_exports_dir),
+                    confidence_threshold=args.yolo_confidence,
+                    device=args.yolo_device
+                )
+        else:
+            run_yolo_extraction(
+                images_dir=Path(args.images_dir),
+                output_dir=Path(args.yolo_exports_dir),
+                confidence_threshold=args.yolo_confidence,
+                device=args.yolo_device
+            )
+        print()
+
+    # ==========================================================================
+    # DOCUMENT LIST
+    # ==========================================================================
     doc_stems = get_document_stems(args.raw_ocr_dir)
     print(f"Found {len(doc_stems)} documents in {args.raw_ocr_dir}\n")
 
     # ==========================================================================
-    # ML TRAINING (once, on full CSV)
+    # ML TRAINING
     # ==========================================================================
     sections_to_keep_by_doc = {}
     ml_metrics = None
     
     if args.step in ["ml_filter", "all"]:
-        print("="*60)
+        print("=" * 60)
         print("ML TRAINING & PREDICTION")
-        print("="*60)
+        print("=" * 60)
         
         features_path = os.path.join(args.results_dir, "training_features.csv")
         
@@ -188,7 +280,6 @@ def main():
                 f"Run: python feature_extractor.py --results_dir {args.results_dir}"
             )
         
-        # No try/except - let ML failures crash loudly so we see what's wrong
         sections_to_keep_by_doc, ml_metrics = train_and_predict(features_path, args.ml_threshold)
         print()
 
@@ -198,9 +289,9 @@ def main():
     validation_results = []
 
     for stem in doc_stems:
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(f"{stem}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         
         raw_input = os.path.join(args.raw_ocr_dir, f"{stem}.json")
         classify_out = os.path.join(args.results_dir, f"{stem}_classification.json")
@@ -222,12 +313,10 @@ def main():
                     continue
             except Exception as e:
                 print(f"  [Error] Classification failed: {e}")
-                # We attempt to continue, but subsequent steps might fail if classify_out is missing
                 
         # STEP 2: TITLE
         if args.step in ["title", "all"]:
             print("[2: Title]")
-            # Robust loading of classification result
             try:
                 result = load_classification_result(classify_out)
             except Exception as e:
@@ -239,7 +328,6 @@ def main():
             if doc_type == 'no_title':
                 with open(title_out, 'w') as f: json.dump([], f)
             else:
-                # This function now has internal try/catch for JSON errors
                 extract_title_from_first_page(raw_input, title_out)
 
         # STEP 3: STRUCTURE
@@ -258,8 +346,6 @@ def main():
                 print(f"  [Skip] Organized output not found.")
             else:
                 if stem not in sections_to_keep_by_doc:
-                    # If ML failed or this doc wasn't in training set, preserve original
-                    import shutil
                     shutil.copy(organized_out, ml_filtered_out)
                 else:
                     try:
@@ -276,15 +362,14 @@ def main():
                             json.dump({'page_metadata': page_metadata, 'elements': reclassified_elements}, f, indent=4)
                     except Exception as e:
                         print(f"  [Error] ML Reclassify failed: {e}")
-                        import shutil
                         shutil.copy(organized_out, ml_filtered_out)
 
-        # STEP 5: ASSETS
+        # STEP 5: ASSETS (using YOLO exports or manual exports)
         if args.step in ["assets", "all"]:
             print("[5: Assets]")
             input_file = ml_filtered_out if os.path.exists(ml_filtered_out) else organized_out
             if os.path.exists(input_file):
-                run_asset_integration(input_file, with_assets_out, args.figures_dir, stem, positioning_mode="bbox")
+                run_asset_integration(input_file, with_assets_out, figures_dir, stem, positioning_mode="bbox")
             else:
                 print(f"  [Skip] Input file for assets not found: {input_file}")
 
@@ -293,7 +378,7 @@ def main():
             print("[6: Tables]")
             input_file = with_assets_out if os.path.exists(with_assets_out) else ml_filtered_out
             if os.path.exists(input_file):
-                run_table_processing_on_file(input_file, tables_out, args.figures_dir, stem, LLM_CONFIG, use_llm_ocr=not args.no_table_ocr)
+                run_table_processing_on_file(input_file, tables_out, figures_dir, stem, LLM_CONFIG, use_llm_ocr=not args.no_table_ocr)
             else:
                 print(f"  [Skip] Input file for tables not found: {input_file}")
 
@@ -302,7 +387,7 @@ def main():
             print("[7: Write]")
             input_file = tables_out if os.path.exists(tables_out) else with_assets_out
             if os.path.exists(input_file):
-                run_docx_creation(input_file, final_docx, args.figures_dir, stem, title_out)
+                run_docx_creation(input_file, final_docx, figures_dir, stem, title_out)
             else:
                 print(f"  [Skip] Input file for write not found: {input_file}")
 
@@ -326,11 +411,10 @@ def main():
     # FINAL SUMMARY
     # ==========================================================================
     
-    # 1. TOC Validation Summary
     if validation_results:
-        print("="*60)
+        print("=" * 60)
         print("TOC VALIDATION SUMMARY")
-        print("="*60)
+        print("=" * 60)
         docs_with_toc = [r for r in validation_results if r['has_toc']]
         if docs_with_toc:
             avg_cov = sum(r['toc_coverage'] for r in docs_with_toc) / len(docs_with_toc)
@@ -339,17 +423,15 @@ def main():
             print(f"Avg TOC Match:     {avg_cov:.1f}%")
             print(f"Avg Precision:     {avg_prec:.1f}%")
 
-    # 2. ML Performance Summary
     if ml_metrics:
         val = ml_metrics.get('val', {})
         train = ml_metrics.get('train', {})
         
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("ML MODEL PERFORMANCE")
-        print("="*60)
+        print("=" * 60)
         
         print("1. VALIDATION (80/20 SPLIT)")
-        print(f"   (How well the model generalizes to unseen data)")
         print(f"   Accuracy:  {val.get('accuracy', 0):.1%}")
         print(f"   Precision: {val.get('precision', 0):.3f}")
         print(f"   Recall:    {val.get('recall', 0):.3f}")
@@ -357,11 +439,10 @@ def main():
         
         if 'confusion' in val:
             tn, fp, fn, tp = val['confusion'].ravel()
-            print(f"   Confusion: TP={tp} (Valid kept), FP={fp} (Junk kept)")
-            print(f"              TN={tn} (Junk removed), FN={fn} (Valid removed)")
+            print(f"   Confusion: TP={tp}, FP={fp}, TN={tn}, FN={fn}")
 
         print("\n2. FINAL MODEL (100% TRAINING DATA)")
-        print(f"   (The model actually used for processing {train.get('total_samples', 0)} labeled rows)")
+        print(f"   Samples:   {train.get('total_samples', 0)}")
         print(f"   Precision: {train.get('precision', 0):.3f}")
         print(f"   Recall:    {train.get('recall', 0):.3f}")
         print(f"   F1 Score:  {train.get('f1', 0):.3f}")
@@ -370,4 +451,27 @@ def main():
 
 
 if __name__ == '__main__':
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Document processing pipeline with YOLO integration")
+    parser.add_argument('--step', type=str, default='all',
+                       help="Step to run: classify, title, structure, ml_filter, yolo, assets, tables, write, validate, all")
+    parser.add_argument('--skip-yolo', action='store_true',
+                       help="Skip YOLO extraction (use manual exports)")
+    parser.add_argument('--yolo-conf', type=float, default=0.25,
+                       help="YOLO confidence threshold")
+    parser.add_argument('--yolo-device', type=str, default='cpu',
+                       help="YOLO device: cpu, cuda:0, or mps")
+    parser.add_argument('--force-yolo', action='store_true',
+                       help="Force re-run YOLO even if exports exist")
+    
+    args = parser.parse_args()
+    
+    # Apply CLI args to config
+    Config.step = args.step
+    Config.use_yolo = not args.skip_yolo
+    Config.yolo_confidence = args.yolo_conf
+    Config.yolo_device = args.yolo_device
+    Config.skip_yolo_if_exists = not args.force_yolo
+    
     main()
