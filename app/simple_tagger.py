@@ -204,123 +204,137 @@ class DocLayoutTagger:
         ttk.Button(nav_frame, text="Last ▶▶", command=self.last_image, style='Nav.TButton').pack(side=tk.RIGHT, padx=2)
         ttk.Button(nav_frame, text="Skip (Space)", command=self.skip_to_unlabeled, style='Nav.TButton').pack(side=tk.RIGHT, padx=20)
         
-        # ===== RIGHT PANEL (Controls) =====
-        right_frame = ttk.Frame(main_frame, width=380)
-        right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
-        right_frame.pack_propagate(False)
+        # ===== RIGHT PANEL (Controls) - Make scrollable =====
+        right_outer = ttk.Frame(main_frame, width=350)
+        right_outer.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
+        right_outer.pack_propagate(False)
         
-        # -- Directory Selection --
-        dir_frame = ttk.LabelFrame(right_frame, text="Directories", padding=10)
-        dir_frame.pack(fill=tk.X, pady=(0, 10))
+        # Create canvas for scrolling
+        right_canvas = tk.Canvas(right_outer, highlightthickness=0, width=330)
+        right_scrollbar = ttk.Scrollbar(right_outer, orient="vertical", command=right_canvas.yview)
+        right_frame = ttk.Frame(right_canvas)
         
-        ttk.Button(dir_frame, text="📁 Select Image Folder", command=self._select_image_dir).pack(fill=tk.X, pady=2)
-        self.dir_display = ttk.Label(dir_frame, text="...", wraplength=340)
-        self.dir_display.pack(fill=tk.X, pady=2)
+        right_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        right_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        right_canvas_window = right_canvas.create_window((0, 0), window=right_frame, anchor="nw")
         
-        # -- Class Selection (scrollable for 10 classes) --
-        class_frame = ttk.LabelFrame(right_frame, text="Select Class (then draw box)", padding=10)
-        class_frame.pack(fill=tk.X, pady=(0, 10))
+        right_canvas.configure(yscrollcommand=right_scrollbar.set)
         
-        # Create scrollable frame for classes
-        class_canvas = tk.Canvas(class_frame, height=200, highlightthickness=0)
-        class_scrollbar = ttk.Scrollbar(class_frame, orient="vertical", command=class_canvas.yview)
-        class_inner = ttk.Frame(class_canvas)
+        def configure_scroll(event):
+            right_canvas.configure(scrollregion=right_canvas.bbox("all"))
+        right_frame.bind("<Configure>", configure_scroll)
         
-        class_canvas.configure(yscrollcommand=class_scrollbar.set)
-        class_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        class_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        class_canvas.create_window((0, 0), window=class_inner, anchor="nw")
+        def configure_width(event):
+            right_canvas.itemconfig(right_canvas_window, width=event.width)
+        right_canvas.bind("<Configure>", configure_width)
         
-        self.class_var = tk.IntVar(value=5)  # Default to table
-        self.class_buttons = {}
+        # Mouse wheel scrolling for right panel
+        def on_right_mousewheel(event):
+            right_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        right_canvas.bind("<MouseWheel>", on_right_mousewheel)
+        right_frame.bind("<MouseWheel>", on_right_mousewheel)
         
-        for class_id, (name, color, key) in CLASSES.items():
-            btn_frame = ttk.Frame(class_inner)
-            btn_frame.pack(fill=tk.X, pady=1)
-            
-            # Color swatch
-            swatch = tk.Canvas(btn_frame, width=20, height=20, bg=color, highlightthickness=1)
-            swatch.pack(side=tk.LEFT, padx=(0, 5))
-            
-            # Radio button with hotkey
-            rb = ttk.Radiobutton(
-                btn_frame, 
-                text=f"{key}: {name}",
-                variable=self.class_var,
-                value=class_id,
-                command=lambda cid=class_id: self._select_class(cid)
-            )
-            rb.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            self.class_buttons[class_id] = rb
+        # -- Model & Auto-Label (TOP PRIORITY) --
+        model_frame = ttk.LabelFrame(right_frame, text="🤖 Auto-Label", padding=8)
+        model_frame.pack(fill=tk.X, pady=(0, 8))
         
-        class_inner.update_idletasks()
-        class_canvas.configure(scrollregion=class_canvas.bbox("all"))
-        
-        # -- Current Labels --
-        labels_frame = ttk.LabelFrame(right_frame, text="Labels on Current Image", padding=10)
-        labels_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-        
-        # Listbox with scrollbar
-        list_container = ttk.Frame(labels_frame)
-        list_container.pack(fill=tk.BOTH, expand=True)
-        
-        self.labels_listbox = tk.Listbox(list_container, font=('Consolas', 9), selectmode=tk.SINGLE)
-        self.labels_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        list_scroll = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=self.labels_listbox.yview)
-        list_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.labels_listbox.config(yscrollcommand=list_scroll.set)
-        
-        # Label actions
-        label_btn_frame = ttk.Frame(labels_frame)
-        label_btn_frame.pack(fill=tk.X, pady=(5, 0))
-        
-        ttk.Button(label_btn_frame, text="🗑 Delete Selected", command=self._delete_selected_label).pack(side=tk.LEFT, padx=2)
-        ttk.Button(label_btn_frame, text="🗑 Clear All", command=self._clear_all_labels).pack(side=tk.LEFT, padx=2)
-        
-        # -- Statistics --
-        stats_frame = ttk.LabelFrame(right_frame, text="Statistics", padding=10)
-        stats_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        self.stats_text = tk.Text(stats_frame, height=8, font=('Consolas', 8), state='disabled', bg='#f5f5f5')
-        self.stats_text.pack(fill=tk.X)
-        
-        # -- Quick Actions --
-        action_frame = ttk.LabelFrame(right_frame, text="Actions", padding=10)
-        action_frame.pack(fill=tk.X)
-        
-        # Auto-label button (prominent)
         self.auto_label_btn = ttk.Button(
-            action_frame, 
-            text="🤖 Auto-Label (A)", 
+            model_frame, 
+            text="Auto-Label This Image (A)", 
             command=self.auto_label,
             style='Action.TButton'
         )
         self.auto_label_btn.pack(fill=tk.X, pady=2)
         
-        # Model status indicator
-        self.model_status = ttk.Label(action_frame, text="Model: Not loaded", font=('Segoe UI', 8))
-        self.model_status.pack(fill=tk.X, pady=(0, 5))
+        self.model_status = ttk.Label(model_frame, text="Model: Not loaded", font=('Segoe UI', 8))
+        self.model_status.pack(fill=tk.X)
         
-        ttk.Button(action_frame, text="💾 Save Labels (S)", command=self.save_labels, style='Action.TButton').pack(fill=tk.X, pady=2)
-        ttk.Button(action_frame, text="🔄 Reload Image (R)", command=self.reload_image, style='Action.TButton').pack(fill=tk.X, pady=2)
-        ttk.Button(action_frame, text="📂 Load Model...", command=self._select_model_file).pack(fill=tk.X, pady=2)
+        ttk.Button(model_frame, text="📂 Load Model...", command=self._select_model_file).pack(fill=tk.X, pady=(4,0))
         
-        # -- Instructions --
-        instr_frame = ttk.LabelFrame(right_frame, text="Shortcuts", padding=10)
-        instr_frame.pack(fill=tk.X, pady=(10, 0))
+        # -- Directory Selection (compact) --
+        dir_frame = ttk.LabelFrame(right_frame, text="Directory", padding=8)
+        dir_frame.pack(fill=tk.X, pady=(0, 8))
         
-        instructions = """
-← / → : Navigate images
-Space : Skip to next unlabeled
-A : Auto-label current image
-1-9, 0 : Select class
-S : Save current labels
-R : Reload current image
-Delete : Remove last box
-Escape : Cancel drawing
-        """.strip()
+        ttk.Button(dir_frame, text="📁 Select Image Folder", command=self._select_image_dir).pack(fill=tk.X)
+        self.dir_display = ttk.Label(dir_frame, text="...", wraplength=300, font=('Segoe UI', 8))
+        self.dir_display.pack(fill=tk.X)
         
+        # -- Class Selection (compact) --
+        class_frame = ttk.LabelFrame(right_frame, text="Class (1-9, 0)", padding=8)
+        class_frame.pack(fill=tk.X, pady=(0, 8))
+        
+        self.class_var = tk.IntVar(value=5)  # Default to table
+        self.class_buttons = {}
+        
+        # Create 2-column grid for classes
+        class_grid = ttk.Frame(class_frame)
+        class_grid.pack(fill=tk.X)
+        
+        for i, (class_id, (name, color, key)) in enumerate(CLASSES.items()):
+            row = i // 2
+            col = i % 2
+            
+            btn_frame = ttk.Frame(class_grid)
+            btn_frame.grid(row=row, column=col, sticky='w', pady=1, padx=2)
+            
+            # Color swatch (smaller)
+            swatch = tk.Canvas(btn_frame, width=12, height=12, bg=color, highlightthickness=1)
+            swatch.pack(side=tk.LEFT, padx=(0, 3))
+            
+            # Radio button with hotkey
+            rb = ttk.Radiobutton(
+                btn_frame, 
+                text=f"{key}:{name[:8]}",  # Truncate long names
+                variable=self.class_var,
+                value=class_id,
+                command=lambda cid=class_id: self._select_class(cid)
+            )
+            rb.pack(side=tk.LEFT)
+            self.class_buttons[class_id] = rb
+        
+        # -- Current Labels (compact) --
+        labels_frame = ttk.LabelFrame(right_frame, text="Current Labels", padding=8)
+        labels_frame.pack(fill=tk.X, pady=(0, 8))
+        
+        # Listbox with scrollbar (shorter)
+        list_container = ttk.Frame(labels_frame)
+        list_container.pack(fill=tk.X)
+        
+        self.labels_listbox = tk.Listbox(list_container, font=('Consolas', 8), selectmode=tk.SINGLE, height=6)
+        self.labels_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        list_scroll = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=self.labels_listbox.yview)
+        list_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.labels_listbox.config(yscrollcommand=list_scroll.set)
+        
+        # Label actions (horizontal)
+        label_btn_frame = ttk.Frame(labels_frame)
+        label_btn_frame.pack(fill=tk.X, pady=(4, 0))
+        
+        ttk.Button(label_btn_frame, text="Delete Sel", command=self._delete_selected_label, width=10).pack(side=tk.LEFT, padx=1)
+        ttk.Button(label_btn_frame, text="Clear All", command=self._clear_all_labels, width=10).pack(side=tk.LEFT, padx=1)
+        
+        # -- Quick Actions (compact) --
+        action_frame = ttk.LabelFrame(right_frame, text="Actions", padding=8)
+        action_frame.pack(fill=tk.X, pady=(0, 8))
+        
+        btn_row = ttk.Frame(action_frame)
+        btn_row.pack(fill=tk.X)
+        ttk.Button(btn_row, text="💾 Save (S)", command=self.save_labels, width=12).pack(side=tk.LEFT, padx=1)
+        ttk.Button(btn_row, text="🔄 Reload (R)", command=self.reload_image, width=12).pack(side=tk.LEFT, padx=1)
+        
+        # -- Statistics (compact) --
+        stats_frame = ttk.LabelFrame(right_frame, text="Stats", padding=8)
+        stats_frame.pack(fill=tk.X, pady=(0, 8))
+        
+        self.stats_text = tk.Text(stats_frame, height=5, font=('Consolas', 8), state='disabled', bg='#f5f5f5')
+        self.stats_text.pack(fill=tk.X)
+        
+        # -- Instructions (compact) --
+        instr_frame = ttk.LabelFrame(right_frame, text="Keys", padding=8)
+        instr_frame.pack(fill=tk.X)
+        
+        instructions = "←/→:Nav | Space:Skip | A:AutoLabel\n1-0:Class | S:Save | Del:Remove"
         ttk.Label(instr_frame, text=instructions, font=('Consolas', 8), justify=tk.LEFT).pack(anchor='w')
     
     def _bind_keys(self):
