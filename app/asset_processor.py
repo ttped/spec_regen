@@ -33,22 +33,26 @@ def extract_asset_bbox_raw(meta: Dict) -> Optional[Dict]:
     Extract bbox from asset metadata WITHOUT any scaling or normalization.
     Returns the raw bbox values as they appear in the metadata.
     
-    We accept whatever coordinate system the asset uses - the key purpose
-    is just to have SOME position for page-level grouping.
+    Compatible with:
+    - YOLO output (bbox.pixels = [x, y, w, h])
+    - Manual exports (bbox.pdf_units = [x, y, w, h])
+    - Simple lists (bbox = [x, y, w, h])
     """
     bbox_data = meta.get('bbox', {})
     
-    # Try different bbox formats - just extract raw values
     raw_bbox = None
     bbox_source = None
     
+    # Case 1: Nested dictionary (YOLO or Manual Export)
     if isinstance(bbox_data, dict):
-        if 'pdf_units' in bbox_data:
-            raw_bbox = bbox_data['pdf_units']
-            bbox_source = 'pdf_units'
-        elif 'pixels' in bbox_data:
+        if 'pixels' in bbox_data:
             raw_bbox = bbox_data['pixels']
             bbox_source = 'pixels'
+        elif 'pdf_units' in bbox_data:
+            raw_bbox = bbox_data['pdf_units']
+            bbox_source = 'pdf_units'
+        
+    # Case 2: Direct list (Simple format)
     elif isinstance(bbox_data, list):
         raw_bbox = bbox_data
         bbox_source = 'direct'
@@ -56,8 +60,7 @@ def extract_asset_bbox_raw(meta: Dict) -> Optional[Dict]:
     if not raw_bbox or len(raw_bbox) < 4:
         return None
     
-    # Just store the raw values - interpret as [x, y, width, height]
-    # Don't try to detect or convert formats
+    # Interpret as [x, y, width, height]
     x, y, w, h = raw_bbox[0], raw_bbox[1], raw_bbox[2], raw_bbox[3]
     
     return {
@@ -68,28 +71,26 @@ def extract_asset_bbox_raw(meta: Dict) -> Optional[Dict]:
         "right": x + w,
         "bottom": y + h,
         "_source": bbox_source,
-        "_raw": raw_bbox  # Keep original for debugging
+        "_raw": raw_bbox
     }
 
 
 def load_all_assets(exports_dir: str, doc_stem: str) -> List[Dict]:
     """
     Load all figure/table assets for a document.
-    
-    Args:
-        exports_dir: Base directory containing exported assets
-        doc_stem: Document stem name (subdirectory name)
-    
-    Returns:
-        List of asset dictionaries with raw bbox (no normalization)
     """
     assets = []
+    
+    # Construct full path to the document's asset folder
     asset_dir = os.path.join(exports_dir, doc_stem)
     
     if not os.path.isdir(asset_dir):
-        print(f"    [Note] No asset directory found at: {asset_dir}")
+        print(f"    [Note] Asset directory not found: {asset_dir}")
         return assets
     
+    print(f"    Scanning for assets in: {asset_dir}")
+    
+    loaded_count = 0
     for filename in os.listdir(asset_dir):
         if not filename.endswith(".json"):
             continue
@@ -100,33 +101,30 @@ def load_all_assets(exports_dir: str, doc_stem: str) -> List[Dict]:
         if not meta:
             continue
         
-        # Normalize the asset type
-        asset_type = meta.get("asset_type", "").lower()
-        if asset_type == "fig":
+        # Normalize the asset type (handle YOLO 'fig'/'tab' vs full names)
+        raw_type = meta.get("asset_type", "").lower()
+        if raw_type in ["fig", "figure"]:
             meta['type'] = 'figure'
-        elif asset_type == "tab":
+        elif raw_type in ["tab", "table"]:
             meta['type'] = 'table'
         else:
-            meta['type'] = 'figure'  # Default
+            meta['type'] = 'figure'  # Default fallback
         
-        # Extract raw bbox (no scaling)
+        # Extract raw bbox
         bbox = extract_asset_bbox_raw(meta)
         if bbox:
             meta['bbox'] = bbox
         
-        # Get page number
-        page = meta.get('page', 9999)
-        meta['page_number'] = page  # Normalize key name
-        
-        # Store export info for reference
-        export_info = meta.get('export', {})
-        meta['_export_dpi'] = export_info.get('dpi')
+        # Get page number (normalize key)
+        page = meta.get('page', meta.get('page_number', 9999))
+        meta['page_number'] = page
         
         assets.append(meta)
+        loaded_count += 1
     
     fig_count = sum(1 for a in assets if a['type'] == 'figure')
     tab_count = sum(1 for a in assets if a['type'] == 'table')
-    print(f"    Loaded {len(assets)} assets ({fig_count} figures, {tab_count} tables)")
+    print(f"    Loaded {loaded_count} assets ({fig_count} figures, {tab_count} tables)")
     
     return assets
 
@@ -137,84 +135,92 @@ def integrate_assets_with_elements(
     page_metadata: Optional[Dict] = None
 ) -> List[Dict]:
     """
-    Merge assets into the element stream while PRESERVING the original element order.
+    Merge assets into the element stream by INTERLEAVING them based on vertical position.
     
-    Strategy:
-    - The OCR elements (sections, text blocks) maintain their exact order
-    - Assets are inserted at the END of each page's elements
-    - Within a page's assets, they are sorted by their raw 'top' value
-    
-    This ensures section ordering is never disrupted by asset integration.
-    
-    Args:
-        elements: List of section/text block elements from section_processor (order is preserved)
-        assets: List of figure/table assets
-        page_metadata: Optional dict of page-level metadata (for debugging)
-    
-    Returns:
-        Combined list with assets inserted after each page's elements
+    Algorithm:
+    1. Sort assets for a page by their 'top' (Y) coordinate.
+    2. Iterate through text elements.
+    3. If an asset's 'top' is LESS than the current text element's 'top', insert it BEFORE.
+    4. Any remaining assets for the page are appended at the end of the page.
     """
     if not assets:
         return elements
     
-    # Debug logging
-    elements_with_bbox = sum(1 for e in elements if e.get('bbox'))
-    assets_with_bbox = sum(1 for a in assets if a.get('bbox'))
-    print(f"    Elements with bbox: {elements_with_bbox}/{len(elements)}")
-    print(f"    Assets with bbox: {assets_with_bbox}/{len(assets)}")
-    
-    # Group assets by page
+    # 1. Group assets by page and SORT by Top position
     assets_by_page: Dict[int, List[Dict]] = {}
     for asset in assets:
-        page = asset.get('page_number', asset.get('page', 9999))
-        if isinstance(page, str):
-            try:
-                page = int(page)
-            except ValueError:
-                page = 9999
-        
+        # Robust page parsing
+        page = asset.get('page_number', 9999)
+        if isinstance(page, str) and page.isdigit():
+            page = int(page)
+        elif not isinstance(page, int):
+            page = 9999
+            
         if page not in assets_by_page:
             assets_by_page[page] = []
         assets_by_page[page].append(asset)
     
-    # Sort assets within each page by their top position (for consistent ordering)
+    # Sort assets within each page strictly by 'top' position
     for page in assets_by_page:
         assets_by_page[page].sort(key=lambda a: a.get('bbox', {}).get('top', 9999))
     
-    # Build result by going through elements and inserting assets at page boundaries
     result = []
     current_page = None
     
-    for i, element in enumerate(elements):
-        elem_page = element.get('page_number', element.get('page', 9999))
-        if isinstance(elem_page, str):
-            try:
-                elem_page = int(elem_page)
-            except ValueError:
-                elem_page = 9999
+    # 2. Iterate through existing text elements
+    for element in elements:
+        elem_page = element.get('page_number', 9999)
+        if isinstance(elem_page, str) and elem_page.isdigit():
+            elem_page = int(elem_page)
         
-        # Check if we've moved to a new page
+        # If we moved to a NEW page, flush any remaining assets from the PREVIOUS page
         if current_page is not None and elem_page != current_page:
-            # Insert any assets from the previous page
             if current_page in assets_by_page:
-                page_assets = assets_by_page.pop(current_page)
-                result.extend(page_assets)
-                print(f"    Inserted {len(page_assets)} assets after page {current_page}")
+                remaining_assets = assets_by_page.pop(current_page)
+                if remaining_assets:
+                    result.extend(remaining_assets)
+                    # print(f"      + Flushed {len(remaining_assets)} assets at end of page {current_page}")
         
         current_page = elem_page
+        
+        # 3. Check if any assets on CURRENT page belong BEFORE this element
+        if current_page in assets_by_page:
+            page_assets = assets_by_page[current_page]
+            
+            # Get current element's top position
+            elem_top = element.get('bbox', {}).get('top', float('inf'))
+            
+            # Identify assets that appear visibly "above" this text block
+            # We use a slight buffer (e.g. -10) just in case they overlap slightly
+            assets_to_insert = []
+            while page_assets:
+                next_asset = page_assets[0]
+                asset_top = next_asset.get('bbox', {}).get('top', 9999)
+                
+                if asset_top < elem_top:
+                    assets_to_insert.append(page_assets.pop(0))
+                else:
+                    # Next asset is below this text, stop checking
+                    break
+            
+            if assets_to_insert:
+                result.extend(assets_to_insert)
+                # print(f"      + Interleaved {len(assets_to_insert)} assets before text at Y={elem_top}")
+
+        # Add the text element itself
         result.append(element)
     
-    # Insert assets for the last page
+    # 4. Handle assets for the very last page processed
     if current_page is not None and current_page in assets_by_page:
-        page_assets = assets_by_page.pop(current_page)
-        result.extend(page_assets)
-        print(f"    Inserted {len(page_assets)} assets after page {current_page}")
+        remaining = assets_by_page.pop(current_page)
+        result.extend(remaining)
+        # print(f"      + Flushed {len(remaining)} assets at end of doc")
     
-    # Add any remaining assets (from pages that had no elements)
+    # 5. Handle orphaned assets (pages with no text elements at all)
     for page in sorted(assets_by_page.keys()):
         page_assets = assets_by_page[page]
         result.extend(page_assets)
-        print(f"    Inserted {len(page_assets)} assets from page {page} (no elements on this page)")
+        print(f"      + Added {len(page_assets)} assets to text-less page {page}")
     
     return result
 
@@ -227,16 +233,9 @@ def run_asset_integration(
     positioning_mode: str = "bbox"
 ):
     """
-    Main function to load sections and integrate assets.
-    
-    Args:
-        input_path: Path to organized sections JSON (from section_processor)
-        output_path: Path to save integrated output
-        exports_dir: Base directory for exported figures/tables
-        doc_stem: Document stem name
-        positioning_mode: Ignored (kept for API compatibility) - always preserves element order
+    Main function to integrate assets.
     """
-    print(f"  - Loading sections from: {input_path}")
+    print(f"  - Reading structure: {input_path}")
     
     if not os.path.exists(input_path):
         print(f"  - [Error] Input file not found: {input_path}")
@@ -245,39 +244,33 @@ def run_asset_integration(
     with open(input_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
     
-    # Handle new output format with page_metadata and elements
+    # Handle structure formats
     if isinstance(data, dict) and 'elements' in data:
         elements = data.get('elements', [])
         page_metadata = data.get('page_metadata', {})
-        print(f"  - Found {len(elements)} section elements")
     else:
-        # Old format - just a list of elements
         elements = data if isinstance(data, list) else []
         page_metadata = {}
-        print(f"  - Found {len(elements)} section elements (legacy format)")
     
-    # Load assets (with raw bboxes)
-    print(f"  - Loading assets from: {exports_dir}/{doc_stem}")
+    # Load assets
     assets = load_all_assets(exports_dir, doc_stem)
     
-    # Integrate - preserves element order, inserts assets at page boundaries
-    print(f"  - Integrating assets (preserving element order)")
+    # Integrate
     integrated = integrate_assets_with_elements(elements, assets, page_metadata)
     
-    # Prepare output - preserve page_metadata for downstream use
+    # Save
     output_data = {
         "page_metadata": page_metadata,
         "elements": integrated
     }
     
-    # Save result
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(output_data, f, indent=4)
     
     asset_count = sum(1 for e in integrated if e.get('type') in ('figure', 'table'))
-    print(f"  - Saved {len(integrated)} elements ({asset_count} assets integrated)")
-    print(f"  - Output: {output_path}")
+    print(f"  - Saved to: {output_path}")
+    print(f"  - Final Element Count: {len(integrated)} (Integrated {asset_count} assets)")
 
 
 if __name__ == '__main__':
