@@ -1,15 +1,34 @@
 """
-Improved YOLO Labeling Tool for PDF Document Elements
-======================================================
-A user-friendly tool for labeling tables and images in PDF page images.
+DocLayout-YOLO Labeling Tool with Auto-Label
+=============================================
+A labeling tool configured for DocLayout-YOLO DocStructBench classes.
+Includes auto-labeling using the pre-trained model for faster annotation.
 
 Features:
+- 10 classes matching DocStructBench model
+- AUTO-LABEL: Use pre-trained model to generate initial labels
 - Clear visual interface with instructions
 - Navigation buttons and keyboard shortcuts
 - Progress tracking and statistics
 - View/edit existing labels
 - Zoom controls
-- Dark mode option
+
+Classes (matching DocLayout-YOLO DocStructBench):
+  0: title           - Document titles, section headers
+  1: plain text      - Regular paragraph text  
+  2: abandon         - Artifacts, noise, page numbers, headers/footers
+  3: figure          - Images, photos, illustrations
+  4: figure_caption  - Captions below/above figures
+  5: table           - Data tables
+  6: table_caption   - Captions for tables
+  7: table_footnote  - Footnotes within tables
+  8: isolate_formula - Mathematical formulas
+  9: formula_caption - Captions for formulas
+
+Setup for Auto-Label:
+  1. pip install doclayout-yolo
+  2. Download model from HuggingFace: juliozhao/DocLayout-YOLO-DocStructBench
+  3. Place .pt file in same directory as this script, or set MODEL_PATH below
 """
 
 import tkinter as tk
@@ -19,6 +38,14 @@ import os
 import glob
 from pathlib import Path
 from datetime import datetime
+
+# Try to import DocLayout-YOLO (optional - only needed for auto-label)
+DOCLAYOUT_AVAILABLE = False
+try:
+    from doclayout_yolo import YOLOv10
+    DOCLAYOUT_AVAILABLE = True
+except ImportError:
+    pass
 
 # ================= CONFIGURATION =================
 def get_paths():
@@ -34,25 +61,42 @@ def get_paths():
 
 DEFAULT_IMAGE_DIR, DEFAULT_LABELS_DIR, DEFAULT_CROPS_DIR = get_paths()
 
+# DocLayout-YOLO DocStructBench classes
+# Format: class_id: (name, color, hotkey)
 CLASSES = {
-    0: ("Table", "#FF6B6B", "t"),      # Red for tables
-    1: ("Image", "#4ECDC4", "i"),      # Teal for images
-    2: ("Chart", "#FFE66D", "c"),      # Yellow for charts (optional)
-    3: ("Diagram", "#95E1D3", "d"),    # Green for diagrams (optional)
-    4: ("Text", "#888888", "x"),       # Gray for text blocks (negative class)
+    0: ("title", "#E74C3C", "1"),            # Red - titles/headers
+    1: ("plain_text", "#3498DB", "2"),       # Blue - regular paragraphs
+    2: ("abandon", "#95A5A6", "3"),          # Gray - noise/artifacts
+    3: ("figure", "#2ECC71", "4"),           # Green - images/illustrations
+    4: ("figure_caption", "#27AE60", "5"),   # Dark green - figure captions
+    5: ("table", "#9B59B6", "6"),            # Purple - tables
+    6: ("table_caption", "#8E44AD", "7"),    # Dark purple - table captions
+    7: ("table_footnote", "#D35400", "8"),   # Orange - table footnotes
+    8: ("isolate_formula", "#F39C12", "9"),  # Yellow - formulas
+    9: ("formula_caption", "#E67E22", "0"),  # Dark yellow - formula captions
 }
 
 # Reverse lookup: key -> class_id
 KEY_TO_CLASS = {v[2]: k for k, v in CLASSES.items()}
+
+# ===== MODEL CONFIGURATION =====
+# Path to DocLayout-YOLO model file (.pt)
+# Options:
+#   1. Place model in same directory as this script
+#   2. Set full path below
+#   3. Will search common locations automatically
+MODEL_PATH = None  # Set this to your model path, e.g. "/path/to/doclayout_yolo_docstructbench_imgsz1024.pt"
+MODEL_CONFIDENCE = 0.25  # Confidence threshold for auto-labeling
+MODEL_IMAGE_SIZE = 1024  # Image size for inference
 # =================================================
 
 
-class ImprovedTagger:
+class DocLayoutTagger:
     def __init__(self, root):
         self.root = root
-        self.root.title("YOLO Document Labeler")
-        self.root.geometry("1400x900")
-        self.root.minsize(1000, 700)
+        self.root.title("DocLayout-YOLO Labeler")
+        self.root.geometry("1500x950")
+        self.root.minsize(1200, 800)
         
         # State
         self.image_list = []
@@ -62,7 +106,11 @@ class ImprovedTagger:
         self.current_rect = None
         self.start_x = None
         self.start_y = None
-        self.selected_class = 0  # Default to Table
+        self.selected_class = 5  # Default to table (most common use case)
+        
+        # Model for auto-labeling
+        self.model = None
+        self.model_loaded = False
         
         # Directories
         self.img_dir = str(DEFAULT_IMAGE_DIR)
@@ -76,6 +124,9 @@ class ImprovedTagger:
         
         # Try to load images
         self._load_directory()
+        
+        # Try to load model in background
+        self._try_load_model()
     
     def _setup_styles(self):
         """Configure ttk styles for a modern look."""
@@ -154,7 +205,7 @@ class ImprovedTagger:
         ttk.Button(nav_frame, text="Skip (Space)", command=self.skip_to_unlabeled, style='Nav.TButton').pack(side=tk.RIGHT, padx=20)
         
         # ===== RIGHT PANEL (Controls) =====
-        right_frame = ttk.Frame(main_frame, width=320)
+        right_frame = ttk.Frame(main_frame, width=380)
         right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
         right_frame.pack_propagate(False)
         
@@ -163,34 +214,47 @@ class ImprovedTagger:
         dir_frame.pack(fill=tk.X, pady=(0, 10))
         
         ttk.Button(dir_frame, text="📁 Select Image Folder", command=self._select_image_dir).pack(fill=tk.X, pady=2)
-        self.dir_display = ttk.Label(dir_frame, text="...", wraplength=280)
+        self.dir_display = ttk.Label(dir_frame, text="...", wraplength=340)
         self.dir_display.pack(fill=tk.X, pady=2)
         
-        # -- Class Selection --
+        # -- Class Selection (scrollable for 10 classes) --
         class_frame = ttk.LabelFrame(right_frame, text="Select Class (then draw box)", padding=10)
         class_frame.pack(fill=tk.X, pady=(0, 10))
         
-        self.class_var = tk.IntVar(value=0)
+        # Create scrollable frame for classes
+        class_canvas = tk.Canvas(class_frame, height=200, highlightthickness=0)
+        class_scrollbar = ttk.Scrollbar(class_frame, orient="vertical", command=class_canvas.yview)
+        class_inner = ttk.Frame(class_canvas)
+        
+        class_canvas.configure(yscrollcommand=class_scrollbar.set)
+        class_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        class_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        class_canvas.create_window((0, 0), window=class_inner, anchor="nw")
+        
+        self.class_var = tk.IntVar(value=5)  # Default to table
         self.class_buttons = {}
         
         for class_id, (name, color, key) in CLASSES.items():
-            btn_frame = ttk.Frame(class_frame)
-            btn_frame.pack(fill=tk.X, pady=2)
+            btn_frame = ttk.Frame(class_inner)
+            btn_frame.pack(fill=tk.X, pady=1)
             
             # Color swatch
             swatch = tk.Canvas(btn_frame, width=20, height=20, bg=color, highlightthickness=1)
             swatch.pack(side=tk.LEFT, padx=(0, 5))
             
-            # Radio button
+            # Radio button with hotkey
             rb = ttk.Radiobutton(
                 btn_frame, 
-                text=f"{name} ({key.upper()})",
+                text=f"{key}: {name}",
                 variable=self.class_var,
                 value=class_id,
                 command=lambda cid=class_id: self._select_class(cid)
             )
             rb.pack(side=tk.LEFT, fill=tk.X, expand=True)
             self.class_buttons[class_id] = rb
+        
+        class_inner.update_idletasks()
+        class_canvas.configure(scrollregion=class_canvas.bbox("all"))
         
         # -- Current Labels --
         labels_frame = ttk.LabelFrame(right_frame, text="Labels on Current Image", padding=10)
@@ -200,7 +264,7 @@ class ImprovedTagger:
         list_container = ttk.Frame(labels_frame)
         list_container.pack(fill=tk.BOTH, expand=True)
         
-        self.labels_listbox = tk.Listbox(list_container, font=('Consolas', 10), selectmode=tk.SINGLE)
+        self.labels_listbox = tk.Listbox(list_container, font=('Consolas', 9), selectmode=tk.SINGLE)
         self.labels_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
         list_scroll = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=self.labels_listbox.yview)
@@ -218,34 +282,46 @@ class ImprovedTagger:
         stats_frame = ttk.LabelFrame(right_frame, text="Statistics", padding=10)
         stats_frame.pack(fill=tk.X, pady=(0, 10))
         
-        self.stats_text = tk.Text(stats_frame, height=6, font=('Consolas', 9), state='disabled', bg='#f5f5f5')
+        self.stats_text = tk.Text(stats_frame, height=8, font=('Consolas', 8), state='disabled', bg='#f5f5f5')
         self.stats_text.pack(fill=tk.X)
         
         # -- Quick Actions --
         action_frame = ttk.LabelFrame(right_frame, text="Actions", padding=10)
         action_frame.pack(fill=tk.X)
         
+        # Auto-label button (prominent)
+        self.auto_label_btn = ttk.Button(
+            action_frame, 
+            text="🤖 Auto-Label (A)", 
+            command=self.auto_label,
+            style='Action.TButton'
+        )
+        self.auto_label_btn.pack(fill=tk.X, pady=2)
+        
+        # Model status indicator
+        self.model_status = ttk.Label(action_frame, text="Model: Not loaded", font=('Segoe UI', 8))
+        self.model_status.pack(fill=tk.X, pady=(0, 5))
+        
         ttk.Button(action_frame, text="💾 Save Labels (S)", command=self.save_labels, style='Action.TButton').pack(fill=tk.X, pady=2)
         ttk.Button(action_frame, text="🔄 Reload Image (R)", command=self.reload_image, style='Action.TButton').pack(fill=tk.X, pady=2)
+        ttk.Button(action_frame, text="📂 Load Model...", command=self._select_model_file).pack(fill=tk.X, pady=2)
         
         # -- Instructions --
-        instr_frame = ttk.LabelFrame(right_frame, text="Keyboard Shortcuts", padding=10)
+        instr_frame = ttk.LabelFrame(right_frame, text="Shortcuts", padding=10)
         instr_frame.pack(fill=tk.X, pady=(10, 0))
         
         instructions = """
 ← / → : Navigate images
 Space : Skip to next unlabeled
-T : Select Table class
-I : Select Image class
-C : Select Chart class  
-D : Select Diagram class
+A : Auto-label current image
+1-9, 0 : Select class
 S : Save current labels
 R : Reload current image
 Delete : Remove last box
 Escape : Cancel drawing
         """.strip()
         
-        ttk.Label(instr_frame, text=instructions, font=('Consolas', 9), justify=tk.LEFT).pack(anchor='w')
+        ttk.Label(instr_frame, text=instructions, font=('Consolas', 8), justify=tk.LEFT).pack(anchor='w')
     
     def _bind_keys(self):
         """Set up keyboard shortcuts."""
@@ -259,11 +335,13 @@ Escape : Cancel drawing
         self.root.bind("<S>", lambda e: self.save_labels())
         self.root.bind("<r>", lambda e: self.reload_image())
         self.root.bind("<R>", lambda e: self.reload_image())
+        self.root.bind("<a>", lambda e: self.auto_label())
+        self.root.bind("<A>", lambda e: self.auto_label())
         
-        # Class selection keys
+        # Class selection keys (1-9 and 0)
         for key, class_id in KEY_TO_CLASS.items():
-            self.root.bind(f"<{key}>", lambda e, cid=class_id: self._select_class(cid))
-            self.root.bind(f"<{key.upper()}>", lambda e, cid=class_id: self._select_class(cid))
+            self.root.bind(f"<Key-{key}>", lambda e, cid=class_id: self._select_class(cid))
+            self.root.bind(f"<KeyPad-{key}>", lambda e, cid=class_id: self._select_class(cid))
         
         # Canvas bindings
         self.canvas.bind("<ButtonPress-1>", self._on_mouse_down)
@@ -324,7 +402,7 @@ Escape : Cancel drawing
         self.original_image = Image.open(self.img_path)
         
         # Calculate scale to fit canvas (max 900px height)
-        canvas_h = 700
+        canvas_h = 750
         w, h = self.original_image.size
         self.scale = min(1.0, canvas_h / h)
         
@@ -390,8 +468,8 @@ Escape : Cancel drawing
             dx1, dy1 = x1 * self.scale, y1 * self.scale
             dx2, dy2 = x2 * self.scale, y2 * self.scale
             
-            color = CLASSES.get(class_id, ("Unknown", "#999999", "?"))[1]
-            name = CLASSES.get(class_id, ("Unknown", "#999999", "?"))[0]
+            color = CLASSES.get(class_id, ("unknown", "#999999", "?"))[1]
+            name = CLASSES.get(class_id, ("unknown", "#999999", "?"))[0]
             
             # Draw rectangle
             self.canvas.create_rectangle(
@@ -400,16 +478,18 @@ Escape : Cancel drawing
             )
             
             # Draw label background
+            label_text = f"{i+1}. {name}"
+            label_width = max(80, len(label_text) * 7)
             self.canvas.create_rectangle(
-                dx1, dy1 - 20, dx1 + 80, dy1,
+                dx1, dy1 - 18, dx1 + label_width, dy1,
                 fill=color, outline=color, tags="box_label"
             )
             
             # Draw label text
             self.canvas.create_text(
-                dx1 + 40, dy1 - 10,
-                text=f"{i+1}. {name}",
-                fill="white", font=('Segoe UI', 9, 'bold'),
+                dx1 + label_width/2, dy1 - 9,
+                text=label_text,
+                fill="white", font=('Segoe UI', 8, 'bold'),
                 tags="box_label"
             )
     
@@ -418,7 +498,7 @@ Escape : Cancel drawing
         self.labels_listbox.delete(0, tk.END)
         
         for i, (x1, y1, x2, y2, class_id) in enumerate(self.boxes):
-            name = CLASSES.get(class_id, ("Unknown", "#999999", "?"))[0]
+            name = CLASSES.get(class_id, ("unknown", "#999999", "?"))[0]
             w = int(x2 - x1)
             h = int(y2 - y1)
             self.labels_listbox.insert(tk.END, f"{i+1}. {name} ({w}x{h})")
@@ -443,12 +523,11 @@ Escape : Cancel drawing
                                 label_counts[cid] += 1
         
         # Build stats text
-        stats = f"Total Images:  {total}\n"
-        stats += f"Labeled:       {labeled} ({100*labeled/total:.1f}%)\n"
-        stats += f"Remaining:     {total - labeled}\n"
+        stats = f"Images: {labeled}/{total} labeled\n"
         stats += f"─────────────────────\n"
         for cid, (name, _, _) in CLASSES.items():
-            stats += f"{name}s:  {label_counts[cid]}\n"
+            if label_counts[cid] > 0:
+                stats += f"{name}: {label_counts[cid]}\n"
         
         self.stats_text.config(state='normal')
         self.stats_text.delete('1.0', tk.END)
@@ -460,7 +539,7 @@ Escape : Cancel drawing
         self.selected_class = class_id
         self.class_var.set(class_id)
         name = CLASSES[class_id][0]
-        self.root.title(f"YOLO Document Labeler - Drawing: {name}")
+        self.root.title(f"DocLayout-YOLO Labeler - Drawing: {name}")
     
     # ===== Drawing Methods =====
     
@@ -577,7 +656,7 @@ Escape : Cancel drawing
                 
                 f.write(f"{class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
         
-        # Save crops
+        # Save crops (optional)
         for i, (x1, y1, x2, y2, class_id) in enumerate(self.boxes):
             crop_img = self.original_image.crop((int(x1), int(y1), int(x2), int(y2)))
             class_name = CLASSES[class_id][0]
@@ -653,11 +732,194 @@ Escape : Cancel drawing
             messagebox.showwarning("Invalid", "Please enter a valid number")
         
         self.jump_var.set("")
+    
+    # ===== Model Methods =====
+    
+    def _try_load_model(self):
+        """Try to find and load the DocLayout-YOLO model."""
+        if not DOCLAYOUT_AVAILABLE:
+            self.model_status.config(text="Model: doclayout-yolo not installed")
+            self.auto_label_btn.config(state='disabled')
+            return
+        
+        # Search for model file
+        search_paths = []
+        
+        # User-specified path
+        if MODEL_PATH:
+            search_paths.append(Path(MODEL_PATH))
+        
+        # Same directory as script
+        script_dir = Path(__file__).resolve().parent
+        search_paths.extend([
+            script_dir / "doclayout_yolo_docstructbench_imgsz1024.pt",
+            script_dir / "doclayout_yolo_docstructbench.pt",
+            script_dir / "best.pt",
+            script_dir / "models" / "doclayout_yolo_docstructbench_imgsz1024.pt",
+        ])
+        
+        # Project root
+        project_root = script_dir.parent
+        search_paths.extend([
+            project_root / "models" / "doclayout_yolo_docstructbench_imgsz1024.pt",
+            project_root / "doclayout_yolo_docstructbench_imgsz1024.pt",
+        ])
+        
+        # Try each path
+        for model_path in search_paths:
+            if model_path.exists():
+                self._load_model(str(model_path))
+                return
+        
+        self.model_status.config(text="Model: Not found (click Load Model)")
+    
+    def _load_model(self, model_path: str):
+        """Load the DocLayout-YOLO model from a file."""
+        try:
+            self.model_status.config(text="Model: Loading...")
+            self.root.update()
+            
+            self.model = YOLOv10(model_path)
+            self.model_loaded = True
+            
+            # Shorten path for display
+            display_path = Path(model_path).name
+            self.model_status.config(text=f"Model: ✓ {display_path}")
+            self.auto_label_btn.config(state='normal')
+            
+        except Exception as e:
+            self.model_status.config(text=f"Model: Error - {str(e)[:30]}")
+            self.auto_label_btn.config(state='disabled')
+            messagebox.showerror("Model Error", f"Failed to load model:\n{e}")
+    
+    def _select_model_file(self):
+        """Open dialog to select model file."""
+        file_path = filedialog.askopenfilename(
+            title="Select DocLayout-YOLO Model",
+            filetypes=[("PyTorch Model", "*.pt"), ("All Files", "*.*")],
+            initialdir=Path(__file__).resolve().parent
+        )
+        if file_path:
+            self._load_model(file_path)
+    
+    def auto_label(self):
+        """Run the model on current image and populate boxes."""
+        if not self.model_loaded:
+            messagebox.showwarning(
+                "Model Not Loaded",
+                "Please load a DocLayout-YOLO model first.\n\n"
+                "1. Click 'Load Model...' button\n"
+                "2. Select your .pt model file\n\n"
+                "Download from: huggingface.co/juliozhao/DocLayout-YOLO-DocStructBench"
+            )
+            return
+        
+        if not self.image_list:
+            return
+        
+        # Confirm if there are existing boxes
+        if self.boxes:
+            result = messagebox.askyesnocancel(
+                "Existing Labels",
+                "This image already has labels.\n\n"
+                "Yes = Replace all labels\n"
+                "No = Add to existing labels\n"
+                "Cancel = Abort"
+            )
+            if result is None:  # Cancel
+                return
+            if result:  # Yes - replace
+                self.boxes = []
+        
+        # Update UI
+        self.file_label.config(text=f"{os.path.basename(self.img_path)} - Running model...")
+        self.root.update()
+        
+        try:
+            # Run inference
+            results = self.model.predict(
+                self.img_path,
+                imgsz=MODEL_IMAGE_SIZE,
+                conf=MODEL_CONFIDENCE,
+                device='cpu',  # Use CPU for compatibility
+                verbose=False
+            )
+            
+            # Extract detections
+            detections = results[0].boxes
+            num_added = 0
+            
+            for box in detections:
+                class_id = int(box.cls)
+                confidence = float(box.conf)
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                
+                # Add to boxes
+                self.boxes.append((x1, y1, x2, y2, class_id))
+                num_added += 1
+            
+            # Redraw
+            self._draw_boxes()
+            self._update_labels_list()
+            
+            # Feedback
+            self.file_label.config(
+                text=f"{os.path.basename(self.img_path)} - Auto-labeled: {num_added} boxes"
+            )
+            
+        except Exception as e:
+            messagebox.showerror("Auto-Label Error", f"Failed to run model:\n{e}")
+            self.file_label.config(text=f"{os.path.basename(self.img_path)} - Error")
+    
+    def auto_label_all_unlabeled(self):
+        """Run auto-label on all unlabeled images."""
+        if not self.model_loaded:
+            messagebox.showwarning("Model Not Loaded", "Please load a model first.")
+            return
+        
+        # Count unlabeled
+        unlabeled = []
+        for img_path in self.image_list:
+            txt_filename = os.path.splitext(os.path.basename(img_path))[0] + ".txt"
+            txt_path = os.path.join(self.lbl_dir, txt_filename)
+            if not os.path.exists(txt_path):
+                unlabeled.append(img_path)
+        
+        if not unlabeled:
+            messagebox.showinfo("Done", "All images are already labeled!")
+            return
+        
+        result = messagebox.askyesno(
+            "Auto-Label All",
+            f"Run auto-label on {len(unlabeled)} unlabeled images?\n\n"
+            "This may take a while."
+        )
+        if not result:
+            return
+        
+        # Process each
+        for i, img_path in enumerate(unlabeled):
+            self.file_label.config(text=f"Auto-labeling {i+1}/{len(unlabeled)}...")
+            self.root.update()
+            
+            # Find index and load
+            idx = self.image_list.index(img_path)
+            self.current_index = idx
+            self._load_image()
+            
+            # Auto-label
+            self.auto_label()
+            
+            # Save
+            self.save_labels()
+        
+        messagebox.showinfo("Done", f"Auto-labeled {len(unlabeled)} images!")
+        self._update_stats()
 
 
 def main():
     root = tk.Tk()
-    app = ImprovedTagger(root)
+    app = DocLayoutTagger(root)
     root.mainloop()
 
 
