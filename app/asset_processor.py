@@ -105,31 +105,43 @@ def extract_and_normalize_asset_bbox(meta: Dict) -> Optional[Dict]:
 def get_page_ocr_dimensions(page_metadata: Dict, page_number: int, verbose: bool = False) -> Tuple[Optional[float], Optional[float]]:
     """
     Get the OCR coordinate space dimensions (render_raw) for a page.
+    Handles both string and integer keys in page_metadata.
     """
-    page_key = str(page_number)
+    # Try both string and int versions of the key
+    page_key_str = str(page_number)
+    page_key_int = int(page_number) if isinstance(page_number, (int, str)) else None
+    
+    page_info = None
+    used_key = None
+    
+    # Try string key first (most common in JSON)
+    if page_key_str in page_metadata:
+        page_info = page_metadata[page_key_str]
+        used_key = page_key_str
+    # Try integer key
+    elif page_key_int is not None and page_key_int in page_metadata:
+        page_info = page_metadata[page_key_int]
+        used_key = page_key_int
+    
+    if page_info is None:
+        if verbose:
+            print(f"    [Debug] Page {page_number} NOT FOUND")
+            print(f"    [Debug] Tried keys: '{page_key_str}' (str) and {page_key_int} (int)")
+            sample_keys = list(page_metadata.keys())[:5]
+            print(f"    [Debug] Sample page_metadata keys: {sample_keys}")
+            if sample_keys:
+                print(f"    [Debug] Key types: {[type(k).__name__ for k in sample_keys]}")
+        return None, None
     
     if verbose:
-        print(f"    [Debug] Looking for page {page_number} (key='{page_key}') in page_metadata")
-        print(f"    [Debug] page_metadata keys: {list(page_metadata.keys())[:10]}...")
-    
-    if page_key not in page_metadata:
-        # Also try integer key
-        if page_number in page_metadata:
-            page_key = page_number
-        else:
-            if verbose:
-                print(f"    [Debug] Page {page_number} NOT FOUND in page_metadata")
-            return None, None
-    
-    page_info = page_metadata[page_key]
-    
-    if verbose:
-        print(f"    [Debug] page_info keys: {list(page_info.keys()) if isinstance(page_info, dict) else type(page_info)}")
+        print(f"    [Debug] Found page {page_number} using key '{used_key}'")
     
     image_meta = page_info.get('image_meta', {})
     
-    if verbose:
-        print(f"    [Debug] image_meta keys: {list(image_meta.keys()) if isinstance(image_meta, dict) else type(image_meta)}")
+    if not image_meta:
+        if verbose:
+            print(f"    [Debug] No 'image_meta' in page_info. Keys: {list(page_info.keys())}")
+        return None, None
     
     # Try render_raw first (what OCR uses)
     render_raw = image_meta.get('render_raw', {})
@@ -137,8 +149,6 @@ def get_page_ocr_dimensions(page_metadata: Dict, page_number: int, verbose: bool
         width = render_raw.get('width_px')
         height = render_raw.get('height_px')
         if width and height:
-            if verbose:
-                print(f"    [Debug] Found render_raw: {width} x {height}")
             return width, height
     
     # Fall back to canonical
@@ -147,12 +157,13 @@ def get_page_ocr_dimensions(page_metadata: Dict, page_number: int, verbose: bool
         width = canonical.get('width_px')
         height = canonical.get('height_px')
         if width and height:
-            if verbose:
-                print(f"    [Debug] Found canonical: {width} x {height}")
             return width, height
     
     if verbose:
-        print(f"    [Debug] No dimensions found for page {page_number}")
+        print(f"    [Debug] image_meta exists but no width_px/height_px found")
+        print(f"    [Debug] image_meta keys: {list(image_meta.keys())}")
+        if render_raw:
+            print(f"    [Debug] render_raw keys: {list(render_raw.keys())}")
     
     return None, None
 
@@ -304,7 +315,6 @@ def normalize_all_element_bboxes(
     skipped_no_bbox = 0
     skipped_no_dims = 0
     failed_pages = set()
-    first_failure_logged = False
     
     for i, elem in enumerate(elements):
         bbox = elem.get('bbox')
@@ -314,30 +324,21 @@ def normalize_all_element_bboxes(
         
         page = elem.get('page_number', 9999)
         
-        # On first potential failure, enable verbose to see what's happening
-        should_debug = verbose or (not first_failure_logged and skipped_no_dims == 0)
-        page_width, page_height = get_page_ocr_dimensions(page_metadata, page, verbose=should_debug and i < 3)
+        # Enable verbose on first failure to help debug
+        debug_this = verbose or (strict and skipped_no_dims == 0)
+        page_width, page_height = get_page_ocr_dimensions(page_metadata, page, verbose=debug_this)
         
         if not page_width or not page_height:
-            if not first_failure_logged:
-                print(f"    [DEBUG] First normalization failure at element {i}, page {page}")
-                print(f"    [DEBUG] Element type: {elem.get('type')}")
-                print(f"    [DEBUG] page_metadata has {len(page_metadata)} entries")
-                if page_metadata:
-                    first_key = list(page_metadata.keys())[0]
-                    print(f"    [DEBUG] First page_metadata key: '{first_key}' (type: {type(first_key)})")
-                # Do a verbose lookup
-                get_page_ocr_dimensions(page_metadata, page, verbose=True)
-                first_failure_logged = True
-            
             skipped_no_dims += 1
             failed_pages.add(page)
+            
             if strict:
+                # Do one more verbose lookup to show exactly what's happening
+                print(f"\n    [ERROR] Cannot normalize element {i} (type: {elem.get('type')}) on page {page}")
+                get_page_ocr_dimensions(page_metadata, page, verbose=True)
                 raise ValueError(
                     f"Cannot normalize element {i} on page {page}: "
-                    f"No OCR dimensions found in page_metadata. "
-                    f"page_metadata keys: {list(page_metadata.keys())[:5]}, "
-                    f"Looking for page key: '{page}' (type: {type(page)})"
+                    f"No OCR dimensions found. See debug output above."
                 )
             continue
         
@@ -346,19 +347,19 @@ def normalize_all_element_bboxes(
         normalized_count += 1
     
     print(f"    Normalized {normalized_count} element bboxes")
-    if skipped_no_bbox > 0:
+    if skipped_no_bbox > 0 and verbose:
         print(f"    Skipped {skipped_no_bbox} elements (no bbox)")
     if skipped_no_dims > 0:
-        print(f"    [WARNING] Skipped {skipped_no_dims} elements - no page dimensions for pages: {failed_pages}")
+        print(f"    [WARNING] Failed to normalize {skipped_no_dims} elements on pages: {failed_pages}")
     
-    if verbose or normalized_count > 0:
-        # Verify normalization worked
-        sample_with_bbox = [e for e in elements if e.get('bbox', {}).get('_is_normalized')][:1]
-        if sample_with_bbox:
-            bbox = sample_with_bbox[0].get('bbox', {})
-            print(f"    [Verify] Sample normalized bbox: norm_top={bbox.get('norm_top'):.4f}, _is_normalized={bbox.get('_is_normalized')}")
+    # Verify normalization worked
+    if normalized_count > 0:
+        sample = next((e for e in elements if e.get('bbox', {}).get('_is_normalized')), None)
+        if sample:
+            bbox = sample['bbox']
+            print(f"    [OK] Sample: norm_top={bbox.get('norm_top'):.4f}")
         else:
-            print(f"    [WARNING] No elements have _is_normalized=True after normalization!")
+            print(f"    [WARNING] No elements have _is_normalized=True!")
     
     return elements
 
