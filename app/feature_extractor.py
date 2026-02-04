@@ -740,6 +740,30 @@ def extract_features_for_section(
                      'definitions', 'acronyms', 'abbreviations', 'references', 'appendix']
     features['title_has_section_keyword'] = 1 if any(kw in title.lower() for kw in title_keywords) else 0
     
+    # =========================================================================
+    # MAJOR SECTION KEYWORD FEATURE
+    # =========================================================================
+    # Major sections (depth 1: "1", "2", "3", etc.) commonly have specific words
+    # in their titles. This is a strong positive signal for valid major sections.
+    # These words are case-insensitive.
+    major_section_keywords = [
+        'scope', 'applicable', 'requirements', 'notes', 'quality',
+        'background', 'preparation', 'introduction', 'general', 'purpose',
+        'overview', 'summary', 'definitions', 'references', 'appendix',
+        'verification', 'validation', 'test', 'design', 'interface',
+        'safety', 'compliance', 'documentation', 'procedures', 'materials'
+    ]
+    title_lower_for_major = title.lower()
+    has_major_keyword = any(kw in title_lower_for_major for kw in major_section_keywords)
+    features['title_has_major_section_keyword'] = 1 if has_major_keyword else 0
+    
+    # Combined signal: depth 1 section WITH a major section keyword = strong positive
+    features['is_major_with_keyword'] = 1 if (parsed.depth == 1 and has_major_keyword) else 0
+    
+    # Inverse signal: depth 1 section WITHOUT a major keyword = slightly suspicious
+    # (not all majors have keywords, but most do)
+    features['is_major_without_keyword'] = 1 if (parsed.depth == 1 and not has_major_keyword) else 0
+    
     # Average word length
     words = title.split()
     features['title_avg_word_length'] = sum(len(w) for w in words) / len(words) if words else 0
