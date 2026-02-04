@@ -102,17 +102,34 @@ def extract_and_normalize_asset_bbox(meta: Dict) -> Optional[Dict]:
     }
 
 
-def get_page_ocr_dimensions(page_metadata: Dict, page_number: int) -> Tuple[Optional[float], Optional[float]]:
+def get_page_ocr_dimensions(page_metadata: Dict, page_number: int, verbose: bool = False) -> Tuple[Optional[float], Optional[float]]:
     """
     Get the OCR coordinate space dimensions (render_raw) for a page.
     """
     page_key = str(page_number)
     
+    if verbose:
+        print(f"    [Debug] Looking for page {page_number} (key='{page_key}') in page_metadata")
+        print(f"    [Debug] page_metadata keys: {list(page_metadata.keys())[:10]}...")
+    
     if page_key not in page_metadata:
-        return None, None
+        # Also try integer key
+        if page_number in page_metadata:
+            page_key = page_number
+        else:
+            if verbose:
+                print(f"    [Debug] Page {page_number} NOT FOUND in page_metadata")
+            return None, None
     
     page_info = page_metadata[page_key]
+    
+    if verbose:
+        print(f"    [Debug] page_info keys: {list(page_info.keys()) if isinstance(page_info, dict) else type(page_info)}")
+    
     image_meta = page_info.get('image_meta', {})
+    
+    if verbose:
+        print(f"    [Debug] image_meta keys: {list(image_meta.keys()) if isinstance(image_meta, dict) else type(image_meta)}")
     
     # Try render_raw first (what OCR uses)
     render_raw = image_meta.get('render_raw', {})
@@ -120,6 +137,8 @@ def get_page_ocr_dimensions(page_metadata: Dict, page_number: int) -> Tuple[Opti
         width = render_raw.get('width_px')
         height = render_raw.get('height_px')
         if width and height:
+            if verbose:
+                print(f"    [Debug] Found render_raw: {width} x {height}")
             return width, height
     
     # Fall back to canonical
@@ -128,7 +147,12 @@ def get_page_ocr_dimensions(page_metadata: Dict, page_number: int) -> Tuple[Opti
         width = canonical.get('width_px')
         height = canonical.get('height_px')
         if width and height:
+            if verbose:
+                print(f"    [Debug] Found canonical: {width} x {height}")
             return width, height
+    
+    if verbose:
+        print(f"    [Debug] No dimensions found for page {page_number}")
     
     return None, None
 
@@ -136,10 +160,16 @@ def get_page_ocr_dimensions(page_metadata: Dict, page_number: int) -> Tuple[Opti
 def normalize_text_bbox(bbox: Dict, page_width: float, page_height: float) -> Dict:
     """
     Add normalized coordinates to a text element's bbox.
-    """
-    if not bbox or page_width <= 0 or page_height <= 0:
-        return bbox
     
+    Returns a NEW dict with normalized values added.
+    """
+    if not bbox:
+        raise ValueError("normalize_text_bbox called with empty bbox")
+    
+    if page_width <= 0 or page_height <= 0:
+        raise ValueError(f"Invalid page dimensions: {page_width} x {page_height}")
+    
+    # Create a copy to avoid modifying the original
     result = dict(bbox)
     
     left = bbox.get('left', 0)
@@ -158,6 +188,7 @@ def normalize_text_bbox(bbox: Dict, page_width: float, page_height: float) -> Di
     result['norm_right'] = right / page_width
     result['norm_bottom'] = bottom / page_height
     result['_is_normalized'] = True
+    result['_norm_page_dims'] = (page_width, page_height)
     
     return result
 
@@ -256,33 +287,78 @@ def calculate_normalized_overlap(text_bbox: Dict, asset_bbox: Dict) -> float:
 def normalize_all_element_bboxes(
     elements: List[Dict],
     page_metadata: Dict,
-    verbose: bool = False
+    verbose: bool = False,
+    strict: bool = True
 ) -> List[Dict]:
     """
     Add normalized bbox coordinates to ALL elements that have bboxes.
     This modifies elements in place and returns the list.
+    
+    Args:
+        elements: List of document elements
+        page_metadata: Dict mapping page numbers to page info
+        verbose: Print debug info
+        strict: If True, raise exceptions on failures instead of silently skipping
     """
     normalized_count = 0
-    skipped_count = 0
+    skipped_no_bbox = 0
+    skipped_no_dims = 0
+    failed_pages = set()
+    first_failure_logged = False
     
-    for elem in elements:
+    for i, elem in enumerate(elements):
         bbox = elem.get('bbox')
         if not bbox:
+            skipped_no_bbox += 1
             continue
         
         page = elem.get('page_number', 9999)
-        page_width, page_height = get_page_ocr_dimensions(page_metadata, page)
+        
+        # On first potential failure, enable verbose to see what's happening
+        should_debug = verbose or (not first_failure_logged and skipped_no_dims == 0)
+        page_width, page_height = get_page_ocr_dimensions(page_metadata, page, verbose=should_debug and i < 3)
         
         if not page_width or not page_height:
-            skipped_count += 1
+            if not first_failure_logged:
+                print(f"    [DEBUG] First normalization failure at element {i}, page {page}")
+                print(f"    [DEBUG] Element type: {elem.get('type')}")
+                print(f"    [DEBUG] page_metadata has {len(page_metadata)} entries")
+                if page_metadata:
+                    first_key = list(page_metadata.keys())[0]
+                    print(f"    [DEBUG] First page_metadata key: '{first_key}' (type: {type(first_key)})")
+                # Do a verbose lookup
+                get_page_ocr_dimensions(page_metadata, page, verbose=True)
+                first_failure_logged = True
+            
+            skipped_no_dims += 1
+            failed_pages.add(page)
+            if strict:
+                raise ValueError(
+                    f"Cannot normalize element {i} on page {page}: "
+                    f"No OCR dimensions found in page_metadata. "
+                    f"page_metadata keys: {list(page_metadata.keys())[:5]}, "
+                    f"Looking for page key: '{page}' (type: {type(page)})"
+                )
             continue
         
         # Add normalized values to the bbox
         elem['bbox'] = normalize_text_bbox(bbox, page_width, page_height)
         normalized_count += 1
     
-    if verbose:
-        print(f"    [Debug] Normalized {normalized_count} element bboxes, skipped {skipped_count}")
+    print(f"    Normalized {normalized_count} element bboxes")
+    if skipped_no_bbox > 0:
+        print(f"    Skipped {skipped_no_bbox} elements (no bbox)")
+    if skipped_no_dims > 0:
+        print(f"    [WARNING] Skipped {skipped_no_dims} elements - no page dimensions for pages: {failed_pages}")
+    
+    if verbose or normalized_count > 0:
+        # Verify normalization worked
+        sample_with_bbox = [e for e in elements if e.get('bbox', {}).get('_is_normalized')][:1]
+        if sample_with_bbox:
+            bbox = sample_with_bbox[0].get('bbox', {})
+            print(f"    [Verify] Sample normalized bbox: norm_top={bbox.get('norm_top'):.4f}, _is_normalized={bbox.get('_is_normalized')}")
+        else:
+            print(f"    [WARNING] No elements have _is_normalized=True after normalization!")
     
     return elements
 
