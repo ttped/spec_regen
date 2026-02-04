@@ -454,17 +454,9 @@ def extract_page_metadata(page_dict: Dict, page_obj: Dict = None) -> Dict:
     """
     metadata = {}
     
-    # === DEBUG OUTPUT ===
-    print(f"      [extract_page_metadata] page_obj is None: {page_obj is None}")
-    if page_obj:
-        print(f"      [extract_page_metadata] page_obj type: {type(page_obj)}")
-        print(f"      [extract_page_metadata] page_obj keys: {list(page_obj.keys()) if isinstance(page_obj, dict) else 'N/A'}")
-        if isinstance(page_obj, dict) and 'image_meta' in page_obj:
-            print(f"      [extract_page_metadata] image_meta found!")
-            print(f"      [extract_page_metadata] image_meta keys: {list(page_obj['image_meta'].keys())}")
-        else:
-            print(f"      [extract_page_metadata] NO image_meta in page_obj")
-    # === END DEBUG ===
+    print('extract_page_metadata')
+    print(page_dict.keys())
+    print(page_obj.keys())
     
     # === PRESERVE ORIGINAL IMAGE_META ===
     if page_obj and isinstance(page_obj, dict):
@@ -493,15 +485,13 @@ def extract_page_metadata(page_dict: Dict, page_obj: Dict = None) -> Dict:
                         metadata['page_height'] = canonical['height_px']
     
     # Capture OCR confidence stats if available
-    if page_dict.get('conf'):
-        try:
-            confs = [c for c in page_dict['conf'] if isinstance(c, (int, float)) and c >= 0]
-            if confs:
-                metadata['avg_confidence'] = sum(confs) / len(confs)
-                metadata['min_confidence'] = min(confs)
-                metadata['max_confidence'] = max(confs)
-        except:
-            pass
+
+    confs = [c for c in page_dict['conf'] if isinstance(c, (int, float)) and c >= 0]
+    if confs:
+        metadata['avg_confidence'] = sum(confs) / len(confs)
+        metadata['min_confidence'] = min(confs)
+        metadata['max_confidence'] = max(confs)
+
     
     # Count words on page
     if page_dict.get('text'):
