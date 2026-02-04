@@ -450,19 +450,29 @@ def get_page_dict_from_object(page_obj: Any) -> Optional[Dict]:
 def extract_page_metadata(page_dict: Dict, page_obj: Dict = None) -> Dict:
     """
     Extract useful metadata from a page_dict and page_obj.
-    
-    IMPORTANT: Preserves the original image_meta structure for downstream
-    coordinate normalization (needed by asset_processor).
+    DEBUG VERSION - prints what it's receiving.
     """
     metadata = {}
     
+    # === DEBUG OUTPUT ===
+    print(f"      [extract_page_metadata] page_obj is None: {page_obj is None}")
+    if page_obj:
+        print(f"      [extract_page_metadata] page_obj type: {type(page_obj)}")
+        print(f"      [extract_page_metadata] page_obj keys: {list(page_obj.keys()) if isinstance(page_obj, dict) else 'N/A'}")
+        if isinstance(page_obj, dict) and 'image_meta' in page_obj:
+            print(f"      [extract_page_metadata] image_meta found!")
+            print(f"      [extract_page_metadata] image_meta keys: {list(page_obj['image_meta'].keys())}")
+        else:
+            print(f"      [extract_page_metadata] NO image_meta in page_obj")
+    # === END DEBUG ===
+    
     # === PRESERVE ORIGINAL IMAGE_META ===
-    # This is critical for coordinate normalization in asset_processor
     if page_obj and isinstance(page_obj, dict):
         image_meta = page_obj.get('image_meta')
         if image_meta and isinstance(image_meta, dict):
             # Store the FULL image_meta structure
             metadata['image_meta'] = image_meta
+            print(f"      [extract_page_metadata] Stored image_meta in metadata")
             
             # Also extract convenient top-level width/height from render_raw
             render_raw = image_meta.get('render_raw', {})
@@ -471,6 +481,7 @@ def extract_page_metadata(page_dict: Dict, page_obj: Dict = None) -> Dict:
                     metadata['page_width'] = render_raw['width_px']
                 if 'height_px' in render_raw:
                     metadata['page_height'] = render_raw['height_px']
+                print(f"      [extract_page_metadata] Set page_width={metadata.get('page_width')}, page_height={metadata.get('page_height')}")
             
             # Fallback to canonical if render_raw not present
             if 'page_width' not in metadata:
@@ -481,12 +492,7 @@ def extract_page_metadata(page_dict: Dict, page_obj: Dict = None) -> Dict:
                     if 'height_px' in canonical:
                         metadata['page_height'] = canonical['height_px']
     
-    # === REMOVED: Inferred dimensions fallback ===
-    # The inferred dimensions from OCR bboxes are unreliable and cause
-    # coordinate mismatch issues. If we don't have image_meta, we simply
-    # won't have page dimensions, which is better than wrong dimensions.
-    
-    # Capture OCR confidence stats if available (still useful)
+    # Capture OCR confidence stats if available
     if page_dict.get('conf'):
         try:
             confs = [c for c in page_dict['conf'] if isinstance(c, (int, float)) and c >= 0]
@@ -513,6 +519,8 @@ def extract_page_metadata(page_dict: Dict, page_obj: Dict = None) -> Dict:
     for key in ['dpi', 'resolution', 'scale', 'ppi']:
         if key in page_dict:
             metadata[key] = page_dict[key]
+    
+    print(f"      [extract_page_metadata] Final metadata keys: {list(metadata.keys())}")
     
     return metadata
 
