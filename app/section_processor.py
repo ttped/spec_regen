@@ -433,7 +433,7 @@ def get_page_dict_from_object(page_obj: Any) -> Optional[Dict]:
     Succinctly handles nested or flat OCR structures.
     """
     if not isinstance(page_obj, dict):
-        return None
+        raise ValueError(f"Expected dict for page object, got {type(page_obj)}")
     
     # If the object itself contains the OCR keys, it's the page_dict
     if 'text' in page_obj and isinstance(page_obj.get('text'), list):
@@ -444,7 +444,7 @@ def get_page_dict_from_object(page_obj: Any) -> Optional[Dict]:
     if isinstance(inner, dict) and 'text' in inner:
         return inner
     
-    return None
+    raise KeyError("Could not find 'page_dict' or 'text' keys. Data may be stale or incorrectly formatted.")
 
 
 def extract_page_metadata(page_dict: Dict, page_obj: Dict = None) -> Dict:
@@ -571,8 +571,8 @@ def run_section_processing_on_file(
     input_path: str, 
     output_path: str, 
     content_start_page: int = 1,
-    header_top_threshold: int = 0,
-    footer_top_threshold: int = 0
+    header_rel_threshold: float = 0.06,
+    footer_rel_threshold: float = 0.94
 ):
     """
     Main execution function - processes raw OCR file into organized sections with bbox metadata.
@@ -586,10 +586,7 @@ def run_section_processing_on_file(
     """
     print(f"  - Loading raw OCR from: {input_path}")
     print(f"  - Content starts at page: {content_start_page}")
-    if header_top_threshold > 0:
-        print(f"  - Filtering headers: Dropping text with Top position < {header_top_threshold}")
-    if footer_top_threshold > 0:
-        print(f"  - Filtering footers: Dropping text with Top position > {footer_top_threshold}")
+
     
     pages_to_process = load_raw_ocr_pages(input_path)
     
@@ -620,6 +617,8 @@ def run_section_processing_on_file(
     for page_id, page_dict, page_meta in content_pages:
         if page_meta:
             all_page_metadata[page_id] = page_meta
+
+        page_height = page_meta.get('page_height', 0)
         
         lines = reconstruct_lines_with_bbox(page_dict)
         
@@ -641,19 +640,23 @@ def run_section_processing_on_file(
             
             line_bbox = line_data.get('bbox')
             
-            # --- HEADER FILTER ---
-            if header_top_threshold > 0 and line_bbox:
-                if line_bbox.get('top', 9999) < header_top_threshold:
-                    dropped_header_lines += 1
-                    continue
-            # ---------------------
+            # CALCULATE NORMALIZED TOP
+            norm_top = 0.0
+            if line_bbox and page_height > 0:
+                norm_top = line_bbox.get('top', 0) / page_height
+
+            # --- HEADER FILTER (UPDATED) ---
+            # Old: if line_bbox.get('top', 9999) < header_top_threshold:
+            if header_rel_threshold > 0 and norm_top < header_rel_threshold:
+                dropped_header_lines += 1
+                continue
             
-            # --- FOOTER FILTER ---
-            if footer_top_threshold > 0 and line_bbox:
-                if line_bbox.get('top', 0) > footer_top_threshold:
-                    dropped_footer_lines += 1
-                    continue
-            # ---------------------
+            # --- FOOTER FILTER (UPDATED) ---
+            # Old: if line_bbox.get('top', 0) > footer_top_threshold:
+            # Note: For footers, you usually check if norm_top > 0.94 (or similar)
+            if footer_rel_threshold > 0 and norm_top > footer_rel_threshold:
+                dropped_footer_lines += 1
+                continue
 
             is_header, section_num, topic, remainder, context = check_if_paragraph_is_header(line_text)
             
@@ -722,12 +725,6 @@ def run_section_processing_on_file(
     
     section_count = sum(1 for e in final_elements if e['type'] == 'section')
     print(f"  - Extracted {len(final_elements)} elements ({section_count} sections).")
-    if header_top_threshold > 0:
-        print(f"  - Filtered out {dropped_header_lines} header lines (Top < {header_top_threshold}).")
-    if footer_top_threshold > 0:
-        print(f"  - Filtered out {dropped_footer_lines} footer lines (Top > {footer_top_threshold}).")
-    print(f"  - Results saved to {output_path}")
-
 
 if __name__ == '__main__':
     import sys
