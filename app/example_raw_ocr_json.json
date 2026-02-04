@@ -49,6 +49,26 @@
 				"dpi_x": 300,
 				"dpi_y": 300,
 				"dpi_source": "render"
+			},
+			"canonical": {
+				"stage": "preprocessed",
+				"width_px": 5052,
+				"height_px": 6600,
+				"channels": 1,
+				"dtype": "uint8",
+				"dpi_x": 300,
+				"dpi_y": 300,
+				"dpi_source": "render"
+			},
+			"render_full": {
+				"stage": "render_full",
+				"width_px": 2530,
+				"height_px": 3300,
+				"channels": 3,
+				"dtype": "uint8",
+				"dpi_x": 300,
+				"dpi_y": 300,
+				"dpi_source": "render"
 			}
 		}
 	},
@@ -112,7 +132,7 @@
 				"dpi_x": 300,
 				"dpi_y": 300,
 				"dpi_source": "render"
-			}
+			},
 			"render_full": {
 				"stage": "render_full",
 				"width_px": 2530,
