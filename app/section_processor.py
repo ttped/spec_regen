@@ -430,19 +430,19 @@ def get_page_id_from_object(page_obj: Dict, fallback_key: str = "0") -> int:
 def get_page_dict_from_object(page_obj: Any) -> Optional[Dict]:
     """
     Extract the actual page_dict (containing 'text', 'block_num', etc.) from various structures.
+    Succinctly handles nested or flat OCR structures.
     """
     if not isinstance(page_obj, dict):
         return None
     
+    # If the object itself contains the OCR keys, it's the page_dict
     if 'text' in page_obj and isinstance(page_obj.get('text'), list):
-        if 'page_dict' in page_obj and isinstance(page_obj['page_dict'], dict):
-            return page_obj['page_dict']
         return page_obj
     
-    if 'page_dict' in page_obj:
-        inner = page_obj['page_dict']
-        if isinstance(inner, dict) and 'text' in inner:
-            return inner
+    # If it's a wrapper, look inside for 'page_dict'
+    inner = page_obj.get('page_dict')
+    if isinstance(inner, dict) and 'text' in inner:
+        return inner
     
     return None
 
@@ -512,55 +512,35 @@ def extract_page_metadata(page_dict: Dict, page_obj: Dict = None) -> Dict:
 def load_raw_ocr_pages(input_path: str) -> List[Tuple[int, Dict, Dict]]:
     """
     Loads raw OCR data and returns a sorted list of (page_id, page_dict, page_metadata) tuples.
-    Handles malformed JSON files gracefully using json_repair.
     """
     if not os.path.exists(input_path):
-        print(f"  - [Error] File not found: {input_path}")
         return []
 
     data = None
-    
-    # 1. Try standard load (Fastest)
-    try:
-        with open(input_path, 'r', encoding='utf-8') as f:
+    with open(input_path, 'r', encoding='utf-8') as f:
+        try:
             data = json.load(f)
-    except json.JSONDecodeError as e:
-        # 2. Try Repair (Slower but robust)
-        if repair_json:
-            print(f"  - [Notice] JSON malformed in {os.path.basename(input_path)}. Attempting repair...")
-            try:
-                with open(input_path, 'r', encoding='utf-8') as f:
-                    file_content = f.read()
-                    repaired_content = repair_json(file_content)
-                    data = json.loads(repaired_content)
-                print(f"  - [Success] File repaired successfully.")
-            except Exception as repair_error:
-                print(f"  - [Error] Repair failed: {repair_error}")
-        else:
-            print(f"  - [Error] JSON malformed and 'json_repair' library not found.")
-            print(f"  - [Action] Run `pip install json_repair` to enable auto-fixing.")
+        except json.JSONDecodeError:
+            if repair_json:
+                f.seek(0)
+                data = json.loads(repair_json(f.read()))
 
-    if data is None:
+    if not data:
         return []
 
     pages_to_process = []
 
+    for key, val in data.items():
+        # val is the full page object containing 'page_dict' and 'image_meta'
+        page_dict = get_page_dict_from_object(val)
 
-    for idx, item in enumerate(data):
-        if not isinstance(item, dict):
-            continue
-        page_dict = get_page_dict_from_object(item)
-        if page_dict is None:
-            if 'text' in item:
-                page_dict = item
-            else:
-                continue
-
-        print('item', item.keys())
-        page_id = get_page_id_from_object(item, fallback_key=str(idx + 1))
-        # Pass full page object (item) to get image_meta
-        page_meta = extract_page_metadata(page_dict, page_obj=item)
-        pages_to_process.append((page_id, page_dict, page_meta))
+        print('page_dict load_raw', page_dict.keys())
+        
+        if page_dict is not None:
+            page_id = get_page_id_from_object(val, fallback_key=key)
+            # Ensure we pass the original 'val' so extract_page_metadata sees 'image_meta'
+            page_meta = extract_page_metadata(page_dict, page_obj=val)
+            pages_to_process.append((page_id, page_dict, page_meta))
 
     pages_to_process.sort(key=lambda x: x[0])
     return pages_to_process
