@@ -264,60 +264,85 @@ def get_page_render_full_dimensions(page_metadata: Dict, page_number: int) -> Tu
 
 def scale_assets_to_ocr_space(
     assets: List[Dict], 
-    page_metadata: Dict
+    page_metadata: Dict,
+    verbose: bool = False
 ) -> Tuple[List[Dict], int]:
     """
     Scale asset bounding boxes from YOLO coordinate space to OCR coordinate space.
     
     COORDINATE SPACES:
-    - YOLO runs on render_full images (e.g., 2530 × 3300) - stored in docs_images/
-    - OCR text bboxes are in render_raw space (e.g., 5052 × 6600) - upscaled for Tesseract
+    - YOLO runs on docs_images/ files (e.g., 1700 × 2200) - actual input to YOLO
+    - OCR text bboxes are in render_raw space (e.g., 5100 × 6600) - upscaled for Tesseract
     
     This function scales YOLO bboxes UP to match OCR coordinates.
     
-    Source dimensions priority:
-    1. render_full from page_metadata (most accurate)
-    2. YOLO-recorded dimensions from bbox metadata (fallback)
+    Source dimensions (what YOLO actually processed):
+    - YOLO-recorded dimensions from bbox metadata (page_width_px, page_height_px)
     
-    Target dimensions:
-    - render_raw from page_metadata (what OCR uses)
+    Target dimensions (what OCR uses):
+    - render_raw from page_metadata
     
     Args:
         assets: List of asset metadata dicts
         page_metadata: Dict mapping page numbers to page info (from OCR JSON)
+        verbose: If True, print detailed debug info
     
     Returns:
         Tuple of (scaled_assets, num_scaled)
     """
     scaled_assets = []
     num_scaled = 0
+    num_skipped_no_source = 0
+    num_skipped_no_target = 0
+    
+    if verbose:
+        print(f"    [Debug] Scaling {len(assets)} assets")
+        print(f"    [Debug] page_metadata has {len(page_metadata)} pages")
     
     for asset in assets:
         asset_copy = dict(asset)
         bbox = asset_copy.get('bbox')
         page = asset_copy.get('page_number', 9999)
         
+        if verbose:
+            print(f"    [Debug] Asset on page {page}: bbox type={type(bbox)}")
+            if bbox:
+                print(f"    [Debug]   bbox keys: {list(bbox.keys()) if isinstance(bbox, dict) else 'N/A'}")
+        
         if not bbox:
             scaled_assets.append(asset_copy)
             continue
         
-        # Get SOURCE dimensions (what YOLO ran on)
-        # Priority 1: render_full from page_metadata
-        source_width, source_height = get_page_render_full_dimensions(page_metadata, page)
+        # Get SOURCE dimensions (what YOLO actually ran on)
+        # These are recorded by YOLO in the bbox metadata
+        source_width = bbox.get('_source_width')
+        source_height = bbox.get('_source_height')
         
-        # Priority 2: Fall back to YOLO-recorded dimensions
+        if verbose:
+            print(f"    [Debug]   _source_width={source_width}, _source_height={source_height}")
+        
         if not source_width or not source_height:
-            source_width = bbox.get('_source_width')
-            source_height = bbox.get('_source_height')
+            num_skipped_no_source += 1
+            if verbose:
+                print(f"    [Debug]   SKIPPED - no source dimensions")
+            scaled_assets.append(asset_copy)
+            continue
         
         # Get TARGET dimensions (OCR coordinate space = render_raw)
         target_width, target_height = get_page_ocr_dimensions(page_metadata, page)
         
-        # Only scale if we have all dimensions and they differ
-        if (source_width and source_height and 
-            target_width and target_height and
-            (source_width != target_width or source_height != target_height)):
-            
+        if verbose:
+            print(f"    [Debug]   target (render_raw): {target_width}×{target_height}")
+        
+        if not target_width or not target_height:
+            num_skipped_no_target += 1
+            if verbose:
+                print(f"    [Debug]   SKIPPED - no target dimensions")
+            scaled_assets.append(asset_copy)
+            continue
+        
+        # Scale if dimensions differ
+        if source_width != target_width or source_height != target_height:
             scaled_bbox = scale_bbox_to_target(
                 bbox, 
                 source_width, source_height,
@@ -333,8 +358,21 @@ def scale_assets_to_ocr_space(
             print(f"      Scaled asset on page {page}: "
                   f"{source_width:.0f}×{source_height:.0f} -> {target_width:.0f}×{target_height:.0f} "
                   f"(scale: {scale_x:.2f}x, {scale_y:.2f}x)")
+            
+            if verbose:
+                print(f"    [Debug]   Original bbox: left={bbox.get('left')}, top={bbox.get('top')}")
+                print(f"    [Debug]   Scaled bbox:   left={scaled_bbox.get('left'):.1f}, top={scaled_bbox.get('top'):.1f}")
+        else:
+            if verbose:
+                print(f"    [Debug]   No scaling needed - dimensions match")
         
         scaled_assets.append(asset_copy)
+    
+    # Report any issues
+    if num_skipped_no_source > 0:
+        print(f"    [Warning] {num_skipped_no_source} assets skipped - missing source dimensions (_source_width/_source_height in bbox)")
+    if num_skipped_no_target > 0:
+        print(f"    [Warning] {num_skipped_no_target} assets skipped - missing target dimensions (render_raw in page_metadata)")
     
     return scaled_assets, num_scaled
 
@@ -498,9 +536,11 @@ def integrate_assets_with_elements(
 
     # --- STEP 0: Scale asset bboxes to OCR coordinate space ---
     if page_metadata:
-        scaled_assets, num_scaled = scale_assets_to_ocr_space(assets, page_metadata)
+        scaled_assets, num_scaled = scale_assets_to_ocr_space(assets, page_metadata, verbose=verbose)
         if num_scaled > 0:
             print(f"    Scaled {num_scaled} asset bboxes to OCR coordinate space.")
+        elif verbose:
+            print(f"    [Debug] No assets were scaled")
         assets = scaled_assets
     else:
         print(f"    [Warning] No page_metadata available - skipping bbox scaling")
