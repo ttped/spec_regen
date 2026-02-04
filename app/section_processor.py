@@ -455,34 +455,30 @@ def extract_page_metadata(page_dict: Dict, page_obj: Dict = None) -> Dict:
     metadata = {}
     
     print('extract_page_metadata')
-    print(page_dict.keys())
-    print(page_obj.keys())
+    print('page_dict', page_dict.keys()) # contains level, page_num, block_num, left, top, width, height, etc
+    print('page_obj', page_obj.keys()) # contains document_Id, page_Id, page_dict
     
     # === PRESERVE ORIGINAL IMAGE_META ===
-    if page_obj and isinstance(page_obj, dict):
-        image_meta = page_obj.get('image_meta')
-        if image_meta and isinstance(image_meta, dict):
-            # Store the FULL image_meta structure
-            metadata['image_meta'] = image_meta
-            print(f"      [extract_page_metadata] Stored image_meta in metadata")
-            
-            # Also extract convenient top-level width/height from render_raw
-            render_raw = image_meta.get('render_raw', {})
-            if render_raw:
-                if 'width_px' in render_raw:
-                    metadata['page_width'] = render_raw['width_px']
-                if 'height_px' in render_raw:
-                    metadata['page_height'] = render_raw['height_px']
-                print(f"      [extract_page_metadata] Set page_width={metadata.get('page_width')}, page_height={metadata.get('page_height')}")
-            
-            # Fallback to canonical if render_raw not present
-            if 'page_width' not in metadata:
-                canonical = image_meta.get('canonical', {})
-                if canonical:
-                    if 'width_px' in canonical:
-                        metadata['page_width'] = canonical['width_px']
-                    if 'height_px' in canonical:
-                        metadata['page_height'] = canonical['height_px']
+    image_meta = page_obj.get('image_meta')
+    # Store the FULL image_meta structure
+    metadata['image_meta'] = image_meta
+    
+    # Also extract convenient top-level width/height from render_raw
+    render_raw = image_meta.get('render_raw', {})
+    if render_raw:
+        if 'width_px' in render_raw:
+            metadata['page_width'] = render_raw['width_px']
+        if 'height_px' in render_raw:
+            metadata['page_height'] = render_raw['height_px']
+    
+    # Fallback to canonical if render_raw not present
+    if 'page_width' not in metadata:
+        canonical = image_meta.get('canonical', {})
+        if canonical:
+            if 'width_px' in canonical:
+                metadata['page_width'] = canonical['width_px']
+            if 'height_px' in canonical:
+                metadata['page_height'] = canonical['height_px']
     
     # Capture OCR confidence stats if available
 
@@ -509,8 +505,6 @@ def extract_page_metadata(page_dict: Dict, page_obj: Dict = None) -> Dict:
     for key in ['dpi', 'resolution', 'scale', 'ppi']:
         if key in page_dict:
             metadata[key] = page_dict[key]
-    
-    print(f"      [extract_page_metadata] Final metadata keys: {list(metadata.keys())}")
     
     return metadata
 
@@ -551,31 +545,22 @@ def load_raw_ocr_pages(input_path: str) -> List[Tuple[int, Dict, Dict]]:
 
     pages_to_process = []
 
-    # Handle dict structure (keyed by page number)
-    if isinstance(data, dict):
-        for key, val in data.items():
-            page_dict = get_page_dict_from_object(val)
-            if page_dict is None:
+
+    for idx, item in enumerate(data):
+        if not isinstance(item, dict):
+            continue
+        page_dict = get_page_dict_from_object(item)
+        if page_dict is None:
+            if 'text' in item:
+                page_dict = item
+            else:
                 continue
-            page_id = get_page_id_from_object(val, fallback_key=key)
-            # Pass full page object (val) to get image_meta
-            page_meta = extract_page_metadata(page_dict, page_obj=val)
-            pages_to_process.append((page_id, page_dict, page_meta))
-            
-    elif isinstance(data, list):
-        for idx, item in enumerate(data):
-            if not isinstance(item, dict):
-                continue
-            page_dict = get_page_dict_from_object(item)
-            if page_dict is None:
-                if 'text' in item:
-                    page_dict = item
-                else:
-                    continue
-            page_id = get_page_id_from_object(item, fallback_key=str(idx + 1))
-            # Pass full page object (item) to get image_meta
-            page_meta = extract_page_metadata(page_dict, page_obj=item)
-            pages_to_process.append((page_id, page_dict, page_meta))
+
+        print('item', item.keys())
+        page_id = get_page_id_from_object(item, fallback_key=str(idx + 1))
+        # Pass full page object (item) to get image_meta
+        page_meta = extract_page_metadata(page_dict, page_obj=item)
+        pages_to_process.append((page_id, page_dict, page_meta))
 
     pages_to_process.sort(key=lambda x: x[0])
     return pages_to_process
