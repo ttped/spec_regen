@@ -571,8 +571,8 @@ def run_section_processing_on_file(
     input_path: str, 
     output_path: str, 
     content_start_page: int = 1,
-    header_rel_threshold: float = 0.06,
-    footer_rel_threshold: float = 0.94
+    header_rel_threshold: float = 0.07,
+    footer_rel_threshold: float = 0.93
 ):
     """
     Main execution function - processes raw OCR file into organized sections with bbox metadata.
