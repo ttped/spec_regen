@@ -104,66 +104,65 @@ def extract_and_normalize_asset_bbox(meta: Dict) -> Optional[Dict]:
 
 def get_page_ocr_dimensions(page_metadata: Dict, page_number: int, verbose: bool = False) -> Tuple[Optional[float], Optional[float]]:
     """
-    Get the OCR coordinate space dimensions (render_raw) for a page.
-    Handles both string and integer keys in page_metadata.
+    Get the OCR coordinate space dimensions for a page.
+    
+    Handles multiple metadata structures:
+    - page_info['image_meta']['render_raw']['width_px'] (preferred)
+    - page_info['image_meta']['canonical']['width_px']
+    - page_info['page_width'] / page_info['page_height'] (convenience keys)
     """
     # Try both string and int versions of the key
     page_key_str = str(page_number)
     page_key_int = int(page_number) if isinstance(page_number, (int, str)) else None
     
     page_info = None
-    used_key = None
     
     # Try string key first (most common in JSON)
     if page_key_str in page_metadata:
         page_info = page_metadata[page_key_str]
-        used_key = page_key_str
     # Try integer key
     elif page_key_int is not None and page_key_int in page_metadata:
         page_info = page_metadata[page_key_int]
-        used_key = page_key_int
     
     if page_info is None:
         if verbose:
-            print(f"    [Debug] Page {page_number} NOT FOUND")
-            print(f"    [Debug] Tried keys: '{page_key_str}' (str) and {page_key_int} (int)")
-            sample_keys = list(page_metadata.keys())[:5]
-            print(f"    [Debug] Sample page_metadata keys: {sample_keys}")
-            if sample_keys:
-                print(f"    [Debug] Key types: {[type(k).__name__ for k in sample_keys]}")
+            print(f"    [Debug] Page {page_number} NOT FOUND in page_metadata")
         return None, None
     
-    if verbose:
-        print(f"    [Debug] Found page {page_number} using key '{used_key}'")
-    
+    # === Try nested image_meta structure (from preserved OCR data) ===
     image_meta = page_info.get('image_meta', {})
+    if image_meta:
+        # Try render_raw first (what OCR uses)
+        render_raw = image_meta.get('render_raw', {})
+        if render_raw:
+            width = render_raw.get('width_px')
+            height = render_raw.get('height_px')
+            if width and height:
+                if verbose:
+                    print(f"    [Debug] Found render_raw: {width} x {height}")
+                return width, height
+        
+        # Try canonical
+        canonical = image_meta.get('canonical', {})
+        if canonical:
+            width = canonical.get('width_px')
+            height = canonical.get('height_px')
+            if width and height:
+                if verbose:
+                    print(f"    [Debug] Found canonical: {width} x {height}")
+                return width, height
     
-    if not image_meta:
+    # === Try convenience keys at page_info level ===
+    width = page_info.get('page_width')
+    height = page_info.get('page_height')
+    if width and height:
         if verbose:
-            print(f"    [Debug] No 'image_meta' in page_info. Keys: {list(page_info.keys())}")
-        return None, None
-    
-    # Try render_raw first (what OCR uses)
-    render_raw = image_meta.get('render_raw', {})
-    if render_raw:
-        width = render_raw.get('width_px')
-        height = render_raw.get('height_px')
-        if width and height:
-            return width, height
-    
-    # Fall back to canonical
-    canonical = image_meta.get('canonical', {})
-    if canonical:
-        width = canonical.get('width_px')
-        height = canonical.get('height_px')
-        if width and height:
-            return width, height
+            print(f"    [Debug] Found page_width/page_height: {width} x {height}")
+        return width, height
     
     if verbose:
-        print(f"    [Debug] image_meta exists but no width_px/height_px found")
-        print(f"    [Debug] image_meta keys: {list(image_meta.keys())}")
-        if render_raw:
-            print(f"    [Debug] render_raw keys: {list(render_raw.keys())}")
+        print(f"    [Debug] Could not find dimensions for page {page_number}")
+        print(f"    [Debug] page_info keys: {list(page_info.keys())}")
     
     return None, None
 

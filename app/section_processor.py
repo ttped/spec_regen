@@ -449,43 +449,44 @@ def get_page_dict_from_object(page_obj: Any) -> Optional[Dict]:
 
 def extract_page_metadata(page_dict: Dict, page_obj: Dict = None) -> Dict:
     """
-    Extract useful metadata from a page_dict and page_obj for debugging and normalization.
+    Extract useful metadata from a page_dict and page_obj.
+    
+    IMPORTANT: Preserves the original image_meta structure for downstream
+    coordinate normalization (needed by asset_processor).
     """
     metadata = {}
     
-    # Try to get actual page dimensions from image_meta
+    # === PRESERVE ORIGINAL IMAGE_META ===
+    # This is critical for coordinate normalization in asset_processor
     if page_obj and isinstance(page_obj, dict):
-        image_meta = page_obj.get('image_meta', {})
-        if image_meta:
+        image_meta = page_obj.get('image_meta')
+        if image_meta and isinstance(image_meta, dict):
+            # Store the FULL image_meta structure
+            metadata['image_meta'] = image_meta
+            
+            # Also extract convenient top-level width/height from render_raw
             render_raw = image_meta.get('render_raw', {})
             if render_raw:
                 if 'width_px' in render_raw:
                     metadata['page_width'] = render_raw['width_px']
                 if 'height_px' in render_raw:
                     metadata['page_height'] = render_raw['height_px']
+            
+            # Fallback to canonical if render_raw not present
+            if 'page_width' not in metadata:
+                canonical = image_meta.get('canonical', {})
+                if canonical:
+                    if 'width_px' in canonical:
+                        metadata['page_width'] = canonical['width_px']
+                    if 'height_px' in canonical:
+                        metadata['page_height'] = canonical['height_px']
     
-    # Fallback: infer dimensions from OCR bounding boxes
-    if 'page_width' not in metadata and page_dict.get('left') and page_dict.get('width'):
-        try:
-            rights = [l + w for l, w in zip(page_dict['left'], page_dict['width'])]
-            metadata['inferred_page_width'] = max(rights) if rights else None
-            # Use inferred as page_width if we don't have actual
-            if 'page_width' not in metadata and metadata.get('inferred_page_width'):
-                metadata['page_width'] = metadata['inferred_page_width']
-        except:
-            pass
+    # === REMOVED: Inferred dimensions fallback ===
+    # The inferred dimensions from OCR bboxes are unreliable and cause
+    # coordinate mismatch issues. If we don't have image_meta, we simply
+    # won't have page dimensions, which is better than wrong dimensions.
     
-    if 'page_height' not in metadata and page_dict.get('top') and page_dict.get('height'):
-        try:
-            bottoms = [t + h for t, h in zip(page_dict['top'], page_dict['height'])]
-            metadata['inferred_page_height'] = max(bottoms) if bottoms else None
-            # Use inferred as page_height if we don't have actual
-            if 'page_height' not in metadata and metadata.get('inferred_page_height'):
-                metadata['page_height'] = metadata['inferred_page_height']
-        except:
-            pass
-    
-    # Capture OCR confidence stats if available
+    # Capture OCR confidence stats if available (still useful)
     if page_dict.get('conf'):
         try:
             confs = [c for c in page_dict['conf'] if isinstance(c, (int, float)) and c >= 0]
@@ -508,6 +509,7 @@ def extract_page_metadata(page_dict: Dict, page_obj: Dict = None) -> Dict:
     if page_dict.get('line_num'):
         metadata['line_count'] = len(set(page_dict['line_num']))
     
+    # Preserve any DPI info if present
     for key in ['dpi', 'resolution', 'scale', 'ppi']:
         if key in page_dict:
             metadata[key] = page_dict[key]
