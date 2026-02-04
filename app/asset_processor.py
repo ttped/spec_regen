@@ -256,44 +256,6 @@ def load_all_assets(exports_dir: str, doc_stem: str) -> List[Dict]:
     return assets
 
 
-def calculate_normalized_overlap(text_bbox: Dict, asset_bbox: Dict) -> float:
-    """
-    Calculate overlap ratio using normalized coordinates.
-    Returns what fraction of the text box is covered by the asset.
-    """
-    # Check if both have normalized coordinates
-    if not text_bbox.get('_is_normalized') or not asset_bbox.get('_is_normalized'):
-        return 0.0
-    
-    # Get normalized bounds
-    t_left = text_bbox['norm_left']
-    t_top = text_bbox['norm_top']
-    t_right = text_bbox['norm_right']
-    t_bottom = text_bbox['norm_bottom']
-    
-    a_left = asset_bbox['norm_left']
-    a_top = asset_bbox['norm_top']
-    a_right = asset_bbox['norm_right']
-    a_bottom = asset_bbox['norm_bottom']
-    
-    # Calculate intersection
-    x_left = max(t_left, a_left)
-    y_top = max(t_top, a_top)
-    x_right = min(t_right, a_right)
-    y_bottom = min(t_bottom, a_bottom)
-    
-    if x_right <= x_left or y_bottom <= y_top:
-        return 0.0
-    
-    intersection = (x_right - x_left) * (y_bottom - y_top)
-    text_area = (t_right - t_left) * (t_bottom - t_top)
-    
-    if text_area <= 0:
-        return 0.0
-    
-    return intersection / text_area
-
-
 def normalize_all_element_bboxes(
     elements: List[Dict],
     page_metadata: Dict,
@@ -363,108 +325,6 @@ def normalize_all_element_bboxes(
     return elements
 
 
-def filter_overlapped_text(
-    elements: List[Dict], 
-    assets: List[Dict],
-    page_metadata: Dict,
-    overlap_threshold: float = 0.60,
-    verbose: bool = False
-) -> Tuple[List[Dict], int]:
-    """
-    Remove text elements that overlap significantly with assets.
-    Uses normalized coordinates for comparison.
-    
-    IMPORTANT: This function expects elements to already have normalized bboxes.
-    Call normalize_all_element_bboxes() first!
-    """
-    if not assets:
-        return elements, 0
-    
-    # Group assets by page
-    assets_by_page = {}
-    for asset in assets:
-        page = asset.get('page_number', 9999)
-        if page not in assets_by_page:
-            assets_by_page[page] = []
-        assets_by_page[page].append(asset)
-    
-    filtered_elements = []
-    removed_count = 0
-    no_bbox_count = 0
-    no_norm_count = 0
-    
-    for elem in elements:
-        bbox = elem.get('bbox')
-        
-        # Keep elements without bboxes (shouldn't filter them)
-        if not bbox:
-            filtered_elements.append(elem)
-            no_bbox_count += 1
-            continue
-        
-        page = elem.get('page_number', 9999)
-        
-        # Keep elements on pages with no assets
-        if page not in assets_by_page:
-            filtered_elements.append(elem)
-            continue
-        
-        # Check if bbox is normalized
-        if not bbox.get('_is_normalized'):
-            # Try to normalize on the fly
-            page_width, page_height = get_page_ocr_dimensions(page_metadata, page)
-            if page_width and page_height:
-                bbox = normalize_text_bbox(bbox, page_width, page_height)
-                elem['bbox'] = bbox
-            else:
-                filtered_elements.append(elem)
-                no_norm_count += 1
-                continue
-        
-        # Check overlap with each asset on this page
-        is_overlapped = False
-        overlapping_asset = None
-        max_overlap = 0.0
-        
-        for asset in assets_by_page[page]:
-            asset_bbox = asset.get('bbox', {})
-            
-            # Skip assets without normalized bboxes
-            if not asset_bbox.get('_is_normalized'):
-                continue
-            
-            overlap = calculate_normalized_overlap(bbox, asset_bbox)
-            
-            if overlap > max_overlap:
-                max_overlap = overlap
-                overlapping_asset = asset
-            
-            if overlap > overlap_threshold:
-                is_overlapped = True
-                break
-        
-        if is_overlapped:
-            removed_count += 1
-            if verbose:
-                print(f"      [Filter] Removed text on p{page}: overlap={max_overlap:.2f}")
-                print(f"               Text norm: ({bbox['norm_left']:.3f}, {bbox['norm_top']:.3f}) - "
-                      f"({bbox['norm_right']:.3f}, {bbox['norm_bottom']:.3f})")
-                if overlapping_asset:
-                    ab = overlapping_asset.get('bbox', {})
-                    print(f"               Asset norm: ({ab.get('norm_left', 0):.3f}, {ab.get('norm_top', 0):.3f}) - "
-                          f"({ab.get('norm_right', 0):.3f}, {ab.get('norm_bottom', 0):.3f})")
-                # Show a snippet of the removed text
-                content = elem.get('content', '')[:50]
-                if content:
-                    print(f"               Content: \"{content}...\"")
-        else:
-            filtered_elements.append(elem)
-    
-    if verbose:
-        print(f"    [Debug] Filter stats: {no_bbox_count} no bbox, {no_norm_count} couldn't normalize")
-    
-    return filtered_elements, removed_count
-
 
 def integrate_assets_with_elements(
     elements: List[Dict], 
@@ -475,34 +335,25 @@ def integrate_assets_with_elements(
     """
     Merge assets into element stream using normalized Y positions for ordering.
     
+    Note: Overlap filtering of text inside figures/tables is handled earlier
+    in section_processor.py at the line level, before text aggregation.
+    
     Algorithm:
     1. Normalize all element bboxes (so they have norm_* values)
-    2. Filter overlapping text (using normalized coordinates)
-    3. Sort assets by normalized top position
-    4. Interleave assets before text elements they precede (by norm_top)
+    2. Sort assets by normalized top position
+    3. Interleave assets before text elements they precede (by norm_top)
     """
     if not assets:
         return elements
     
     if not page_metadata:
         print(f"    [Warning] No page_metadata - cannot normalize coordinates")
-        print(f"              Text filtering and positioning may be inaccurate")
+        print(f"              Asset positioning may be inaccurate")
         return elements  # Can't do much without metadata
     
-    # --- STEP 0: Normalize all element bboxes ---
+    # --- STEP 1: Normalize all element bboxes ---
     print(f"    Normalizing element bboxes...")
     elements = normalize_all_element_bboxes(elements, page_metadata, verbose=verbose)
-    
-    # --- STEP 1: Filter overlapping text ---
-    clean_elements, removed_count = filter_overlapped_text(
-        elements, assets, page_metadata,
-        overlap_threshold=0.60,
-        verbose=verbose
-    )
-    if removed_count > 0:
-        print(f"    Filtered {removed_count} text blocks overlapping with assets")
-    else:
-        print(f"    No overlapping text blocks found to filter")
     
     # --- STEP 2: Group and sort assets by page and normalized top ---
     assets_by_page: Dict[int, List[Dict]] = {}
@@ -526,7 +377,7 @@ def integrate_assets_with_elements(
     result = []
     current_page = None
     
-    for element in clean_elements:
+    for element in elements:
         elem_page = element.get('page_number', 9999)
         if isinstance(elem_page, str) and elem_page.isdigit():
             elem_page = int(elem_page)

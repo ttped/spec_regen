@@ -6,6 +6,126 @@ from typing import List, Dict, Tuple, Optional, Any
 from json_repair import repair_json
 
 
+# =============================================================================
+# YOLO ASSET OVERLAP FILTERING
+# =============================================================================
+
+def load_yolo_assets_for_filtering(exports_dir: str, doc_stem: str) -> Dict[int, List[Dict]]:
+    """
+    Load YOLO-detected asset bboxes for overlap filtering.
+    
+    Returns:
+        Dict mapping page_number -> list of normalized asset bboxes
+    """
+    assets_by_page: Dict[int, List[Dict]] = {}
+    
+    if not exports_dir or not doc_stem:
+        return assets_by_page
+    
+    asset_dir = os.path.join(exports_dir, doc_stem)
+    if not os.path.isdir(asset_dir):
+        return assets_by_page
+    
+    for filename in os.listdir(asset_dir):
+        if not filename.endswith(".json"):
+            continue
+        
+        json_path = os.path.join(asset_dir, filename)
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                meta = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            continue
+        
+        page = meta.get('page', 9999)
+        bbox_data = meta.get('bbox', {})
+        
+        # Extract pixel bbox and page dimensions
+        pixels = bbox_data.get('pixels', [])
+        page_width = bbox_data.get('page_width_px')
+        page_height = bbox_data.get('page_height_px')
+        
+        if len(pixels) < 4 or not page_width or not page_height:
+            continue
+        
+        # Normalize bbox to 0-1 range
+        x, y, w, h = pixels[0], pixels[1], pixels[2], pixels[3]
+        norm_bbox = {
+            'norm_left': x / page_width,
+            'norm_top': y / page_height,
+            'norm_right': (x + w) / page_width,
+            'norm_bottom': (y + h) / page_height,
+        }
+        
+        if page not in assets_by_page:
+            assets_by_page[page] = []
+        assets_by_page[page].append(norm_bbox)
+    
+    return assets_by_page
+
+
+def line_overlaps_asset(
+    line_bbox: Dict,
+    page_height: float,
+    page_width: float,
+    assets_on_page: List[Dict],
+    overlap_threshold: float = 0.60
+) -> bool:
+    """
+    Check if a line's bbox overlaps significantly with any asset on the page.
+    
+    Args:
+        line_bbox: Line bbox with left, top, width, height (in OCR pixels)
+        page_height: Page height for normalization
+        page_width: Page width for normalization  
+        assets_on_page: List of normalized asset bboxes
+        overlap_threshold: Fraction of line that must be covered to count as overlap
+    
+    Returns:
+        True if the line overlaps with an asset and should be filtered out
+    """
+    if not line_bbox or not assets_on_page:
+        return False
+    
+    if page_width <= 0 or page_height <= 0:
+        return False
+    
+    # Normalize line bbox
+    left = line_bbox.get('left', 0)
+    top = line_bbox.get('top', 0)
+    width = line_bbox.get('width', 0)
+    height = line_bbox.get('height', 0)
+    
+    line_norm = {
+        'left': left / page_width,
+        'top': top / page_height,
+        'right': (left + width) / page_width,
+        'bottom': (top + height) / page_height,
+    }
+    
+    line_area = (line_norm['right'] - line_norm['left']) * (line_norm['bottom'] - line_norm['top'])
+    if line_area <= 0:
+        return False
+    
+    for asset in assets_on_page:
+        # Calculate intersection
+        x_left = max(line_norm['left'], asset['norm_left'])
+        y_top = max(line_norm['top'], asset['norm_top'])
+        x_right = min(line_norm['right'], asset['norm_right'])
+        y_bottom = min(line_norm['bottom'], asset['norm_bottom'])
+        
+        if x_right <= x_left or y_bottom <= y_top:
+            continue
+        
+        intersection = (x_right - x_left) * (y_bottom - y_top)
+        overlap_ratio = intersection / line_area
+        
+        if overlap_ratio >= overlap_threshold:
+            return True
+    
+    return False
+
+
 def get_line_bbox(page_dict: Dict, word_indices: List[int]) -> Optional[Dict]:
     """
     Calculate the bounding box for a line given the indices of its words.
@@ -572,7 +692,10 @@ def run_section_processing_on_file(
     output_path: str, 
     content_start_page: int = 1,
     header_rel_threshold: float = 0.07,
-    footer_rel_threshold: float = 0.93
+    footer_rel_threshold: float = 0.93,
+    yolo_exports_dir: str = None,
+    doc_stem: str = None,
+    asset_overlap_threshold: float = 0.60
 ):
     """
     Main execution function - processes raw OCR file into organized sections with bbox metadata.
@@ -581,11 +704,22 @@ def run_section_processing_on_file(
         input_path: Path to the raw OCR JSON file.
         output_path: Path to save the organized sections JSON.
         content_start_page: The page number where actual content begins (skips ToC).
-        header_top_threshold: Filter out lines where bbox['top'] < this value (0 to disable).
-        footer_top_threshold: Filter out lines where bbox['top'] > this value (0 to disable).
+        header_rel_threshold: Filter out lines where normalized top < this value (0 to disable).
+        footer_rel_threshold: Filter out lines where normalized top > this value (0 to disable).
+        yolo_exports_dir: Directory containing YOLO-detected asset metadata (optional).
+        doc_stem: Document stem name for loading YOLO assets (required if yolo_exports_dir set).
+        asset_overlap_threshold: Fraction of line that must overlap asset to be filtered (0-1).
     """
     print(f"  - Loading raw OCR from: {input_path}")
     print(f"  - Content starts at page: {content_start_page}")
+    
+    # Load YOLO assets for overlap filtering (if provided)
+    yolo_assets_by_page: Dict[int, List[Dict]] = {}
+    if yolo_exports_dir and doc_stem:
+        yolo_assets_by_page = load_yolo_assets_for_filtering(yolo_exports_dir, doc_stem)
+        total_assets = sum(len(v) for v in yolo_assets_by_page.values())
+        if total_assets > 0:
+            print(f"  - Loaded {total_assets} YOLO assets for overlap filtering across {len(yolo_assets_by_page)} pages")
 
     
     pages_to_process = load_raw_ocr_pages(input_path)
@@ -613,12 +747,17 @@ def run_section_processing_on_file(
     raw_elements = []
     dropped_header_lines = 0
     dropped_footer_lines = 0
+    dropped_asset_overlap_lines = 0
     
     for page_id, page_dict, page_meta in content_pages:
         if page_meta:
             all_page_metadata[page_id] = page_meta
 
         page_height = page_meta.get('page_height', 0)
+        page_width = page_meta.get('page_width', 0)
+        
+        # Get YOLO assets for this page (if any)
+        assets_on_page = yolo_assets_by_page.get(page_id, [])
         
         lines = reconstruct_lines_with_bbox(page_dict)
         
@@ -656,6 +795,14 @@ def run_section_processing_on_file(
             # Note: For footers, you usually check if norm_top > 0.94 (or similar)
             if footer_rel_threshold > 0 and norm_top > footer_rel_threshold:
                 dropped_footer_lines += 1
+                continue
+            
+            # --- YOLO ASSET OVERLAP FILTER ---
+            # Filter out text that overlaps with detected figures/tables
+            if assets_on_page and line_overlaps_asset(
+                line_bbox, page_height, page_width, assets_on_page, asset_overlap_threshold
+            ):
+                dropped_asset_overlap_lines += 1
                 continue
 
             is_header, section_num, topic, remainder, context = check_if_paragraph_is_header(line_text)
@@ -725,6 +872,8 @@ def run_section_processing_on_file(
     
     section_count = sum(1 for e in final_elements if e['type'] == 'section')
     print(f"  - Extracted {len(final_elements)} elements ({section_count} sections).")
+    if dropped_asset_overlap_lines > 0:
+        print(f"  - Filtered {dropped_asset_overlap_lines} lines overlapping with YOLO-detected assets.")
 
 if __name__ == '__main__':
     import sys

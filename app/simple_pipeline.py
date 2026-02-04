@@ -326,7 +326,13 @@ def main():
             print("[3: Structure]")
             try:
                 content_start = load_content_start_page(classify_out, default=1)
-                run_section_processing_on_file(raw_input, organized_out, content_start_page=content_start)
+                run_section_processing_on_file(
+                    raw_input, 
+                    organized_out, 
+                    content_start_page=content_start,
+                    yolo_exports_dir=figures_dir,  # Pass YOLO exports for overlap filtering
+                    doc_stem=stem
+                )
             except Exception as e:
                 print(f"  [Error] Structure processing failed: {e}")
 
