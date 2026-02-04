@@ -1,24 +1,22 @@
 """
 asset_processor.py - Handles loading and positioning of figures and tables.
 
-FIXED VERSION - Addresses coordinate system mismatch between YOLO and OCR
+NORMALIZED COORDINATES VERSION
 
-This module:
-1. Loads figure/table metadata from exported JSON files
-2. SCALES asset bboxes to match OCR coordinate system (render_full -> render_raw)
-3. Filters out OCR text that lies INSIDE these assets (Double OCR Fix)
-4. Integrates assets into the document element stream based on VISUAL POSITION
-5. Interleaves assets between text blocks based on vertical (Y-axis) coordinates
+This module uses normalized (0-1) coordinates to avoid dimension mismatch issues.
+All bounding boxes are converted to relative coordinates before comparison.
 
-COORDINATE SPACES:
-- render_full: Original page images (~2530×3300) - YOLO runs on these (docs_images/)
-- render_raw:  Upscaled images (~5052×6600) - OCR/Tesseract runs on these
-- canonical:   Preprocessed (same dims as render_raw)
+Key insight:
+- YOLO bbox: One large box covering entire figure/table
+- OCR bbox: Many small boxes, one per text line
+- Normalization makes coordinate systems irrelevant
 
-Key Fix:
-- YOLO detects on render_full images (smaller)
-- OCR text bboxes are in render_raw coordinates (larger, ~2x)
-- This module scales YOLO bboxes UP to match OCR space before comparison
+Flow:
+1. Load assets with their source dimensions (page_width_px, page_height_px)
+2. Normalize asset bboxes to 0-1 range
+3. Normalize text bboxes using render_raw dimensions from page_metadata
+4. Compare normalized bboxes for overlap filtering
+5. Interleave assets based on normalized Y position
 """
 
 import os
@@ -27,9 +25,7 @@ from typing import List, Dict, Tuple, Optional, Any
 
 
 def load_asset_metadata(json_path: str) -> Optional[Dict]:
-    """
-    Load and parse a single asset metadata JSON file.
-    """
+    """Load and parse a single asset metadata JSON file."""
     try:
         with open(json_path, 'r', encoding='utf-8') as f:
             return json.load(f)
@@ -38,17 +34,15 @@ def load_asset_metadata(json_path: str) -> Optional[Dict]:
         return None
 
 
-def extract_asset_bbox_raw(meta: Dict) -> Optional[Dict]:
+def extract_and_normalize_asset_bbox(meta: Dict) -> Optional[Dict]:
     """
-    Extract bbox from asset metadata WITHOUT any scaling or normalization.
-    Returns the raw bbox values as they appear in the metadata.
+    Extract bbox from asset metadata and normalize to 0-1 range.
     
-    Also extracts the source image dimensions for later scaling.
+    Returns dict with both raw pixel values and normalized values.
     """
     bbox_data = meta.get('bbox', {})
     
     raw_bbox = None
-    bbox_source = None
     source_width = None
     source_height = None
     
@@ -56,19 +50,19 @@ def extract_asset_bbox_raw(meta: Dict) -> Optional[Dict]:
     if isinstance(bbox_data, dict):
         if 'pixels' in bbox_data:
             raw_bbox = bbox_data['pixels']
-            bbox_source = 'pixels'
         elif 'pdf_units' in bbox_data:
             raw_bbox = bbox_data['pdf_units']
-            bbox_source = 'pdf_units'
+        elif 'xyxy' in bbox_data:
+            # Handle xyxy format [x1, y1, x2, y2]
+            xyxy = bbox_data['xyxy']
+            raw_bbox = [xyxy[0], xyxy[1], xyxy[2] - xyxy[0], xyxy[3] - xyxy[1]]
         
-        # Get source image dimensions (from YOLO metadata)
         source_width = bbox_data.get('page_width_px')
         source_height = bbox_data.get('page_height_px')
         
-    # Case 2: Direct list (Simple format)
+    # Case 2: Direct list
     elif isinstance(bbox_data, list):
         raw_bbox = bbox_data
-        bbox_source = 'direct'
     
     if not raw_bbox or len(raw_bbox) < 4:
         return None
@@ -76,136 +70,41 @@ def extract_asset_bbox_raw(meta: Dict) -> Optional[Dict]:
     # Interpret as [x, y, width, height]
     x, y, w, h = raw_bbox[0], raw_bbox[1], raw_bbox[2], raw_bbox[3]
     
+    # Calculate normalized coordinates if we have source dimensions
+    norm_left = None
+    norm_top = None
+    norm_right = None
+    norm_bottom = None
+    
+    if source_width and source_height and source_width > 0 and source_height > 0:
+        norm_left = x / source_width
+        norm_top = y / source_height
+        norm_right = (x + w) / source_width
+        norm_bottom = (y + h) / source_height
+    
     return {
+        # Raw pixel values
         "left": x,
         "top": y,
         "width": w,
         "height": h,
         "right": x + w,
         "bottom": y + h,
-        "_source": bbox_source,
-        "_raw": raw_bbox,
+        # Source dimensions
         "_source_width": source_width,
         "_source_height": source_height,
+        # Normalized 0-1 values
+        "norm_left": norm_left,
+        "norm_top": norm_top,
+        "norm_right": norm_right,
+        "norm_bottom": norm_bottom,
+        "_is_normalized": norm_left is not None,
     }
-
-
-def scale_bbox_to_target(
-    bbox: Dict, 
-    source_width: float, 
-    source_height: float,
-    target_width: float, 
-    target_height: float
-) -> Dict:
-    """
-    Scale a bounding box from source coordinate system to target coordinate system.
-    
-    This is critical for aligning YOLO bboxes (render_raw) with OCR bboxes (canonical).
-    
-    Args:
-        bbox: The bounding box dict with left, top, width, height, right, bottom
-        source_width: Width of the image the bbox was detected on
-        source_height: Height of the image the bbox was detected on
-        target_width: Width of the target coordinate system
-        target_height: Height of the target coordinate system
-    
-    Returns:
-        A new bbox dict with scaled coordinates
-    """
-    if source_width <= 0 or source_height <= 0:
-        return bbox  # Can't scale, return as-is
-    
-    scale_x = target_width / source_width
-    scale_y = target_height / source_height
-    
-    scaled = {
-        "left": bbox["left"] * scale_x,
-        "top": bbox["top"] * scale_y,
-        "width": bbox["width"] * scale_x,
-        "height": bbox["height"] * scale_y,
-        "right": bbox["right"] * scale_x,
-        "bottom": bbox["bottom"] * scale_y,
-        "_source": bbox.get("_source"),
-        "_raw": bbox.get("_raw"),
-        "_scaled_from": (source_width, source_height),
-        "_scaled_to": (target_width, target_height),
-        "_scale_factors": (scale_x, scale_y),
-    }
-    
-    return scaled
-
-
-def load_all_assets(exports_dir: str, doc_stem: str) -> List[Dict]:
-    """
-    Load all figure/table assets for a document.
-    """
-    assets = []
-    
-    # Construct full path to the document's asset folder
-    asset_dir = os.path.join(exports_dir, doc_stem)
-    
-    if not os.path.isdir(asset_dir):
-        print(f"    [Note] Asset directory not found: {asset_dir}")
-        return assets
-    
-    print(f"    Scanning for assets in: {asset_dir}")
-    
-    loaded_count = 0
-    for filename in os.listdir(asset_dir):
-        if not filename.endswith(".json"):
-            continue
-        
-        json_path = os.path.join(asset_dir, filename)
-        meta = load_asset_metadata(json_path)
-        
-        if not meta:
-            continue
-        
-        # Normalize the asset type (handle YOLO 'fig'/'tab' vs full names)
-        raw_type = meta.get("asset_type", "").lower()
-        if raw_type in ["fig", "figure"]:
-            meta['type'] = 'figure'
-        elif raw_type in ["tab", "table"]:
-            meta['type'] = 'table'
-        else:
-            meta['type'] = 'figure'  # Default fallback
-        
-        # Extract raw bbox (includes source dimensions)
-        bbox = extract_asset_bbox_raw(meta)
-        if bbox:
-            meta['bbox'] = bbox
-            meta['_bbox_source_dims'] = (
-                bbox.get('_source_width'),
-                bbox.get('_source_height')
-            )
-        
-        # Get page number (normalize key)
-        page = meta.get('page', meta.get('page_number', 9999))
-        meta['page_number'] = page
-        
-        assets.append(meta)
-        loaded_count += 1
-    
-    fig_count = sum(1 for a in assets if a['type'] == 'figure')
-    tab_count = sum(1 for a in assets if a['type'] == 'table')
-    print(f"    Loaded {loaded_count} assets ({fig_count} figures, {tab_count} tables)")
-    
-    return assets
 
 
 def get_page_ocr_dimensions(page_metadata: Dict, page_number: int) -> Tuple[Optional[float], Optional[float]]:
     """
-    Extract the OCR coordinate space dimensions for a given page from page_metadata.
-    
-    The page_metadata comes from the OCR JSON and contains image_meta with
-    render_full, render_raw, and canonical dimensions.
-    
-    Priority order for OCR space (what text bboxes use):
-    1. render_raw - the upscaled image that Tesseract actually processes
-    2. canonical - preprocessed version (usually same dims as render_raw)
-    
-    Returns:
-        Tuple of (width, height) or (None, None) if not found
+    Get the OCR coordinate space dimensions (render_raw) for a page.
     """
     page_key = str(page_number)
     
@@ -215,7 +114,7 @@ def get_page_ocr_dimensions(page_metadata: Dict, page_number: int) -> Tuple[Opti
     page_info = page_metadata[page_key]
     image_meta = page_info.get('image_meta', {})
     
-    # Try render_raw first (this is what OCR/Tesseract actually uses)
+    # Try render_raw first (what OCR uses)
     render_raw = image_meta.get('render_raw', {})
     if render_raw:
         width = render_raw.get('width_px')
@@ -223,7 +122,7 @@ def get_page_ocr_dimensions(page_metadata: Dict, page_number: int) -> Tuple[Opti
         if width and height:
             return width, height
     
-    # Fall back to canonical (usually same dimensions)
+    # Fall back to canonical
     canonical = image_meta.get('canonical', {})
     if canonical:
         width = canonical.get('width_px')
@@ -234,277 +133,192 @@ def get_page_ocr_dimensions(page_metadata: Dict, page_number: int) -> Tuple[Opti
     return None, None
 
 
-def get_page_render_full_dimensions(page_metadata: Dict, page_number: int) -> Tuple[Optional[float], Optional[float]]:
+def normalize_text_bbox(bbox: Dict, page_width: float, page_height: float) -> Dict:
     """
-    Extract the render_full (original) image dimensions for a given page.
-    
-    render_full is the original rendered image BEFORE upscaling for OCR.
-    This is what YOLO processes (the images in docs_images/).
-    
-    Returns:
-        Tuple of (width, height) or (None, None) if not found
+    Add normalized coordinates to a text element's bbox.
     """
-    page_key = str(page_number)
+    if not bbox or page_width <= 0 or page_height <= 0:
+        return bbox
     
-    if page_key not in page_metadata:
-        return None, None
+    result = dict(bbox)
     
-    page_info = page_metadata[page_key]
-    image_meta = page_info.get('image_meta', {})
+    left = bbox.get('left', 0)
+    top = bbox.get('top', 0)
+    width = bbox.get('width', 0)
+    height = bbox.get('height', 0)
     
-    render_full = image_meta.get('render_full', {})
-    if render_full:
-        width = render_full.get('width_px')
-        height = render_full.get('height_px')
-        if width and height:
-            return width, height
+    # Ensure right/bottom exist
+    right = bbox.get('right', left + width)
+    bottom = bbox.get('bottom', top + height)
     
-    return None, None
+    result['right'] = right
+    result['bottom'] = bottom
+    result['norm_left'] = left / page_width
+    result['norm_top'] = top / page_height
+    result['norm_right'] = right / page_width
+    result['norm_bottom'] = bottom / page_height
+    result['_is_normalized'] = True
+    
+    return result
 
 
-def scale_assets_to_ocr_space(
-    assets: List[Dict], 
-    page_metadata: Dict,
-    verbose: bool = False
-) -> Tuple[List[Dict], int]:
-    """
-    Scale asset bounding boxes from YOLO coordinate space to OCR coordinate space.
+def load_all_assets(exports_dir: str, doc_stem: str) -> List[Dict]:
+    """Load all figure/table assets for a document."""
+    assets = []
+    asset_dir = os.path.join(exports_dir, doc_stem)
     
-    COORDINATE SPACES:
-    - YOLO runs on docs_images/ files (e.g., 1700 × 2200) - actual input to YOLO
-    - OCR text bboxes are in render_raw space (e.g., 5100 × 6600) - upscaled for Tesseract
+    if not os.path.isdir(asset_dir):
+        print(f"    [Note] Asset directory not found: {asset_dir}")
+        return assets
     
-    This function scales YOLO bboxes UP to match OCR coordinates.
+    print(f"    Scanning for assets in: {asset_dir}")
     
-    Source dimensions (what YOLO actually processed):
-    - YOLO-recorded dimensions from bbox metadata (page_width_px, page_height_px)
-    
-    Target dimensions (what OCR uses):
-    - render_raw from page_metadata
-    
-    Args:
-        assets: List of asset metadata dicts
-        page_metadata: Dict mapping page numbers to page info (from OCR JSON)
-        verbose: If True, print detailed debug info
-    
-    Returns:
-        Tuple of (scaled_assets, num_scaled)
-    """
-    scaled_assets = []
-    num_scaled = 0
-    num_skipped_no_source = 0
-    num_skipped_no_target = 0
-    
-    if verbose:
-        print(f"    [Debug] Scaling {len(assets)} assets")
-        print(f"    [Debug] page_metadata has {len(page_metadata)} pages")
-    
-    for asset in assets:
-        asset_copy = dict(asset)
-        bbox = asset_copy.get('bbox')
-        page = asset_copy.get('page_number', 9999)
-        
-        if verbose:
-            print(f"    [Debug] Asset on page {page}: bbox type={type(bbox)}")
-            if bbox:
-                print(f"    [Debug]   bbox keys: {list(bbox.keys()) if isinstance(bbox, dict) else 'N/A'}")
-        
-        if not bbox:
-            scaled_assets.append(asset_copy)
+    for filename in os.listdir(asset_dir):
+        if not filename.endswith(".json"):
             continue
         
-        # Get SOURCE dimensions (what YOLO actually ran on)
-        # These are recorded by YOLO in the bbox metadata
-        source_width = bbox.get('_source_width')
-        source_height = bbox.get('_source_height')
+        json_path = os.path.join(asset_dir, filename)
+        meta = load_asset_metadata(json_path)
         
-        if verbose:
-            print(f"    [Debug]   _source_width={source_width}, _source_height={source_height}")
-        
-        if not source_width or not source_height:
-            num_skipped_no_source += 1
-            if verbose:
-                print(f"    [Debug]   SKIPPED - no source dimensions")
-            scaled_assets.append(asset_copy)
+        if not meta:
             continue
         
-        # Get TARGET dimensions (OCR coordinate space = render_raw)
-        target_width, target_height = get_page_ocr_dimensions(page_metadata, page)
-        
-        if verbose:
-            print(f"    [Debug]   target (render_raw): {target_width}×{target_height}")
-        
-        if not target_width or not target_height:
-            num_skipped_no_target += 1
-            if verbose:
-                print(f"    [Debug]   SKIPPED - no target dimensions")
-            scaled_assets.append(asset_copy)
-            continue
-        
-        # Scale if dimensions differ
-        if source_width != target_width or source_height != target_height:
-            scaled_bbox = scale_bbox_to_target(
-                bbox, 
-                source_width, source_height,
-                target_width, target_height
-            )
-            asset_copy['bbox'] = scaled_bbox
-            asset_copy['_bbox_scaled'] = True
-            num_scaled += 1
-            
-            # Log scaling info
-            scale_x = target_width / source_width
-            scale_y = target_height / source_height
-            print(f"      Scaled asset on page {page}: "
-                  f"{source_width:.0f}×{source_height:.0f} -> {target_width:.0f}×{target_height:.0f} "
-                  f"(scale: {scale_x:.2f}x, {scale_y:.2f}x)")
-            
-            if verbose:
-                print(f"    [Debug]   Original bbox: left={bbox.get('left')}, top={bbox.get('top')}")
-                print(f"    [Debug]   Scaled bbox:   left={scaled_bbox.get('left'):.1f}, top={scaled_bbox.get('top'):.1f}")
+        # Normalize asset type
+        raw_type = meta.get("asset_type", "").lower()
+        if raw_type in ["fig", "figure"]:
+            meta['type'] = 'figure'
+        elif raw_type in ["tab", "table"]:
+            meta['type'] = 'table'
         else:
-            if verbose:
-                print(f"    [Debug]   No scaling needed - dimensions match")
+            meta['type'] = 'figure'
         
-        scaled_assets.append(asset_copy)
-    
-    # Report any issues
-    if num_skipped_no_source > 0:
-        print(f"    [Warning] {num_skipped_no_source} assets skipped - missing source dimensions (_source_width/_source_height in bbox)")
-    if num_skipped_no_target > 0:
-        print(f"    [Warning] {num_skipped_no_target} assets skipped - missing target dimensions (render_raw in page_metadata)")
-    
-    return scaled_assets, num_scaled
-
-
-def calculate_overlap_ratio(text_bbox: Dict, asset_bbox: Dict) -> float:
-    """
-    Calculates what fraction of the text block is covered by the asset block.
-    Returns float 0.0 to 1.0.
-    """
-    # Determine intersection rectangle
-    x_left = max(text_bbox['left'], asset_bbox['left'])
-    y_top = max(text_bbox['top'], asset_bbox['top'])
-    x_right = min(text_bbox['right'], asset_bbox['right'])
-    y_bottom = min(text_bbox['bottom'], asset_bbox['bottom'])
-
-    if x_right < x_left or y_bottom < y_top:
-        return 0.0
-
-    intersection_area = (x_right - x_left) * (y_bottom - y_top)
-    text_area = text_bbox['width'] * text_bbox['height']
-    
-    if text_area <= 0:
-        return 0.0
+        # Extract and normalize bbox
+        bbox = extract_and_normalize_asset_bbox(meta)
+        if bbox:
+            meta['bbox'] = bbox
         
-    return intersection_area / text_area
+        # Get page number
+        page = meta.get('page', meta.get('page_number', 9999))
+        meta['page_number'] = page
+        
+        assets.append(meta)
+    
+    fig_count = sum(1 for a in assets if a['type'] == 'figure')
+    tab_count = sum(1 for a in assets if a['type'] == 'table')
+    print(f"    Loaded {len(assets)} assets ({fig_count} figures, {tab_count} tables)")
+    
+    # Check normalization status
+    normalized_count = sum(1 for a in assets if a.get('bbox', {}).get('_is_normalized'))
+    if normalized_count < len(assets):
+        print(f"    [Warning] Only {normalized_count}/{len(assets)} assets have normalized bboxes")
+    
+    return assets
 
 
-def calculate_iou(bbox1: Dict, bbox2: Dict) -> float:
+def calculate_normalized_overlap(text_bbox: Dict, asset_bbox: Dict) -> float:
     """
-    Calculate Intersection over Union (IoU) between two bounding boxes.
-    
-    This is a more robust overlap metric that considers both boxes' sizes.
+    Calculate overlap ratio using normalized coordinates.
+    Returns what fraction of the text box is covered by the asset.
     """
-    x_left = max(bbox1['left'], bbox2['left'])
-    y_top = max(bbox1['top'], bbox2['top'])
-    x_right = min(bbox1['right'], bbox2['right'])
-    y_bottom = min(bbox1['bottom'], bbox2['bottom'])
+    # Check if both have normalized coordinates
+    if not text_bbox.get('_is_normalized') or not asset_bbox.get('_is_normalized'):
+        return 0.0
     
-    if x_right < x_left or y_bottom < y_top:
+    # Get normalized bounds
+    t_left = text_bbox['norm_left']
+    t_top = text_bbox['norm_top']
+    t_right = text_bbox['norm_right']
+    t_bottom = text_bbox['norm_bottom']
+    
+    a_left = asset_bbox['norm_left']
+    a_top = asset_bbox['norm_top']
+    a_right = asset_bbox['norm_right']
+    a_bottom = asset_bbox['norm_bottom']
+    
+    # Calculate intersection
+    x_left = max(t_left, a_left)
+    y_top = max(t_top, a_top)
+    x_right = min(t_right, a_right)
+    y_bottom = min(t_bottom, a_bottom)
+    
+    if x_right <= x_left or y_bottom <= y_top:
         return 0.0
     
     intersection = (x_right - x_left) * (y_bottom - y_top)
+    text_area = (t_right - t_left) * (t_bottom - t_top)
     
-    area1 = bbox1['width'] * bbox1['height']
-    area2 = bbox2['width'] * bbox2['height']
-    union = area1 + area2 - intersection
-    
-    if union <= 0:
+    if text_area <= 0:
         return 0.0
     
-    return intersection / union
+    return intersection / text_area
 
 
 def filter_overlapped_text(
     elements: List[Dict], 
     assets: List[Dict],
+    page_metadata: Dict,
     overlap_threshold: float = 0.60,
     verbose: bool = False
 ) -> Tuple[List[Dict], int]:
     """
-    Removes text elements that are significantly overlapped by an asset (figure/table).
-    This prevents "double OCR" where the text appears both in the image and as raw text.
-    
-    Args:
-        elements: List of document elements (sections, text blocks, etc.)
-        assets: List of assets with scaled bboxes
-        overlap_threshold: Minimum overlap ratio to filter (0.0-1.0)
-        verbose: If True, print details about each filtered element
-    
-    Returns:
-        Tuple of (filtered_elements, removed_count)
+    Remove text elements that overlap significantly with assets.
+    Uses normalized coordinates for comparison.
     """
     if not assets:
         return elements, 0
-        
-    # Group assets by page for faster lookup
+    
+    # Group assets by page
     assets_by_page = {}
     for asset in assets:
         page = asset.get('page_number', 9999)
         if page not in assets_by_page:
             assets_by_page[page] = []
         assets_by_page[page].append(asset)
-        
+    
     filtered_elements = []
     removed_count = 0
     
     for elem in elements:
-        # Skip elements that don't have bboxes or aren't text/sections
-        if 'bbox' not in elem or not elem['bbox']:
+        bbox = elem.get('bbox')
+        if not bbox:
             filtered_elements.append(elem)
             continue
-            
+        
         page = elem.get('page_number', 9999)
         if page not in assets_by_page:
             filtered_elements.append(elem)
             continue
-            
-        # Check against all assets on this page
+        
+        # Get page dimensions and normalize text bbox
+        page_width, page_height = get_page_ocr_dimensions(page_metadata, page)
+        if not page_width or not page_height:
+            filtered_elements.append(elem)
+            continue
+        
+        norm_text_bbox = normalize_text_bbox(bbox, page_width, page_height)
+        
+        # Check overlap with each asset on this page
         is_overlapped = False
-        text_bbox = elem['bbox']
-        
-        # Ensure text_bbox has right/bottom calculated
-        if 'right' not in text_bbox and 'width' in text_bbox:
-            text_bbox = dict(text_bbox)
-            text_bbox['right'] = text_bbox['left'] + text_bbox['width']
-            text_bbox['bottom'] = text_bbox['top'] + text_bbox['height']
-        
         for asset in assets_by_page[page]:
-            asset_bbox = asset.get('bbox')
-            if not asset_bbox:
-                continue
-                
-            # Check overlap
-            overlap_ratio = calculate_overlap_ratio(text_bbox, asset_bbox)
+            asset_bbox = asset.get('bbox', {})
             
-            # THRESHOLD: If >60% of text area is inside the asset, filter it
-            if overlap_ratio > overlap_threshold:
+            overlap = calculate_normalized_overlap(norm_text_bbox, asset_bbox)
+            
+            if overlap > overlap_threshold:
                 is_overlapped = True
                 if verbose:
-                    print(f"      [Filter] Dropped text on p{page} "
-                          f"(overlap {overlap_ratio:.2f} with {asset.get('asset_id', 'unknown')})")
-                    print(f"               Text bbox: ({text_bbox['left']:.0f}, {text_bbox['top']:.0f}) - "
-                          f"({text_bbox['right']:.0f}, {text_bbox['bottom']:.0f})")
-                    print(f"               Asset bbox: ({asset_bbox['left']:.0f}, {asset_bbox['top']:.0f}) - "
-                          f"({asset_bbox['right']:.0f}, {asset_bbox['bottom']:.0f})")
+                    print(f"      [Filter] Text on p{page}: overlap={overlap:.2f}")
+                    print(f"               Text norm: ({norm_text_bbox['norm_left']:.3f}, {norm_text_bbox['norm_top']:.3f}) - "
+                          f"({norm_text_bbox['norm_right']:.3f}, {norm_text_bbox['norm_bottom']:.3f})")
+                    print(f"               Asset norm: ({asset_bbox['norm_left']:.3f}, {asset_bbox['norm_top']:.3f}) - "
+                          f"({asset_bbox['norm_right']:.3f}, {asset_bbox['norm_bottom']:.3f})")
                 break
         
         if is_overlapped:
             removed_count += 1
         else:
             filtered_elements.append(elem)
-            
+    
     return filtered_elements, removed_count
 
 
@@ -515,118 +329,109 @@ def integrate_assets_with_elements(
     verbose: bool = False
 ) -> List[Dict]:
     """
-    Merge assets into the element stream by INTERLEAVING them based on vertical position.
+    Merge assets into element stream using normalized Y positions for ordering.
     
     Algorithm:
-    1. Scale asset bboxes to OCR coordinate space (render_raw -> canonical)
-    2. Filter out text elements that are visually covered by assets (Double OCR fix).
-    3. Sort assets for a page by their 'top' (Y) coordinate.
-    4. Iterate through text elements.
-    5. If an asset's 'top' is LESS than the current text element's 'top', insert it BEFORE.
-    6. Any remaining assets for the page are appended at the end of the page.
-    
-    Args:
-        elements: List of document elements from OCR/structure processing
-        assets: List of asset metadata dicts
-        page_metadata: Dict mapping page numbers to page info (for coordinate scaling)
-        verbose: If True, print detailed debug information
+    1. Filter overlapping text (using normalized coordinates)
+    2. Sort assets by normalized top position
+    3. Interleave assets before text elements they precede (by norm_top)
     """
     if not assets:
         return elements
-
-    # --- STEP 0: Scale asset bboxes to OCR coordinate space ---
-    if page_metadata:
-        scaled_assets, num_scaled = scale_assets_to_ocr_space(assets, page_metadata, verbose=verbose)
-        if num_scaled > 0:
-            print(f"    Scaled {num_scaled} asset bboxes to OCR coordinate space.")
-        elif verbose:
-            print(f"    [Debug] No assets were scaled")
-        assets = scaled_assets
-    else:
-        print(f"    [Warning] No page_metadata available - skipping bbox scaling")
-        print(f"              Asset positions may not align correctly with text!")
-
-    # --- STEP 1: Filter Double OCR Text ---
-    clean_elements, removed_count = filter_overlapped_text(
-        elements, assets, 
-        overlap_threshold=0.60,
-        verbose=verbose
-    )
-    if removed_count > 0:
-        print(f"    Filtered out {removed_count} text blocks overlapping with assets (Double OCR fix).")
     
-    # --- STEP 2: Group assets by page and SORT by Top position ---
+    if not page_metadata:
+        print(f"    [Warning] No page_metadata - cannot normalize coordinates")
+        print(f"              Falling back to raw pixel comparison (may be inaccurate)")
+    
+    # --- STEP 1: Filter overlapping text ---
+    if page_metadata:
+        clean_elements, removed_count = filter_overlapped_text(
+            elements, assets, page_metadata,
+            overlap_threshold=0.60,
+            verbose=verbose
+        )
+        if removed_count > 0:
+            print(f"    Filtered {removed_count} text blocks overlapping with assets")
+    else:
+        clean_elements = elements
+    
+    # --- STEP 2: Group and sort assets by page and normalized top ---
     assets_by_page: Dict[int, List[Dict]] = {}
     for asset in assets:
-        # Robust page parsing
         page = asset.get('page_number', 9999)
         if isinstance(page, str) and page.isdigit():
             page = int(page)
-        elif not isinstance(page, int):
-            page = 9999
-            
+        
         if page not in assets_by_page:
             assets_by_page[page] = []
         assets_by_page[page].append(asset)
     
-    # Sort assets within each page strictly by 'top' position
+    # Sort by normalized top (fall back to raw top if not normalized)
     for page in assets_by_page:
-        assets_by_page[page].sort(key=lambda a: a.get('bbox', {}).get('top', 9999))
+        assets_by_page[page].sort(
+            key=lambda a: a.get('bbox', {}).get('norm_top') or 
+                          (a.get('bbox', {}).get('top', 9999) / 10000)
+        )
     
+    # --- STEP 3: Interleave assets with text elements ---
     result = []
     current_page = None
     
-    # --- STEP 3: Iterate through existing text elements ---
     for element in clean_elements:
         elem_page = element.get('page_number', 9999)
         if isinstance(elem_page, str) and elem_page.isdigit():
             elem_page = int(elem_page)
         
-        # If we moved to a NEW page, flush any remaining assets from the PREVIOUS page
+        # Flush remaining assets from previous page
         if current_page is not None and elem_page != current_page:
             if current_page in assets_by_page:
-                remaining_assets = assets_by_page.pop(current_page)
-                if remaining_assets:
-                    result.extend(remaining_assets)
+                remaining = assets_by_page.pop(current_page)
+                result.extend(remaining)
         
         current_page = elem_page
         
-        # --- STEP 4: Check if any assets on CURRENT page belong BEFORE this element ---
+        # Get element's normalized top position
+        elem_bbox = element.get('bbox', {})
+        if page_metadata:
+            page_width, page_height = get_page_ocr_dimensions(page_metadata, current_page)
+            if page_height and page_height > 0:
+                elem_norm_top = elem_bbox.get('top', 0) / page_height
+            else:
+                elem_norm_top = elem_bbox.get('top', 0) / 10000
+        else:
+            elem_norm_top = elem_bbox.get('top', 0) / 10000
+        
+        # Insert assets that come before this element
         if current_page in assets_by_page:
             page_assets = assets_by_page[current_page]
             
-            # Get current element's top position
-            elem_top = element.get('bbox', {}).get('top', float('inf'))
-            
-            # Identify assets that appear visibly "above" this text block
-            assets_to_insert = []
             while page_assets:
-                next_asset = page_assets[0]
-                asset_top = next_asset.get('bbox', {}).get('top', 9999)
+                asset = page_assets[0]
+                asset_norm_top = asset.get('bbox', {}).get('norm_top')
                 
-                # If asset is definitely above the text, insert it now
-                if asset_top < elem_top:
-                    assets_to_insert.append(page_assets.pop(0))
+                if asset_norm_top is None:
+                    asset_top = asset.get('bbox', {}).get('top', 9999)
+                    asset_norm_top = asset_top / 10000
+                
+                if asset_norm_top < elem_norm_top:
+                    result.append(page_assets.pop(0))
+                    if verbose:
+                        print(f"      Inserted asset at norm_top={asset_norm_top:.3f} "
+                              f"before element at {elem_norm_top:.3f}")
                 else:
-                    # Next asset is below this text, stop checking
                     break
-            
-            if assets_to_insert:
-                result.extend(assets_to_insert)
-
-        # Add the text element itself
+        
         result.append(element)
     
-    # --- STEP 5: Handle assets for the very last page processed ---
+    # Flush final page's remaining assets
     if current_page is not None and current_page in assets_by_page:
-        remaining = assets_by_page.pop(current_page)
-        result.extend(remaining)
+        result.extend(assets_by_page.pop(current_page))
     
-    # --- STEP 6: Handle orphaned assets (pages with no text elements at all) ---
+    # Add orphaned assets (pages with no text)
     for page in sorted(assets_by_page.keys()):
         page_assets = assets_by_page[page]
         result.extend(page_assets)
-        print(f"      + Added {len(page_assets)} assets to text-less page {page}")
+        print(f"      Added {len(page_assets)} assets to text-less page {page}")
     
     return result
 
@@ -640,15 +445,7 @@ def run_asset_integration(
     verbose: bool = False
 ):
     """
-    Main function to integrate assets.
-    
-    Args:
-        input_path: Path to the structure JSON (from section_processor)
-        output_path: Path to save the integrated JSON
-        exports_dir: Base directory containing asset exports (e.g., yolo_exports/)
-        doc_stem: Document stem name (for finding the right subfolder)
-        positioning_mode: "bbox" (default) - future support for other modes
-        verbose: If True, print detailed debug information
+    Main entry point for asset integration.
     """
     print(f"  - Reading structure: {input_path}")
     
@@ -667,15 +464,16 @@ def run_asset_integration(
         elements = data if isinstance(data, list) else []
         page_metadata = {}
     
+    if verbose:
+        print(f"  - Loaded {len(elements)} elements")
+        print(f"  - page_metadata has {len(page_metadata)} pages")
+    
     # Load assets
     assets = load_all_assets(exports_dir, doc_stem)
     
-    # Integrate (now with coordinate scaling)
+    # Integrate
     integrated = integrate_assets_with_elements(
-        elements, 
-        assets, 
-        page_metadata,
-        verbose=verbose
+        elements, assets, page_metadata, verbose=verbose
     )
     
     # Save
@@ -690,7 +488,7 @@ def run_asset_integration(
     
     asset_count = sum(1 for e in integrated if e.get('type') in ('figure', 'table'))
     print(f"  - Saved to: {output_path}")
-    print(f"  - Final Element Count: {len(integrated)} (Integrated {asset_count} assets)")
+    print(f"  - Final count: {len(integrated)} elements ({asset_count} assets)")
 
 
 if __name__ == '__main__':
@@ -705,4 +503,4 @@ if __name__ == '__main__':
         
         run_asset_integration(input_file, output_file, exports_dir, doc_stem, verbose=verbose)
     else:
-        print("Usage: python asset_processor.py <input.json> <output.json> <exports_dir> [doc_stem] [-v|--verbose]")
+        print("Usage: python asset_processor.py <input.json> <output.json> <exports_dir> [doc_stem] [-v]")
