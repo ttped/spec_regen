@@ -253,6 +253,7 @@ def check_ocr_for_keywords(
     Check if the OCR text for a page contains figure/table keywords.
     
     This is a fallback validation when no caption is detected by YOLO.
+    Requires a numbered reference like "Figure 1", "Table 2.1", "Fig. 3" etc.
     
     Args:
         raw_ocr_dir: Directory containing raw OCR JSON files
@@ -263,6 +264,8 @@ def check_ocr_for_keywords(
     Returns:
         True if relevant keywords are found on the page
     """
+    import re
+    
     if not raw_ocr_dir:
         return False
     
@@ -297,14 +300,14 @@ def check_ocr_for_keywords(
     # Join all text and search for keywords
     page_text = ' '.join(str(t) for t in text_list).lower()
     
+    # Require numbered references to reduce false positives
+    # Matches: "figure 1", "figure 2.1", "fig. 3", "fig 4", "table 1", etc.
     if asset_type == "figure":
-        # Look for "figure", "fig.", "fig " patterns
-        keywords = ['figure ', 'figure.', 'fig.', 'fig ']
+        pattern = r'\b(figure|fig\.?)\s*\d'
     else:  # table
-        # Look for "table" patterns
-        keywords = ['table ', 'table.', 'tab.', 'tab ']
+        pattern = r'\b(table|tab\.?)\s*\d'
     
-    return any(kw in page_text for kw in keywords)
+    return bool(re.search(pattern, page_text))
 
 
 def run_detection_on_image(
@@ -399,6 +402,7 @@ def run_detection_on_image(
         
         # Skip unvalidated assets
         if validated_by == "none":
+            print(f"      [Rejected] {asset_class} on page {page_number} - no caption or keyword found")
             continue
         
         asset = DetectedAsset(
@@ -628,6 +632,12 @@ def run_yolo_extraction(
     if raw_ocr_dir is None:
         raw_ocr_dir = str(paths['raw_ocr_dir'])
     
+    # Verify raw_ocr_dir exists
+    if not os.path.isdir(raw_ocr_dir):
+        print(f"  [WARNING] Raw OCR directory not found: {raw_ocr_dir}")
+        print(f"  [WARNING] OCR keyword validation will not work - only caption detection will be used")
+        raw_ocr_dir = None
+    
     print("=" * 60)
     print("YOLO ASSET EXTRACTION")
     print("=" * 60)
@@ -635,7 +645,7 @@ def run_yolo_extraction(
     print(f"  Output directory: {output_dir}")
     print(f"  Confidence threshold: {confidence_threshold}")
     print(f"  Device: {device}")
-    print(f"  Raw OCR directory: {raw_ocr_dir}")
+    print(f"  Raw OCR directory: {raw_ocr_dir or '(not found)'}")
     print()
     
     # Group images by document
