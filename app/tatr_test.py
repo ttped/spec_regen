@@ -1,32 +1,66 @@
+import os
 import torch
 from PIL import Image, ImageDraw
 from transformers import TableTransformerForObjectDetection, DetrImageProcessor
 
-def load_and_run_structure_model(image_path, model_directory):
+def get_model_path():
     """
-    Loads a local Table Transformer model and detects table structure (cells/rows).
-    Returns the original image with detected bounding boxes drawn on it.
+    Resolves the absolute path to the model directory.
+    Assumes structure:
+      repo_name/
+      ├── app/tatr_test.py
+      └── models/tatr-structure/
     """
-    # Load model and processor from local files explicitly
+    # Get the directory where this script lives (repo_name/app)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Go up one level (..) to repo root, then down into models
+    model_path = os.path.join(script_dir, "..", "models", "tatr-structure")
+    
+    return os.path.normpath(model_path)
+
+def load_local_model():
+    """
+    Loads the model and processor from the local directory.
+    """
+    model_dir = get_model_path()
+
+    # Explicit check to avoid vague errors
+    config_file = os.path.join(model_dir, "config.json")
+    if not os.path.exists(config_file):
+        raise FileNotFoundError(f"CRITICAL: Config not found at {config_file}. Check folder structure.")
+
+    print(f"Loading model from: {model_dir}")
+
+    # Load with local_files_only=True to prevent any internet connection attempts
     model = TableTransformerForObjectDetection.from_pretrained(
-        model_directory, 
+        model_dir, 
         local_files_only=True
     )
     processor = DetrImageProcessor.from_pretrained(
-        model_directory, 
+        model_dir, 
         local_files_only=True
     )
+    
+    return model, processor
+
+def run_inference(image_path, model, processor):
+    """
+    Runs the model on the image and returns bounding box results.
+    """
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image not found at {image_path}")
 
     image = Image.open(image_path).convert("RGB")
     
-    # Preprocess image
+    # Preprocess
     inputs = processor(images=image, return_tensors="pt")
 
-    # Forward pass (inference)
+    # Inference
     with torch.no_grad():
         outputs = model(**inputs)
 
-    # Convert outputs (logits/boxes) to actual coordinates
+    # Convert logits to bounding boxes
     target_sizes = [image.size[::-1]]
     results = processor.post_process_object_detection(
         outputs, 
@@ -34,33 +68,44 @@ def load_and_run_structure_model(image_path, model_directory):
         target_sizes=target_sizes
     )[0]
 
-    return _draw_boxes(image, results)
+    return image, results
 
-def _draw_boxes(image, results):
+def draw_boxes(image, results):
     """
-    Helper to draw bounding boxes on the image for visual validation.
+    Draws red bounding boxes around detected table elements.
     """
     draw = ImageDraw.Draw(image)
     
     for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
-        # Unpack box coordinates
+        # Convert tensor to list and round
         box = [round(i, 2) for i in box.tolist()]
         xmin, ymin, xmax, ymax = box
         
-        # Draw rectangle (Red for high visibility)
+        # Draw box
         draw.rectangle((xmin, ymin, xmax, ymax), outline="red", width=2)
         
-        # Optional: Label the box (0 usually maps to 'table')
-        # In structure models, labels might be 'table row', 'table column', etc.
+        # Draw Label (Score)
         draw.text((xmin, ymin), f"{score:.2f}", fill="red")
 
     return image
 
 if __name__ == "__main__":
-    # Example usage
-    local_model_path = "./models/tatr-structure"
-    test_image = "test_table.jpg" # Ensure this file exists
+    # 1. Setup
+    # Ensure you have a 'test_table.jpg' in the same folder as this script (app/)
+    # Or update this path to where your image is.
+    input_image_path = os.path.join(os.path.dirname(__file__), "test_table.jpg")
+    output_image_path = os.path.join(os.path.dirname(__file__), "output_result.jpg")
+
+    # 2. Load
+    model, processor = load_local_model()
+
+    # 3. Run
+    print(f"Processing image: {input_image_path}")
+    original_image, results = run_inference(input_image_path, model, processor)
+
+    # 4. Visualize
+    final_image = draw_boxes(original_image, results)
     
-    result_img = load_and_run_structure_model(test_image, local_model_path)
-    result_img.save("test_output.jpg")
-    print("Test complete. Check 'test_output.jpg' for results.")
+    # 5. Save
+    final_image.save(output_image_path)
+    print(f"Done. Result saved to: {output_image_path}")
