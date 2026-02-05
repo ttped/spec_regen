@@ -235,14 +235,16 @@ def main():
                     images_dir=Path(args.images_dir),
                     output_dir=Path(args.yolo_exports_dir),
                     confidence_threshold=args.yolo_confidence,
-                    device=args.yolo_device
+                    device=args.yolo_device,
+                    raw_ocr_dir=args.raw_ocr_dir
                 )
         else:
             run_yolo_extraction(
                 images_dir=Path(args.images_dir),
                 output_dir=Path(args.yolo_exports_dir),
                 confidence_threshold=args.yolo_confidence,
-                device=args.yolo_device
+                device=args.yolo_device,
+                raw_ocr_dir=args.raw_ocr_dir
             )
         print()
 

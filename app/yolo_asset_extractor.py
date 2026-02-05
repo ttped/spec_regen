@@ -34,7 +34,6 @@ from PIL import Image
 HUGGINGFACE_MODEL = "juliozhao/DocLayout-YOLO-DocStructBench"
 
 # DocLayout-YOLO class mapping (from DocStructBench)
-# We only care about figures and tables
 YOLO_CLASSES = {
     0: "title",
     1: "plain_text",
@@ -51,6 +50,24 @@ YOLO_CLASSES = {
 # Classes we want to extract as assets
 ASSET_CLASSES = {"figure", "table"}
 
+# Caption classes that validate assets
+CAPTION_CLASSES = {"figure_caption", "table_caption"}
+
+# Mapping from asset type to its caption type
+ASSET_TO_CAPTION = {
+    "figure": "figure_caption",
+    "table": "table_caption",
+}
+
+
+@dataclass
+class Detection:
+    """Represents any YOLO detection (asset or caption)."""
+    class_name: str
+    bbox_pixels: Tuple[int, int, int, int]  # (x1, y1, x2, y2) in pixels
+    confidence: float
+    class_id: int
+
 
 @dataclass
 class DetectedAsset:
@@ -63,6 +80,9 @@ class DetectedAsset:
     doc_stem: str
     image_width: int
     image_height: int
+    has_caption: bool = False        # Whether a matching caption was detected
+    caption_bbox: Optional[Tuple[int, int, int, int]] = None  # Caption bbox if found
+    validated_by: str = "none"       # "caption", "ocr_keyword", or "none"
 
 
 def get_paths():
@@ -73,6 +93,7 @@ def get_paths():
     return {
         'images_dir': project_root / "docs_images",
         'exports_dir': project_root / "yolo_exports",  # Output directory for extracted assets
+        'raw_ocr_dir': project_root / "iris_ocr" / "CM_Spec_OCR_and_figtab_output" / "raw_data_advanced",
     }
 
 
@@ -141,21 +162,180 @@ def group_images_by_document(images_dir: Path) -> Dict[str, List[Tuple[Path, int
     return dict(docs)
 
 
+def calculate_bbox_proximity(
+    asset_bbox: Tuple[int, int, int, int],
+    caption_bbox: Tuple[int, int, int, int],
+    image_height: int
+) -> Tuple[bool, float]:
+    """
+    Check if a caption bbox is near an asset bbox.
+    
+    Captions are typically directly above or below the asset.
+    Returns (is_nearby, distance_ratio) where distance_ratio is relative to image height.
+    """
+    ax1, ay1, ax2, ay2 = asset_bbox
+    cx1, cy1, cx2, cy2 = caption_bbox
+    
+    # Check horizontal overlap - caption should overlap horizontally with asset
+    horizontal_overlap = min(ax2, cx2) - max(ax1, cx1)
+    asset_width = ax2 - ax1
+    
+    if horizontal_overlap < asset_width * 0.3:  # At least 30% horizontal overlap
+        return False, float('inf')
+    
+    # Calculate vertical distance
+    # Caption above asset
+    if cy2 <= ay1:
+        vertical_distance = ay1 - cy2
+    # Caption below asset
+    elif cy1 >= ay2:
+        vertical_distance = cy1 - ay2
+    # Overlapping vertically (caption inside or overlapping asset)
+    else:
+        vertical_distance = 0
+    
+    # Normalize by image height
+    distance_ratio = vertical_distance / image_height if image_height > 0 else float('inf')
+    
+    # Caption should be within 10% of image height from the asset
+    is_nearby = distance_ratio < 0.10
+    
+    return is_nearby, distance_ratio
+
+
+def find_matching_caption(
+    asset: Detection,
+    captions: List[Detection],
+    asset_type: str,
+    image_height: int
+) -> Optional[Detection]:
+    """
+    Find a caption that matches the given asset.
+    
+    Args:
+        asset: The figure or table detection
+        captions: List of all caption detections on the page
+        asset_type: "figure" or "table"
+        image_height: Height of the page image
+    
+    Returns:
+        The matching caption Detection, or None if not found
+    """
+    expected_caption_type = ASSET_TO_CAPTION.get(asset_type)
+    if not expected_caption_type:
+        return None
+    
+    best_caption = None
+    best_distance = float('inf')
+    
+    for caption in captions:
+        if caption.class_name != expected_caption_type:
+            continue
+        
+        is_nearby, distance = calculate_bbox_proximity(
+            asset.bbox_pixels, caption.bbox_pixels, image_height
+        )
+        
+        if is_nearby and distance < best_distance:
+            best_distance = distance
+            best_caption = caption
+    
+    return best_caption
+
+
+def check_ocr_for_keywords(
+    raw_ocr_dir: str,
+    doc_stem: str,
+    page_number: int,
+    asset_type: str
+) -> bool:
+    """
+    Check if the OCR text for a page contains figure/table keywords.
+    
+    This is a fallback validation when no caption is detected by YOLO.
+    
+    Args:
+        raw_ocr_dir: Directory containing raw OCR JSON files
+        doc_stem: Document stem name
+        page_number: Page number to check
+        asset_type: "figure" or "table"
+    
+    Returns:
+        True if relevant keywords are found on the page
+    """
+    if not raw_ocr_dir:
+        return False
+    
+    ocr_path = os.path.join(raw_ocr_dir, f"{doc_stem}.json")
+    if not os.path.exists(ocr_path):
+        return False
+    
+    try:
+        with open(ocr_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return False
+    
+    # Handle dict structure (keyed by page number)
+    page_key = str(page_number)
+    page_data = data.get(page_key)
+    
+    if not page_data:
+        # Try integer key
+        page_data = data.get(page_number)
+    
+    if not page_data:
+        return False
+    
+    # Extract text from page
+    page_dict = page_data.get('page_dict', page_data)
+    text_list = page_dict.get('text', [])
+    
+    if not text_list:
+        return False
+    
+    # Join all text and search for keywords
+    page_text = ' '.join(str(t) for t in text_list).lower()
+    
+    if asset_type == "figure":
+        # Look for "figure", "fig.", "fig " patterns
+        keywords = ['figure ', 'figure.', 'fig.', 'fig ']
+    else:  # table
+        # Look for "table" patterns
+        keywords = ['table ', 'table.', 'tab.', 'tab ']
+    
+    return any(kw in page_text for kw in keywords)
+
+
 def run_detection_on_image(
     model: 'YOLOv10',
     image_path: Path,
     doc_stem: str,
     page_number: int,
     confidence_threshold: float = 0.25,
-    device: str = 'cpu'
+    device: str = 'cpu',
+    raw_ocr_dir: str = None
 ) -> List[DetectedAsset]:
     """
     Run YOLO detection on a single page image.
     
+    Assets are validated by requiring either:
+    1. A matching caption detected by YOLO (figure_caption/table_caption)
+    2. Relevant keywords ("Figure", "Table") found in OCR text for the page
+    
+    Args:
+        model: The YOLO model
+        image_path: Path to the page image
+        doc_stem: Document stem name
+        page_number: Page number (1-indexed)
+        confidence_threshold: Minimum confidence for detections
+        device: Device to run inference on
+        raw_ocr_dir: Directory containing raw OCR files (for keyword fallback)
+    
     Returns:
-        List of DetectedAsset objects for figures and tables found
+        List of validated DetectedAsset objects for figures and tables
     """
-    assets = []
+    validated_assets = []
     
     # Run prediction
     results = model.predict(
@@ -168,41 +348,75 @@ def run_detection_on_image(
     )
     
     if not results or len(results) == 0:
-        return assets
+        return validated_assets
     
     result = results[0]
     
     # Get image dimensions
     img_height, img_width = result.orig_shape
     
-    # Process each detection
+    # Collect ALL detections first (assets and captions)
+    all_detections: List[Detection] = []
     for box in result.boxes:
         class_id = int(box.cls)
         class_name = YOLO_CLASSES.get(class_id, "unknown")
-        
-        # Only keep figures and tables
-        if class_name not in ASSET_CLASSES:
-            continue
-        
         confidence = float(box.conf)
         x1, y1, x2, y2 = box.xyxy[0].tolist()
         
-        # Normalize asset type for consistency with existing pipeline
-        asset_type = "fig" if class_name == "figure" else "tab"
+        detection = Detection(
+            class_name=class_name,
+            bbox_pixels=(int(x1), int(y1), int(x2), int(y2)),
+            confidence=confidence,
+            class_id=class_id
+        )
+        all_detections.append(detection)
+    
+    # Separate assets and captions
+    asset_detections = [d for d in all_detections if d.class_name in ASSET_CLASSES]
+    caption_detections = [d for d in all_detections if d.class_name in CAPTION_CLASSES]
+    
+    # Process each asset detection
+    for detection in asset_detections:
+        asset_class = detection.class_name  # "figure" or "table"
+        asset_type = "fig" if asset_class == "figure" else "tab"
+        
+        # Try to find a matching caption
+        matching_caption = find_matching_caption(
+            detection, caption_detections, asset_class, img_height
+        )
+        
+        has_caption = matching_caption is not None
+        caption_bbox = matching_caption.bbox_pixels if matching_caption else None
+        validated_by = "caption" if has_caption else "none"
+        
+        # If no caption found, try OCR keyword fallback
+        if not has_caption and raw_ocr_dir:
+            has_keyword = check_ocr_for_keywords(
+                raw_ocr_dir, doc_stem, page_number, asset_class
+            )
+            if has_keyword:
+                validated_by = "ocr_keyword"
+        
+        # Skip unvalidated assets
+        if validated_by == "none":
+            continue
         
         asset = DetectedAsset(
             asset_type=asset_type,
             page_number=page_number,
-            bbox_pixels=(int(x1), int(y1), int(x2), int(y2)),
-            confidence=confidence,
-            class_id=class_id,
+            bbox_pixels=detection.bbox_pixels,
+            confidence=detection.confidence,
+            class_id=detection.class_id,
             doc_stem=doc_stem,
             image_width=img_width,
-            image_height=img_height
+            image_height=img_height,
+            has_caption=has_caption,
+            caption_bbox=caption_bbox,
+            validated_by=validated_by
         )
-        assets.append(asset)
+        validated_assets.append(asset)
     
-    return assets
+    return validated_assets
 
 
 def crop_and_save_asset(
@@ -285,8 +499,17 @@ def create_asset_metadata(
             "confidence": round(asset.confidence, 4),
             "class_id": asset.class_id,
             "class_name": YOLO_CLASSES.get(asset.class_id, "unknown"),
+            "validated_by": asset.validated_by,
+            "has_caption": asset.has_caption,
         }
     }
+    
+    # Include caption bbox if available
+    if asset.caption_bbox:
+        cx1, cy1, cx2, cy2 = asset.caption_bbox
+        metadata["detection"]["caption_bbox"] = {
+            "pixels": [cx1, cy1, cx2 - cx1, cy2 - cy1],
+        }
     
     return metadata
 
@@ -297,13 +520,23 @@ def process_document(
     page_images: List[Tuple[Path, int]],
     output_dir: Path,
     confidence_threshold: float = 0.25,
-    device: str = 'cpu'
+    device: str = 'cpu',
+    raw_ocr_dir: str = None
 ) -> List[Dict]:
     """
-    Process all pages of a document and extract assets.
+    Process all pages of a document and extract validated assets.
+    
+    Args:
+        model: The YOLO model
+        doc_stem: Document stem name
+        page_images: List of (image_path, page_number) tuples
+        output_dir: Directory for output files
+        confidence_threshold: Minimum confidence for detections
+        device: Device to run inference on
+        raw_ocr_dir: Directory containing raw OCR files (for keyword fallback)
     
     Returns:
-        List of metadata dictionaries for all detected assets
+        List of metadata dictionaries for all validated assets
     """
     # Create document-specific output directory
     doc_output_dir = output_dir / doc_stem
@@ -311,6 +544,7 @@ def process_document(
     
     all_assets_metadata = []
     asset_counters = {"fig": 0, "tab": 0}
+    validation_stats = {"caption": 0, "ocr_keyword": 0}
     
     print(f"  Processing {len(page_images)} pages...")
     
@@ -322,16 +556,18 @@ def process_document(
             doc_stem=doc_stem,
             page_number=page_number,
             confidence_threshold=confidence_threshold,
-            device=device
+            device=device,
+            raw_ocr_dir=raw_ocr_dir
         )
         
         if detected_assets:
-            print(f"    Page {page_number}: Found {len(detected_assets)} assets")
+            print(f"    Page {page_number}: Found {len(detected_assets)} validated assets")
         
         # Process each detected asset
         for asset in detected_assets:
             asset_counters[asset.asset_type] += 1
             asset_index = asset_counters[asset.asset_type]
+            validation_stats[asset.validated_by] += 1
             
             # Crop and save the image
             image_filename, _ = crop_and_save_asset(
@@ -351,6 +587,9 @@ def process_document(
             with open(json_path, 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, indent=2)
     
+    # Print validation stats
+    print(f"  Validation: {validation_stats['caption']} by caption, {validation_stats['ocr_keyword']} by OCR keyword")
+    
     return all_assets_metadata
 
 
@@ -360,10 +599,13 @@ def run_yolo_extraction(
     doc_filter: Optional[str] = None,
     confidence_threshold: float = 0.25,
     device: str = 'cpu',
-    model_path: Optional[str] = None
+    model_path: Optional[str] = None,
+    raw_ocr_dir: Optional[str] = None
 ) -> Dict[str, List[Dict]]:
     """
     Main function to run YOLO extraction on all documents (or a specific one).
+    
+    Assets are validated by requiring either a detected caption or OCR keywords.
     
     Args:
         images_dir: Directory containing page images (defaults to docs_images/)
@@ -372,6 +614,7 @@ def run_yolo_extraction(
         confidence_threshold: Minimum confidence for detections
         device: 'cpu', 'cuda:0', or 'mps' for Apple Silicon
         model_path: Optional path to local model weights
+        raw_ocr_dir: Directory containing raw OCR files (auto-inferred if not provided)
     
     Returns:
         Dict mapping doc_stem -> list of asset metadata
@@ -381,6 +624,10 @@ def run_yolo_extraction(
     images_dir = Path(images_dir) if images_dir else paths['images_dir']
     output_dir = Path(output_dir) if output_dir else paths['exports_dir']
     
+    # Auto-infer raw_ocr_dir if not provided
+    if raw_ocr_dir is None:
+        raw_ocr_dir = str(paths['raw_ocr_dir'])
+    
     print("=" * 60)
     print("YOLO ASSET EXTRACTION")
     print("=" * 60)
@@ -388,6 +635,7 @@ def run_yolo_extraction(
     print(f"  Output directory: {output_dir}")
     print(f"  Confidence threshold: {confidence_threshold}")
     print(f"  Device: {device}")
+    print(f"  Raw OCR directory: {raw_ocr_dir}")
     print()
     
     # Group images by document
@@ -429,7 +677,8 @@ def run_yolo_extraction(
             page_images=page_images,
             output_dir=output_dir,
             confidence_threshold=confidence_threshold,
-            device=device
+            device=device,
+            raw_ocr_dir=raw_ocr_dir
         )
         
         results[doc_stem] = assets
@@ -512,6 +761,12 @@ if __name__ == '__main__':
         default=None,
         help="Path to local model weights (optional)"
     )
+    parser.add_argument(
+        '--raw-ocr-dir',
+        type=str,
+        default=None,
+        help="Directory containing raw OCR JSON files (auto-inferred if not provided)"
+    )
     
     args = parser.parse_args()
     
@@ -521,5 +776,6 @@ if __name__ == '__main__':
         doc_filter=args.doc,
         confidence_threshold=args.conf,
         device=args.device,
-        model_path=args.model
+        model_path=args.model,
+        raw_ocr_dir=args.raw_ocr_dir
     )
