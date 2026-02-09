@@ -21,6 +21,12 @@ UPDATES (v3):
 - Added enhanced blank/empty title features
 - Added relative position within page features (for late-page junk detection)
 - Added height-based features to detect text that spans multiple lines
+
+UPDATES (v4):
+- Added OCR metadata columns (_ocr_*) for human review: block_num, par_num,
+  line_num, word_count, confidence stats from word-level Tesseract output
+- Added OCR-derived ML features (ocr_*): confidence flags, structural flags,
+  word position features for better false-positive detection
 """
 
 import os
@@ -247,6 +253,73 @@ def extract_features_for_section(
     features['_page'] = section.get('page_number', 0)
     features['_label'] = ''  # To be filled manually: 1=valid, 0=false positive
     
+    # =========================================================================
+    # RAW OCR METADATA (for human review in CSV, prefixed with _ocr_)
+    # =========================================================================
+    # These come from word-level Tesseract output aggregated per line.
+    # Prefixed with _ so they appear in the metadata section of the CSV,
+    # making it easy for reviewers to see the OCR structural context.
+    
+    ocr_meta = section.get('ocr_metadata', {})
+    
+    features['_ocr_block_num'] = ocr_meta.get('ocr_block_num', '')
+    features['_ocr_par_num'] = ocr_meta.get('ocr_par_num', '')
+    features['_ocr_line_num'] = ocr_meta.get('ocr_line_num', '')
+    features['_ocr_word_count'] = ocr_meta.get('ocr_word_count', '')
+    features['_ocr_conf_mean'] = ocr_meta.get('ocr_conf_mean', '')
+    features['_ocr_conf_min'] = ocr_meta.get('ocr_conf_min', '')
+    features['_ocr_conf_max'] = ocr_meta.get('ocr_conf_max', '')
+    features['_ocr_level'] = ocr_meta.get('ocr_level', '')
+    
+    # =========================================================================
+    # OCR-DERIVED ML FEATURES (for classifier)
+    # =========================================================================
+    # These are numeric features derived from the raw OCR metadata that
+    # can help the ML model distinguish real sections from false positives.
+    #
+    # Rationale:
+    #   - Low OCR confidence on a "section number" suggests it was misread
+    #   - Sections spanning multiple blocks/paragraphs are suspicious
+    #   - Word position within a block hints at whether this is a heading
+    #   - Confidence spread (std) indicates inconsistent OCR quality
+    
+    ocr_conf_mean = ocr_meta.get('ocr_conf_mean', 0) or 0
+    ocr_conf_min = ocr_meta.get('ocr_conf_min', 0) or 0
+    ocr_conf_max = ocr_meta.get('ocr_conf_max', 0) or 0
+    ocr_conf_std = ocr_meta.get('ocr_conf_std', 0) or 0
+    ocr_word_count = ocr_meta.get('ocr_word_count', 0) or 0
+    ocr_low_conf_words = ocr_meta.get('ocr_low_conf_word_count', 0) or 0
+    
+    features['ocr_conf_mean'] = ocr_conf_mean
+    features['ocr_conf_min'] = ocr_conf_min
+    features['ocr_conf_max'] = ocr_conf_max
+    features['ocr_conf_std'] = ocr_conf_std
+    features['ocr_word_count'] = ocr_word_count
+    features['ocr_low_conf_word_count'] = ocr_low_conf_words
+    
+    # Binary flags derived from confidence
+    features['ocr_conf_below_50'] = 1 if ocr_conf_mean < 50 else 0
+    features['ocr_conf_below_30'] = 1 if ocr_conf_mean < 30 else 0
+    features['ocr_has_low_conf_word'] = 1 if ocr_low_conf_words > 0 else 0
+    features['ocr_mostly_low_conf'] = 1 if (
+        ocr_word_count > 0 and ocr_low_conf_words / ocr_word_count > 0.5
+    ) else 0
+    
+    # Confidence spread — high spread suggests mixed quality (some words guessed)
+    features['ocr_conf_spread'] = ocr_conf_max - ocr_conf_min
+    features['ocr_conf_high_spread'] = 1 if (ocr_conf_max - ocr_conf_min) > 50 else 0
+    
+    # Structural flags — sections should typically be in a single block/paragraph
+    block_unique = ocr_meta.get('ocr_block_num_unique_count', 0)
+    par_unique = ocr_meta.get('ocr_par_num_unique_count', 0)
+    features['ocr_spans_multiple_blocks'] = 1 if block_unique and block_unique > 1 else 0
+    features['ocr_spans_multiple_pars'] = 1 if par_unique and par_unique > 1 else 0
+    
+    # Word position within block — first word (word_num=1) suggests line/block start
+    first_word_num = ocr_meta.get('ocr_word_num_first', 0) or 0
+    features['ocr_is_first_word_in_line'] = 1 if first_word_num <= 1 else 0
+    features['ocr_word_num_first'] = first_word_num
+
     # =========================================================================
     # SECTION NUMBER FEATURES
     # =========================================================================

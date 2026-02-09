@@ -1,7 +1,7 @@
 import os
 import torch
 from PIL import Image, ImageDraw
-from transformers import TableTransformerForObjectDetection, DetrImageProcessor
+from transformers import TableTransformerForObjectDetection, DetrImageProcessor, AutoImageProcessor
 
 def get_model_path():
     """
@@ -37,7 +37,7 @@ def load_local_model():
         model_dir, 
         local_files_only=True
     )
-    processor = DetrImageProcessor.from_pretrained(
+    processor = AutoImageProcessor.from_pretrained(
         model_dir, 
         local_files_only=True
     )

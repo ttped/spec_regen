@@ -2,6 +2,7 @@
 section_classifier.py - ML-based section classification using XGBoost.
 
 Updated v3: Added linguistic features, enhanced blank title features, and position features.
+Updated v4: Added OCR confidence and structural features from word-level Tesseract metadata.
 """
 
 import pandas as pd
@@ -22,6 +23,9 @@ from dataclasses import dataclass
 #   - Position features (is_in_bottom_third, late_page_*)
 #   - Height features (relative_height, height_is_multiline)
 #   - Major section magnitude features (major_section_gt_*)
+# New in v4:
+#   - OCR confidence features (ocr_conf_*): Word-level Tesseract confidence
+#   - OCR structural features (ocr_spans_*, ocr_is_first_*): Block/paragraph hierarchy
 
 SELECTED_FEATURES = [
     # === EXISTING HIGH-VALUE FEATURES ===
@@ -90,6 +94,24 @@ SELECTED_FEATURES = [
     'major_section_gt_6',       # Major section > 6 (soft signal)
     'major_section_gt_10',      # Major section > 10 (stronger signal)
     'major_section_gt_20',      # Major section > 20 (almost certainly wrong)
+    
+    # === NEW: OCR CONFIDENCE FEATURES ===
+    # Word-level OCR confidence for the section's line
+    'ocr_conf_mean',            # Average word confidence (0-100)
+    'ocr_conf_min',             # Lowest word confidence in line
+    'ocr_conf_std',             # Confidence spread across words
+    'ocr_conf_below_50',        # Mean confidence < 50 -> likely misread
+    'ocr_conf_below_30',        # Mean confidence < 30 -> very likely misread
+    'ocr_has_low_conf_word',    # At least one word with conf < 50
+    'ocr_mostly_low_conf',      # >50% of words have conf < 50
+    'ocr_conf_high_spread',     # Max-min confidence > 50 -> mixed quality
+    
+    # === NEW: OCR STRUCTURAL FEATURES ===
+    # Where the section sits in the Tesseract block/paragraph hierarchy
+    'ocr_word_count',           # Words in the line (from Tesseract, not title)
+    'ocr_spans_multiple_blocks', # Line spans >1 OCR block -> suspicious merge
+    'ocr_spans_multiple_pars',  # Line spans >1 OCR paragraph -> suspicious
+    'ocr_is_first_word_in_line', # First word in OCR line (word_num <= 1)
 ]
 
 def train_and_predict(

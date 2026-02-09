@@ -169,6 +169,65 @@ def get_line_bbox(page_dict: Dict, word_indices: List[int]) -> Optional[Dict]:
         return None
 
 
+def get_line_ocr_metadata(page_dict: Dict, word_indices: List[int]) -> Dict:
+    """
+    Extract word-level OCR metadata for a line given its word indices.
+    
+    Aggregates per-word fields (level, block_num, par_num, line_num, 
+    word_num, conf) into summary statistics that downstream ML features
+    and human reviewers can use.
+    
+    Returns:
+        Dict with aggregated OCR metadata for this line.
+    """
+    if not word_indices:
+        return {}
+
+    metadata = {}
+
+    # --- Structural position (take first word's values since they share a line) ---
+    for key in ('level', 'block_num', 'par_num', 'line_num'):
+        values = page_dict.get(key, [])
+        if values:
+            line_vals = [values[i] for i in word_indices if i < len(values)]
+            if line_vals:
+                # For structural keys the values are identical within a line,
+                # but store both the representative value and unique count
+                metadata[f'ocr_{key}'] = line_vals[0]
+                unique = set(line_vals)
+                if len(unique) > 1:
+                    # Multiple blocks/pars merged into one line — worth knowing
+                    metadata[f'ocr_{key}_unique_count'] = len(unique)
+
+    # --- Word count ---
+    metadata['ocr_word_count'] = len(word_indices)
+
+    # --- Word nums (first and last, useful for position within block) ---
+    word_nums = page_dict.get('word_num', [])
+    if word_nums:
+        line_word_nums = [word_nums[i] for i in word_indices if i < len(word_nums)]
+        if line_word_nums:
+            metadata['ocr_word_num_first'] = line_word_nums[0]
+            metadata['ocr_word_num_last'] = line_word_nums[-1]
+
+    # --- Confidence statistics (per-word, not page-level) ---
+    confs = page_dict.get('conf', [])
+    if confs:
+        line_confs = [confs[i] for i in word_indices if i < len(confs)]
+        # Filter to valid confidences (Tesseract uses -1 for non-word levels)
+        valid_confs = [c for c in line_confs if isinstance(c, (int, float)) and c >= 0]
+        if valid_confs:
+            metadata['ocr_conf_mean'] = round(sum(valid_confs) / len(valid_confs), 1)
+            metadata['ocr_conf_min'] = min(valid_confs)
+            metadata['ocr_conf_max'] = max(valid_confs)
+            metadata['ocr_conf_std'] = round(
+                (sum((c - metadata['ocr_conf_mean']) ** 2 for c in valid_confs) / len(valid_confs)) ** 0.5, 1
+            ) if len(valid_confs) > 1 else 0.0
+            metadata['ocr_low_conf_word_count'] = sum(1 for c in valid_confs if c < 50)
+
+    return metadata
+
+
 def reconstruct_lines_with_bbox(page_dict: Dict[str, List]) -> List[Dict]:
     """
     Reconstructs lines from word-level OCR data, including bounding box info.
@@ -183,7 +242,8 @@ def reconstruct_lines_with_bbox(page_dict: Dict[str, List]) -> List[Dict]:
             # Try to get overall bbox from all words
             all_indices = list(range(len(page_dict.get('text', []))))
             bbox = get_line_bbox(page_dict, all_indices)
-            return [{"text": all_text, "bbox": bbox, "word_indices": all_indices}]
+            ocr_meta = get_line_ocr_metadata(page_dict, all_indices)
+            return [{"text": all_text, "bbox": bbox, "word_indices": all_indices, "ocr_metadata": ocr_meta}]
         return []
 
     lines = []
@@ -213,10 +273,12 @@ def reconstruct_lines_with_bbox(page_dict: Dict[str, List]) -> List[Dict]:
             if current_line_words:
                 line_text = " ".join(current_line_words)
                 bbox = get_line_bbox(page_dict, current_line_indices)
+                ocr_meta = get_line_ocr_metadata(page_dict, current_line_indices)
                 lines.append({
                     "text": line_text,
                     "bbox": bbox,
-                    "word_indices": current_line_indices.copy()
+                    "word_indices": current_line_indices.copy(),
+                    "ocr_metadata": ocr_meta
                 })
             # Start new line
             current_line_words = [word_text]
@@ -230,10 +292,12 @@ def reconstruct_lines_with_bbox(page_dict: Dict[str, List]) -> List[Dict]:
     if current_line_words:
         line_text = " ".join(current_line_words)
         bbox = get_line_bbox(page_dict, current_line_indices)
+        ocr_meta = get_line_ocr_metadata(page_dict, current_line_indices)
         lines.append({
             "text": line_text,
             "bbox": bbox,
-            "word_indices": current_line_indices.copy()
+            "word_indices": current_line_indices.copy(),
+            "ocr_metadata": ocr_meta
         })
         
     return lines
@@ -815,6 +879,7 @@ def run_section_processing_on_file(
             element_base = {
                 "page_number": page_id,
                 "bbox": line_bbox,
+                "ocr_metadata": line_data.get('ocr_metadata', {}),
                 "ml_features": {
                     "relative_height": relative_height,
                     "is_bold": context.get('is_bold', False) if context else False, # Placeholder
