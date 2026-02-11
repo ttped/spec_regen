@@ -478,10 +478,51 @@ def crop_and_save_asset(
     return filename, output_path
 
 
+def crop_and_save_caption(
+    source_image_path: Path,
+    asset: DetectedAsset,
+    output_dir: Path,
+    asset_index: int,
+    padding: int = 5
+) -> Tuple[str, Path]:
+    """
+    Crop the caption region associated with a detected asset and save it.
+    
+    Naming follows: {doc_stem}_{type}_p{page}_{index}_caption.jpg
+    Example: MyDocument_fig_p003_001_caption.jpg
+    
+    Args:
+        source_image_path: Path to the full page image
+        asset: The detected asset (must have caption_bbox set)
+        output_dir: Directory to save cropped caption images
+        asset_index: Index matching the parent asset
+        padding: Pixels to add around the bounding box
+    
+    Returns:
+        Tuple of (caption_filename, full_path)
+    """
+    filename = f"{asset.doc_stem}_{asset.asset_type}_p{asset.page_number:03d}_{asset_index:03d}_caption.jpg"
+    output_path = output_dir / filename
+    
+    with Image.open(source_image_path) as img:
+        x1, y1, x2, y2 = asset.caption_bbox
+        
+        x1 = max(0, x1 - padding)
+        y1 = max(0, y1 - padding)
+        x2 = min(img.width, x2 + padding)
+        y2 = min(img.height, y2 + padding)
+        
+        cropped = img.crop((x1, y1, x2, y2))
+        cropped.save(output_path, "JPEG", quality=95)
+    
+    return filename, output_path
+
+
 def create_asset_metadata(
     asset: DetectedAsset,
     image_filename: str,
-    output_dpi: int = 200
+    output_dpi: int = 200,
+    caption_image_filename: str = None
 ) -> Dict:
     """
     Create metadata JSON for an asset in the format expected by asset_processor.py.
@@ -498,7 +539,7 @@ def create_asset_metadata(
     
     metadata = {
         "asset_id": asset_id,
-        "asset_type": asset.asset_type,  # "fig" or "tab"
+        "asset_type": asset.asset_type,  # "fig", "tab", or "eq"
         "page": asset.page_number,
         "bbox": {
             "pixels": [x1, y1, width, height],  # [x, y, width, height] format
@@ -507,6 +548,7 @@ def create_asset_metadata(
         },
         "export": {
             "image_file": image_filename,
+            "caption_image_file": caption_image_filename,
             "dpi": output_dpi,
             "format": "JPEG",
         },
@@ -586,7 +628,7 @@ def process_document(
             asset_index = asset_counters[asset.asset_type]
             validation_stats[asset.validated_by] += 1
             
-            # Crop and save the image
+            # Crop and save the asset image
             image_filename, _ = crop_and_save_asset(
                 source_image_path=image_path,
                 asset=asset,
@@ -594,8 +636,18 @@ def process_document(
                 asset_index=asset_index
             )
             
+            # Crop and save the caption image if one was detected
+            caption_image_filename = None
+            if asset.has_caption and asset.caption_bbox:
+                caption_image_filename, _ = crop_and_save_caption(
+                    source_image_path=image_path,
+                    asset=asset,
+                    output_dir=doc_output_dir,
+                    asset_index=asset_index
+                )
+            
             # Create metadata
-            metadata = create_asset_metadata(asset, image_filename)
+            metadata = create_asset_metadata(asset, image_filename, caption_image_filename=caption_image_filename)
             all_assets_metadata.append(metadata)
             
             # Save individual metadata JSON (for compatibility with asset_processor)
