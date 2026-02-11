@@ -48,15 +48,16 @@ YOLO_CLASSES = {
 }
 
 # Classes we want to extract as assets
-ASSET_CLASSES = {"figure", "table"}
+ASSET_CLASSES = {"figure", "table", "isolate_formula"}
 
 # Caption classes that validate assets
-CAPTION_CLASSES = {"figure_caption", "table_caption"}
+CAPTION_CLASSES = {"figure_caption", "table_caption", "formula_caption"}
 
 # Mapping from asset type to its caption type
 ASSET_TO_CAPTION = {
     "figure": "figure_caption",
     "table": "table_caption",
+    "isolate_formula": "formula_caption",
 }
 
 
@@ -304,8 +305,13 @@ def check_ocr_for_keywords(
     # Matches: "figure 1", "figure 2.1", "fig. 3", "fig 4", "table 1", etc.
     if asset_type == "figure":
         pattern = r'\b(figure|fig\.?)\s*\d'
-    else:  # table
+    elif asset_type == "table":
         pattern = r'\b(table|tab\.?)\s*\d'
+    elif asset_type == "isolate_formula":
+        # Equations/formulas: "equation 1", "eq. 2", "formula 3"
+        pattern = r'\b(equation|eq\.?|formula)\s*\d'
+    else:
+        return False
     
     return bool(re.search(pattern, page_text))
 
@@ -380,8 +386,15 @@ def run_detection_on_image(
     
     # Process each asset detection
     for detection in asset_detections:
-        asset_class = detection.class_name  # "figure" or "table"
-        asset_type = "fig" if asset_class == "figure" else "tab"
+        asset_class = detection.class_name  # "figure", "table", or "isolate_formula"
+        if asset_class == "figure":
+            asset_type = "fig"
+        elif asset_class == "table":
+            asset_type = "tab"
+        elif asset_class == "isolate_formula":
+            asset_type = "eq"
+        else:
+            continue
         
         # Try to find a matching caption
         matching_caption = find_matching_caption(
@@ -547,7 +560,7 @@ def process_document(
     doc_output_dir.mkdir(parents=True, exist_ok=True)
     
     all_assets_metadata = []
-    asset_counters = {"fig": 0, "tab": 0}
+    asset_counters = {"fig": 0, "tab": 0, "eq": 0}
     validation_stats = {"caption": 0, "ocr_keyword": 0}
     
     print(f"  Processing {len(page_images)} pages...")
@@ -696,7 +709,8 @@ def run_yolo_extraction(
         # Summary for this document
         fig_count = sum(1 for a in assets if a['asset_type'] == 'fig')
         tab_count = sum(1 for a in assets if a['asset_type'] == 'tab')
-        print(f"  Extracted: {fig_count} figures, {tab_count} tables")
+        eq_count = sum(1 for a in assets if a['asset_type'] == 'eq')
+        print(f"  Extracted: {fig_count} figures, {tab_count} tables, {eq_count} equations")
         print()
     
     # Overall summary
@@ -705,8 +719,10 @@ def run_yolo_extraction(
     print("=" * 60)
     total_figs = sum(sum(1 for a in assets if a['asset_type'] == 'fig') for assets in results.values())
     total_tabs = sum(sum(1 for a in assets if a['asset_type'] == 'tab') for assets in results.values())
+    total_eqs = sum(sum(1 for a in assets if a['asset_type'] == 'eq') for assets in results.values())
     print(f"  Total figures: {total_figs}")
     print(f"  Total tables: {total_tabs}")
+    print(f"  Total equations: {total_eqs}")
     print(f"  Output: {output_dir}")
     
     return results

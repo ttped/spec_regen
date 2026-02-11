@@ -181,6 +181,32 @@ def add_table_caption(doc, text: str):
     p.add_run(f": {text}")
 
 
+def add_equation_caption(doc, text: str):
+    """
+    Adds a true Word caption for an EQUATION, which can be used for a Table of Equations.
+    
+    Uses the 'Equation' SEQ field, tracked separately from Figure and Table.
+    """
+    p = doc.add_paragraph(style='Caption')
+    p.add_run("Equation ")
+
+    run = p.add_run()
+    fldChar_begin = OxmlElement('w:fldChar')
+    fldChar_begin.set(qn('w:fldCharType'), 'begin')
+    run._r.append(fldChar_begin)
+
+    instrText = OxmlElement('w:instrText')
+    instrText.set(qn('xml:space'), 'preserve')
+    instrText.text = 'SEQ Equation \\* ARABIC'
+    run._r.append(instrText)
+
+    fldChar_end = OxmlElement('w:fldChar')
+    fldChar_end.set(qn('w:fldCharType'), 'end')
+    run._r.append(fldChar_end)
+
+    p.add_run(f": {text}")
+
+
 def add_bordered_paragraph(doc, text: str):
     """
     Adds a paragraph with a single-line border around it.
@@ -360,7 +386,7 @@ def add_caption(doc, text: str):
 def create_docx_from_elements(elements: List[Dict], output_filename: str, figures_image_folder: str, part_number: str, title_data: Optional[Dict]):
     """
     Creates a .docx file from document elements.
-    Handles 'section', 'unassigned_text_block', 'figure', and 'table' element types.
+    Handles 'section', 'unassigned_text_block', 'figure', 'table', and 'equation' element types.
     
     Tables can be rendered either as:
     - Structured Word tables (if table_data is present from LLM OCR)
@@ -481,6 +507,24 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
                 p_placeholder = doc.add_paragraph()
                 p_placeholder.add_run(f"[Table content not available]").italic = True
                 add_table_caption(doc, caption_name)
+
+        elif element_type == "equation":
+            image_filename = element.get("export", {}).get("image_file")
+            caption_name = element.get('asset_id', 'Untitled Equation')
+            
+            if image_filename:
+                image_path = os.path.join(figures_image_folder, image_filename)
+                if os.path.exists(image_path):
+                    doc.add_picture(image_path, width=Inches(4.0))
+                    add_equation_caption(doc, caption_name)
+                else:
+                    p_error = doc.add_paragraph()
+                    p_error.add_run(f"[Equation image not found: {image_filename}]").italic = True
+                    add_equation_caption(doc, caption_name)
+            else:
+                p_placeholder = doc.add_paragraph()
+                p_placeholder.add_run(f"[Equation content not available]").italic = True
+                add_equation_caption(doc, caption_name)
 
     doc.save(output_filename)
 
