@@ -413,7 +413,12 @@ def run_detection_on_image(
             if has_keyword:
                 validated_by = "ocr_keyword"
         
-        # Skip unvalidated assets
+        # Formulas are accepted without validation - they commonly appear
+        # standalone without captions or keyword references
+        if not has_caption and asset_class == "isolate_formula":
+            validated_by = "standalone"
+        
+        # Skip unvalidated assets (figures and tables still require validation)
         if validated_by == "none":
             print(f"      [Rejected] {asset_class} on page {page_number} - no caption or keyword found")
             continue
@@ -603,7 +608,7 @@ def process_document(
     
     all_assets_metadata = []
     asset_counters = {"fig": 0, "tab": 0, "eq": 0}
-    validation_stats = {"caption": 0, "ocr_keyword": 0}
+    validation_stats = {"caption": 0, "ocr_keyword": 0, "standalone": 0}
     
     print(f"  Processing {len(page_images)} pages...")
     
@@ -657,7 +662,7 @@ def process_document(
                 json.dump(metadata, f, indent=2)
     
     # Print validation stats
-    print(f"  Validation: {validation_stats['caption']} by caption, {validation_stats['ocr_keyword']} by OCR keyword")
+    print(f"  Validation: {validation_stats['caption']} by caption, {validation_stats['ocr_keyword']} by OCR keyword, {validation_stats['standalone']} standalone")
     
     return all_assets_metadata
 
