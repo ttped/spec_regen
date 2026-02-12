@@ -230,6 +230,8 @@ def load_all_assets(exports_dir: str, doc_stem: str) -> List[Dict]:
             meta['type'] = 'figure'
         elif raw_type in ["tab", "table"]:
             meta['type'] = 'table'
+        elif raw_type in ["tab_layout"]:
+            meta['type'] = 'table_layout'
         elif raw_type in ["eq", "equation", "isolate_formula", "formula"]:
             meta['type'] = 'equation'
         else:
@@ -249,7 +251,8 @@ def load_all_assets(exports_dir: str, doc_stem: str) -> List[Dict]:
     fig_count = sum(1 for a in assets if a['type'] == 'figure')
     tab_count = sum(1 for a in assets if a['type'] == 'table')
     eq_count = sum(1 for a in assets if a['type'] == 'equation')
-    print(f"    Loaded {len(assets)} assets ({fig_count} figures, {tab_count} tables, {eq_count} equations)")
+    tab_layout_count = sum(1 for a in assets if a['type'] == 'table_layout')
+    print(f"    Loaded {len(assets)} assets ({fig_count} figures, {tab_count} tables, {eq_count} equations, {tab_layout_count} layout tables)")
     
     # Check normalization status
     normalized_count = sum(1 for a in assets if a.get('bbox', {}).get('_is_normalized'))
@@ -490,7 +493,7 @@ def run_asset_integration(
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(output_data, f, indent=4)
     
-    asset_count = sum(1 for e in integrated if e.get('type') in ('figure', 'table', 'equation'))
+    asset_count = sum(1 for e in integrated if e.get('type') in ('figure', 'table', 'equation', 'table_layout'))
     print(f"  - Saved to: {output_path}")
     print(f"  - Final count: {len(integrated)} elements ({asset_count} assets)")
 

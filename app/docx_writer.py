@@ -386,7 +386,7 @@ def add_caption(doc, text: str):
 def create_docx_from_elements(elements: List[Dict], output_filename: str, figures_image_folder: str, part_number: str, title_data: Optional[Dict]):
     """
     Creates a .docx file from document elements.
-    Handles 'section', 'unassigned_text_block', 'figure', 'table', and 'equation' element types.
+    Handles 'section', 'unassigned_text_block', 'figure', 'table', 'equation', and 'table_layout' element types.
     
     Tables can be rendered either as:
     - Structured Word tables (if table_data is present from LLM OCR)
@@ -525,6 +525,19 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
                 p_placeholder = doc.add_paragraph()
                 p_placeholder.add_run(f"[Equation content not available]").italic = True
                 add_equation_caption(doc, caption_name)
+
+        elif element_type == "table_layout":
+            # Layout tables are uncaptioned - no SEQ field, won't appear in TOC.
+            # Included for spatial context only.
+            image_filename = element.get("export", {}).get("image_file")
+            
+            if image_filename:
+                image_path = os.path.join(figures_image_folder, image_filename)
+                if os.path.exists(image_path):
+                    doc.add_picture(image_path, width=Inches(6.0))
+                else:
+                    p_error = doc.add_paragraph()
+                    p_error.add_run(f"[Layout table image not found: {image_filename}]").italic = True
 
     doc.save(output_filename)
 

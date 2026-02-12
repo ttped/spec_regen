@@ -83,7 +83,8 @@ class DetectedAsset:
     image_height: int
     has_caption: bool = False        # Whether a matching caption was detected
     caption_bbox: Optional[Tuple[int, int, int, int]] = None  # Caption bbox if found
-    validated_by: str = "none"       # "caption", "ocr_keyword", or "none"
+    caption_text: str = ""           # OCR text extracted from the caption region
+    validated_by: str = "none"       # "caption", "ocr_keyword", "standalone", "layout_only", or "none"
 
 
 def get_paths():
@@ -242,6 +243,94 @@ def find_matching_caption(
             best_caption = caption
     
     return best_caption
+
+
+def extract_caption_text(
+    raw_ocr_dir: str,
+    doc_stem: str,
+    page_number: int,
+    caption_bbox: Tuple[int, int, int, int],
+    overlap_threshold: float = 0.5
+) -> str:
+    """
+    Extract caption text by finding OCR words that fall inside the caption bbox.
+    
+    Both YOLO and Tesseract operate on the same render_raw page images,
+    so their pixel coordinates are in the same space — no scaling needed.
+    
+    Args:
+        raw_ocr_dir: Directory containing raw OCR JSON files
+        doc_stem: Document stem name
+        page_number: Page number (1-indexed)
+        caption_bbox: YOLO-detected caption region as (x1, y1, x2, y2) pixels
+        overlap_threshold: Minimum fraction of word area inside caption bbox to include
+    
+    Returns:
+        Extracted caption text string, or empty string if extraction fails
+    """
+    if not raw_ocr_dir:
+        return ""
+    
+    ocr_path = os.path.join(raw_ocr_dir, f"{doc_stem}.json")
+    if not os.path.exists(ocr_path):
+        return ""
+    
+    try:
+        with open(ocr_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return ""
+    
+    # Get page data
+    page_data = data.get(str(page_number)) or data.get(page_number)
+    if not page_data:
+        return ""
+    
+    page_dict = page_data.get('page_dict', page_data)
+    
+    texts = page_dict.get('text', [])
+    lefts = page_dict.get('left', [])
+    tops = page_dict.get('top', [])
+    widths = page_dict.get('width', [])
+    heights = page_dict.get('height', [])
+    
+    if not all([texts, lefts, tops, widths, heights]):
+        return ""
+    
+    cx1, cy1, cx2, cy2 = caption_bbox
+    
+    # Collect words whose bboxes overlap sufficiently with the caption region
+    caption_words = []
+    for i in range(min(len(texts), len(lefts), len(tops), len(widths), len(heights))):
+        wl = lefts[i]
+        wt = tops[i]
+        wr = wl + widths[i]
+        wb = wt + heights[i]
+        
+        # Calculate intersection
+        inter_l = max(wl, cx1)
+        inter_t = max(wt, cy1)
+        inter_r = min(wr, cx2)
+        inter_b = min(wb, cy2)
+        
+        if inter_r <= inter_l or inter_b <= inter_t:
+            continue
+        
+        inter_area = (inter_r - inter_l) * (inter_b - inter_t)
+        word_area = max((wr - wl) * (wb - wt), 1)
+        
+        if inter_area / word_area >= overlap_threshold:
+            word_text = str(texts[i]).strip()
+            if word_text and word_text != '-1':
+                caption_words.append((wl, wt, word_text))
+    
+    if not caption_words:
+        return ""
+    
+    # Sort by top then left (reading order)
+    caption_words.sort(key=lambda w: (w[1], w[0]))
+    
+    return " ".join(w[2] for w in caption_words)
 
 
 def check_ocr_for_keywords(
@@ -415,13 +504,26 @@ def run_detection_on_image(
         
         # Formulas are accepted without validation - they commonly appear
         # standalone without captions or keyword references
-        if not has_caption and asset_class == "isolate_formula":
+        if validated_by == "none" and asset_class == "isolate_formula":
             validated_by = "standalone"
         
-        # Skip unvalidated assets (figures and tables still require validation)
+        # Uncaptioned tables are kept as layout references for spatial context,
+        # but marked so they don't end up in the table of contents/figures
+        if validated_by == "none" and asset_class == "table":
+            asset_type = "tab_layout"
+            validated_by = "layout_only"
+        
+        # Skip unvalidated figures (figures still require validation)
         if validated_by == "none":
             print(f"      [Rejected] {asset_class} on page {page_number} - no caption or keyword found")
             continue
+        
+        # Extract caption text from OCR data if we have a caption bbox
+        caption_text = ""
+        if has_caption and caption_bbox and raw_ocr_dir:
+            caption_text = extract_caption_text(
+                raw_ocr_dir, doc_stem, page_number, caption_bbox
+            )
         
         asset = DetectedAsset(
             asset_type=asset_type,
@@ -434,6 +536,7 @@ def run_detection_on_image(
             image_height=img_height,
             has_caption=has_caption,
             caption_bbox=caption_bbox,
+            caption_text=caption_text,
             validated_by=validated_by
         )
         validated_assets.append(asset)
@@ -568,12 +671,17 @@ def create_asset_metadata(
         }
     }
     
-    # Include caption bbox if available
+    # Include caption info if available
     if asset.caption_bbox:
         cx1, cy1, cx2, cy2 = asset.caption_bbox
         metadata["detection"]["caption_bbox"] = {
             "pixels": [cx1, cy1, cx2 - cx1, cy2 - cy1],
         }
+    
+    if asset.caption_text:
+        metadata["caption_text"] = asset.caption_text
+        # Use real caption text as the asset_id for downstream display
+        metadata["asset_id"] = asset.caption_text
     
     return metadata
 
@@ -607,8 +715,8 @@ def process_document(
     doc_output_dir.mkdir(parents=True, exist_ok=True)
     
     all_assets_metadata = []
-    asset_counters = {"fig": 0, "tab": 0, "eq": 0}
-    validation_stats = {"caption": 0, "ocr_keyword": 0, "standalone": 0}
+    asset_counters = {"fig": 0, "tab": 0, "eq": 0, "tab_layout": 0}
+    validation_stats = {"caption": 0, "ocr_keyword": 0, "standalone": 0, "layout_only": 0}
     
     print(f"  Processing {len(page_images)} pages...")
     
@@ -662,7 +770,7 @@ def process_document(
                 json.dump(metadata, f, indent=2)
     
     # Print validation stats
-    print(f"  Validation: {validation_stats['caption']} by caption, {validation_stats['ocr_keyword']} by OCR keyword, {validation_stats['standalone']} standalone")
+    print(f"  Validation: {validation_stats['caption']} by caption, {validation_stats['ocr_keyword']} by OCR keyword, {validation_stats['standalone']} standalone, {validation_stats['layout_only']} layout-only")
     
     return all_assets_metadata
 
@@ -767,7 +875,8 @@ def run_yolo_extraction(
         fig_count = sum(1 for a in assets if a['asset_type'] == 'fig')
         tab_count = sum(1 for a in assets if a['asset_type'] == 'tab')
         eq_count = sum(1 for a in assets if a['asset_type'] == 'eq')
-        print(f"  Extracted: {fig_count} figures, {tab_count} tables, {eq_count} equations")
+        tab_layout_count = sum(1 for a in assets if a['asset_type'] == 'tab_layout')
+        print(f"  Extracted: {fig_count} figures, {tab_count} tables, {eq_count} equations, {tab_layout_count} layout tables")
         print()
     
     # Overall summary
@@ -777,9 +886,11 @@ def run_yolo_extraction(
     total_figs = sum(sum(1 for a in assets if a['asset_type'] == 'fig') for assets in results.values())
     total_tabs = sum(sum(1 for a in assets if a['asset_type'] == 'tab') for assets in results.values())
     total_eqs = sum(sum(1 for a in assets if a['asset_type'] == 'eq') for assets in results.values())
+    total_tab_layouts = sum(sum(1 for a in assets if a['asset_type'] == 'tab_layout') for assets in results.values())
     print(f"  Total figures: {total_figs}")
     print(f"  Total tables: {total_tabs}")
     print(f"  Total equations: {total_eqs}")
+    print(f"  Total layout tables: {total_tab_layouts}")
     print(f"  Output: {output_dir}")
     
     return results
