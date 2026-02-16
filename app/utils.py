@@ -375,6 +375,10 @@ def _call_ollama(
     """
     Sends a prompt to Ollama and expects a JSON object in the response.
     """
+    # Ensure URL has a scheme — requests requires it
+    if not base_url.startswith(("http://", "https://")):
+        base_url = f"http://{base_url}"
+    
     api_url = f"{base_url.rstrip('/')}/api/chat"
     payload = {
         "model": model_name,
@@ -408,6 +412,9 @@ def _call_mission_assist(
     else:
         url_model_segment = model_name
 
+    if not base_url.startswith(("http://", "https://")):
+        base_url = f"http://{base_url}"
+    
     api_url = f"{base_url.rstrip('/')}/bae-api-{url_model_segment}/v1"
     headers = {"apikey": api_key}
 
