@@ -405,9 +405,11 @@ def clean_leading_junk(text: str) -> Tuple[str, str]:
     Handles patterns like:
     - ". 1. Scope" -> "1. Scope"
     - "` 1 Scope" -> "1 Scope"
-    - "' 1.2 Title" -> "1.2 Title"
+    - "' 1.2 Title" -> "1.2 Title"  (curly quote)
     - "- 1 Scope" -> "1 Scope"
     - ": 1.1 Scope" -> "1.1 Scope"
+    - "' . 1 Scope" -> "1 Scope"  (multiple junk chars with spaces)
+    - ". I. Scope" -> "I. Scope"  (junk before Roman numeral)
     
     Returns:
         tuple: (cleaned_text, removed_junk)
@@ -415,20 +417,60 @@ def clean_leading_junk(text: str) -> Tuple[str, str]:
     if not text:
         return text, ""
     
-    # Pattern: punctuation/symbol + optional space + digit
-    # Common junk: . ` ' " - : ; | ! * # @ ^
-    junk_match = re.match(r'^(\s*[.`\'":\-;|!*#@^,]+\s*)(?=\d)', text)
+    # Pattern: one or more junk characters (possibly separated by spaces) before a digit or Roman numeral.
+    # Includes curly/smart quotes (\u2018\u2019\u201c\u201d), backticks, and other OCR artifacts.
+    # The key change: allow spaces *between* junk characters so ". ' 1" matches.
+    junk_match = re.match(
+        r'''^([\s.`'"\u2018\u2019\u201c\u201d:\-;|!*#@^,~\u2022\u00b7]+)'''  # junk chars including spaces
+        r'''(?=[0-9IVXivx])''',  # lookahead: digit or Roman numeral start
+        text
+    )
     if junk_match:
         junk = junk_match.group(1)
         cleaned = text[len(junk):]
-        return cleaned, junk
+        # Safety: don't strip if we'd eat the entire string or the "junk" is actually meaningful
+        if cleaned and len(junk.strip()) <= 5:
+            return cleaned, junk
     
     return text, ""
+
+
+ROMAN_NUMERAL_PATTERN = re.compile(
+    r'^((?:X{0,3})(?:IX|IV|V?I{0,3}))$',  # I through XXXIX (1-39)
+    re.IGNORECASE
+)
+
+ROMAN_VALUES = {
+    'I': 1, 'V': 5, 'X': 10, 'L': 50, 'C': 100
+}
+
+def roman_to_int(s: str) -> Optional[int]:
+    """Convert a Roman numeral string to integer, or None if invalid."""
+    s = s.upper().strip()
+    if not ROMAN_NUMERAL_PATTERN.match(s):
+        return None
+    total = 0
+    prev = 0
+    for char in reversed(s):
+        val = ROMAN_VALUES.get(char, 0)
+        if val < prev:
+            total -= val
+        else:
+            total += val
+        prev = val
+    return total if total > 0 else None
 
 
 def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[bool, Optional[str], Optional[str], Optional[str], Optional[Dict]]:
     """
     Checks if a line of text is a section header using regex.
+    
+    Supports:
+    - Arabic numbered sections: "1. Scope", "1.2.3 Title", "3 Title"
+    - Roman numeral sections: "I. Scope", "IV.3 Title", "II References"
+    - Annex/appendix letter prefixes: "A.1 Scope", "B.2.3 Title"
+    - OCR artifacts before numbers: ". 1. Scope", "' IV. Scope"
+    - Missing spaces after number: "1.Scope" (bad OCR)
     """
     context = {
         'raw_section_number': None,
@@ -448,7 +490,7 @@ def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[b
     context['had_leading_whitespace'] = leading_ws > 0
     context['leading_whitespace_len'] = leading_ws
     
-    # Clean leading junk (like ". 1.2" or "` 1")
+    # Clean leading junk (like ". 1.2" or "` 1" or "' IV.")
     cleaned_text, junk_removed = clean_leading_junk(line_text)
     if junk_removed:
         context['leading_junk_removed'] = junk_removed.strip()
@@ -459,16 +501,48 @@ def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[b
     # GREEDY REGEX: Find section-number-like patterns ANYWHERE in the line
     # ==========================================================================
     
+    # --- Arabic numeral patterns (existing, with fixes) ---
+    # Fix: allow \s* (zero or more spaces) before topic to catch "1.Scope" (bad OCR)
+    ARABIC_NUM = r'[0-9]+(?:[.\-,][0-9]+)*[.\-,]?[A-Za-z]?'
+    
+    # --- Roman numeral patterns (new) ---
+    # Matches: "I.", "II.", "IV", "IX.3", "XI.2.1"
+    # Roman part, optionally followed by .digit sub-sections
+    ROMAN_NUM = r'[IVXLC]+(?:\.[0-9]+)*\.?'
+    
+    # --- Annex/letter-prefix patterns (new) ---
+    # Matches: "A.1", "B.2.3", "C.1" (single letter + dot + digits)
+    ANNEX_NUM = r'[A-Z]\.[0-9]+(?:\.[0-9]+)*\.?'
+    
+    # Combined number pattern
+    COMBINED_NUM = rf'(?:{ARABIC_NUM}|{ANNEX_NUM}|{ROMAN_NUM})'
+    
     # Use cleaned text for matching
-    match_start = re.match(r'^(\s*)([0-9]+(?:[.\-,][0-9]+)*[.\-,]?[A-Za-z]?)\s+(.+)', cleaned_text)
-    match_start_no_title = re.match(r'^(\s*)([0-9]+(?:[.\-,][0-9]+)*[.\-,]?[A-Za-z]?)\s*$', cleaned_text)
-    match_mid = re.search(r'(?:^|[:\s])([0-9]+(?:\.[0-9]+)+)\s+([A-Z][A-Za-z].*?)(?:\.|$)', cleaned_text)
+    # Pattern 1: Number at start + space + title text
+    match_start = re.match(
+        rf'^(\s*)({COMBINED_NUM})\s+(.+)', cleaned_text
+    )
+    # Pattern 1b: Number at start + NO space + title starting with capital (bad OCR)
+    match_start_nospace = re.match(
+        rf'^(\s*)([0-9]+(?:[.\-,][0-9]+)*\.?)([A-Z][a-z].+)', cleaned_text
+    )
+    # Pattern 2: Number alone on a line
+    match_start_no_title = re.match(
+        rf'^(\s*)({COMBINED_NUM})\s*$', cleaned_text
+    )
+    # Pattern 3: Number mid-line (e.g., after some text)
+    match_mid = re.search(
+        r'(?:^|[:\s])([0-9]+(?:\.[0-9]+)+)\s+([A-Z][A-Za-z].*?)(?:\.|$)', cleaned_text
+    )
     
     potential_num = None
     full_topic = ""
     
     if match_start:
         ws, potential_num, full_topic = match_start.groups()
+        context['had_text_before_number'] = False
+    elif match_start_nospace:
+        ws, potential_num, full_topic = match_start_nospace.groups()
         context['had_text_before_number'] = False
     elif match_start_no_title:
         ws, potential_num = match_start_no_title.groups()
@@ -489,7 +563,22 @@ def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[b
     context['raw_section_number'] = potential_num
     
     original_num = potential_num
-    potential_num = normalize_section_number(potential_num)
+    
+    # --- Handle Roman numerals: convert to Arabic for downstream consistency ---
+    is_roman = False
+    roman_parts = potential_num.rstrip('.').split('.')
+    roman_val = roman_to_int(roman_parts[0])
+    if roman_val is not None and not roman_parts[0].isdigit():
+        is_roman = True
+        # Convert: "IV.3" -> "4.3", "II" -> "2"
+        arabic_parts = [str(roman_val)] + roman_parts[1:]
+        potential_num = '.'.join(arabic_parts)
+        context['is_roman_numeral'] = True
+        context['roman_original'] = original_num
+        if debug:
+            print(f"      [DEBUG] Roman numeral: '{original_num}' -> '{potential_num}'")
+    else:
+        potential_num = normalize_section_number(potential_num)
     
     if debug and original_num != potential_num:
         print(f"      [DEBUG] Normalized section number: '{original_num}' -> '{potential_num}'")
@@ -513,13 +602,12 @@ def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[b
         return False, None, None, None, context
 
     # ==========================================================================
-    # LOGICAL VALIDATION (Added for strict filtering)
+    # LOGICAL VALIDATION
     # ==========================================================================
     
     section_num = potential_num.strip().rstrip('.')
     
     # 1. Reject "all zero" sections (0, 0.0, 0.0.0)
-    #    Split by dot, check if all parts are 0
     parts = section_num.split('.')
     if all(p.isdigit() and int(p) == 0 for p in parts):
         if debug:
@@ -527,13 +615,14 @@ def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[b
         context['rejection_reason'] = 'zero_section'
         return False, None, None, None, context
 
-    # 2. Reject major sections > 10 (Safety cap)
-    #    e.g., "12.1" or "52.2.1"
+    # 2. Soft cap on major section number.
+    #    Old: hard reject > 10. New: let the ML model handle it.
+    #    We still reject obviously absurd numbers (> 100) as a safety valve.
     if parts and parts[0].isdigit():
         major_section = int(parts[0])
-        if major_section > 10:
+        if major_section > 100:
             if debug:
-                print(f"      [DEBUG] Rejected (major section > 10): '{section_num}'")
+                print(f"      [DEBUG] Rejected (major section > 100): '{section_num}'")
             context['rejection_reason'] = 'major_section_too_large'
             return False, None, None, None, context
 

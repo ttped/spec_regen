@@ -8,8 +8,9 @@ Updated v4: Added OCR confidence and structural features from word-level Tessera
 import pandas as pd
 import numpy as np
 from xgboost import XGBClassifier
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, RandomizedSearchCV, StratifiedKFold
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support, accuracy_score
+from scipy.stats import uniform, randint
 from typing import List, Dict, Tuple, Set, Any
 from dataclasses import dataclass
 
@@ -168,34 +169,52 @@ def train_and_predict(
     
     scale_weight = (neg_count / pos_count) * 1.5 if pos_count > 0 else 1
 
-    # Hyperparameters
-    params = {
-        'n_estimators': 150,
-        'max_depth': 3,
-        'learning_rate': 0.05,
-        'min_child_weight': 3,
-        'gamma': 0.1,
-        'subsample': 0.8,
-        'colsample_bytree': 0.8,
+    # Search space for hyperparameter tuning
+    param_distributions = {
+        'n_estimators': randint(80, 300),
+        'max_depth': randint(2, 7),
+        'learning_rate': uniform(0.01, 0.19),       # 0.01 - 0.20
+        'min_child_weight': randint(1, 7),
+        'gamma': uniform(0.0, 0.5),
+        'subsample': uniform(0.6, 0.4),             # 0.6 - 1.0
+        'colsample_bytree': uniform(0.5, 0.5),      # 0.5 - 1.0
+        'reg_alpha': uniform(0.0, 1.0),
+        'reg_lambda': uniform(0.5, 2.0),             # 0.5 - 2.5
+    }
+
+    fixed_params = {
         'random_state': 42,
-        'reg_alpha': 0.1,
-        'reg_lambda': 1.0,
-        'scale_pos_weight': scale_weight
+        'scale_pos_weight': scale_weight,
     }
 
     metrics = {}
 
     # =========================================================================
-    # PASS 1: VALIDATION (80/20 Split) - How well does it generalize?
+    # PASS 1: VALIDATION (80/20 Split) + Hyperparameter Tuning via CV
     # =========================================================================
-    print(f"\n  --- Phase 1: Validation (80/20 Split) ---")
+    print(f"\n  --- Phase 1: Validation (80/20 Split) with Hyperparameter Tuning ---")
     X_train, X_test, y_train, y_test = train_test_split(
         X_labeled, y_labeled, test_size=0.2, random_state=42, stratify=y_labeled
     )
 
-    val_model = XGBClassifier(**params)
-    val_model.fit(X_train, y_train)
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    search = RandomizedSearchCV(
+        estimator=XGBClassifier(**fixed_params),
+        param_distributions=param_distributions,
+        n_iter=50,
+        scoring='f1',
+        cv=cv,
+        random_state=42,
+        n_jobs=-1,
+        verbose=0,
+    )
+    search.fit(X_train, y_train)
     
+    best_params = {**fixed_params, **search.best_params_}
+    print(f"  Best CV F1: {search.best_score_:.3f}")
+    print(f"  Best params: { {k: (round(v, 4) if isinstance(v, float) else v) for k, v in search.best_params_.items()} }")
+
+    val_model = search.best_estimator_
     val_pred = val_model.predict(X_test)
     v_prec, v_rec, v_f1, _ = precision_recall_fscore_support(y_test, val_pred, average='binary', pos_label=1)
     v_acc = accuracy_score(y_test, val_pred)
@@ -205,14 +224,14 @@ def train_and_predict(
         'precision': v_prec, 'recall': v_rec, 'f1': v_f1, 'accuracy': v_acc, 'confusion': v_conf
     }
     
-    print(f"  Precision: {v_prec:.3f}, Recall: {v_rec:.3f}, F1: {v_f1:.3f}")
+    print(f"  Holdout Precision: {v_prec:.3f}, Recall: {v_rec:.3f}, F1: {v_f1:.3f}")
     print(f"  Confusion (Test Set): TN={v_conf[0,0]}, FP={v_conf[0,1]}, FN={v_conf[1,0]}, TP={v_conf[1,1]}")
 
     # =========================================================================
-    # PASS 2: PRODUCTION (100% Data) - Maximize knowledge
+    # PASS 2: PRODUCTION - Retrain best params on 100% labeled data
     # =========================================================================
-    print(f"\n  --- Phase 2: Full Training (100% Labeled Data) ---")
-    final_model = XGBClassifier(**params)
+    print(f"\n  --- Phase 2: Full Training (100% Labeled Data) with Tuned Params ---")
+    final_model = XGBClassifier(**best_params)
     final_model.fit(X_labeled, y_labeled)
     
     # Check training error (sanity check)
@@ -223,7 +242,8 @@ def train_and_predict(
 
     metrics['train'] = {
         'precision': t_prec, 'recall': t_rec, 'f1': t_f1, 'accuracy': t_acc, 'confusion': t_conf,
-        'total_samples': len(labeled_df)
+        'total_samples': len(labeled_df),
+        'best_params': best_params,
     }
 
     print(f"  Training Fit: Precision: {t_prec:.3f}, Recall: {t_rec:.3f}, F1: {t_f1:.3f}")
