@@ -254,6 +254,24 @@ def extract_features_for_section(
     features['_label'] = ''  # To be filled manually: 1=valid, 0=false positive
     
     # =========================================================================
+    # STABLE ROW FINGERPRINT (for label preservation across re-extractions)
+    # =========================================================================
+    # Problem: When re-extracting features, rows can shift (different section
+    # numbers, different titles) because the regex or preprocessing changed.
+    # The old key (_doc_name + _section_number_raw + _page + _title) breaks.
+    #
+    # Solution: Use the physical location on the page (bbox) as part of the key.
+    # The bbox comes directly from Tesseract word positions, which are deterministic
+    # for the same OCR input regardless of how we parse the section number/title.
+    #
+    # Format: "{doc_name}|{page}|{bbox_left}_{bbox_top}" 
+    # This is unique per detected line on a page.
+    bbox = section.get('bbox', {})
+    bbox_left = int(bbox.get('left', 0)) if bbox else 0
+    bbox_top = int(bbox.get('top', 0)) if bbox else 0
+    features['_fingerprint'] = f"{doc_name}|{section.get('page_number', 0)}|{bbox_left}_{bbox_top}"
+    
+    # =========================================================================
     # RAW OCR METADATA (for human review in CSV, prefixed with _ocr_)
     # =========================================================================
     # These come from word-level Tesseract output aggregated per line.
@@ -1737,22 +1755,44 @@ def process_directory(
                     print(f"  Found {len(labeled_df)} existing labels to preserve")
                     
                     # =========================================================
-                    # LABEL PRESERVATION STRATEGY:
+                    # LABEL PRESERVATION STRATEGY (v2):
                     # 
-                    # Problem: Rows can have duplicate keys (e.g., repeated 
-                    # headers/footers like "1 | Mar-25" on every page).
+                    # Problem: Rows can have duplicate keys AND keys can shift
+                    # when regex/preprocessing changes between re-extractions.
                     # 
-                    # Solution: Use TWO-PASS matching:
-                    # 1. EXACT match: doc + section + page + title + index
-                    #    (handles unique rows perfectly)
-                    # 2. CONTENT match: doc + section + title (no page/index)
-                    #    (propagates labels to ALL similar rows - your insight
-                    #    that same section/title = same validity)
+                    # Solution: THREE-PASS matching with priority:
+                    #
+                    # 1. FINGERPRINT match: doc + page + bbox position
+                    #    Most stable — bbox comes from Tesseract directly and
+                    #    doesn't change when section parsing logic changes.
+                    #    Uniquely identifies a physical line on a page.
+                    #
+                    # 2. EXACT match: doc + section + page + title + index
+                    #    Handles cases where fingerprint isn't available (old data).
+                    #
+                    # 3. CONTENT match: doc + section + title (no page/index)
+                    #    Propagates labels to ALL similar rows (e.g., repeated
+                    #    headers/footers like "1 | Mar-25" on every page).
                     # =========================================================
                     
                     labeled_df = labeled_df.copy()
                     
-                    # PASS 1: Exact matching (includes page and index for precision)
+                    # BUILD LABEL MAPS (most specific to least specific)
+                    fingerprint_label_map = {}
+                    exact_label_map = {}
+                    content_label_map = {}
+                    
+                    # --- PASS 1: Fingerprint matching (most stable) ---
+                    has_fingerprint_old = '_fingerprint' in existing_df.columns
+                    has_fingerprint_new = '_fingerprint' in df.columns
+                    
+                    if has_fingerprint_old:
+                        for _, row in labeled_df.iterrows():
+                            fp = row.get('_fingerprint', '')
+                            if fp and pd.notna(fp) and str(fp).strip():
+                                fingerprint_label_map[str(fp)] = row['_label']
+                    
+                    # --- PASS 2: Exact key matching (fallback for old data) ---
                     exact_key_cols_old = ['_doc_name', '_section_number_raw', '_page', '_title']
                     if '_index' in existing_df.columns:
                         exact_key_cols_old.append('_index')
@@ -1767,8 +1807,14 @@ def process_directory(
                     
                     exact_key_cols_new = [c for c in exact_key_cols_old if c in df.columns]
                     
-                    # PASS 2: Content matching (section + title only, ignores page/index)
-                    # This propagates labels to repeated headers/footers
+                    if len(exact_key_cols_old_actual) >= 3:
+                        labeled_df['_exact_key'] = labeled_df[exact_key_cols_old_actual].fillna('').astype(str).agg('|'.join, axis=1)
+                        for _, row in labeled_df.iterrows():
+                            key = row['_exact_key']
+                            if key not in exact_label_map:
+                                exact_label_map[key] = row['_label']
+                    
+                    # --- PASS 3: Content key matching (propagates to duplicates) ---
                     content_key_cols = ['_doc_name', '_section_number_raw', '_title']
                     content_key_cols_old = []
                     for col in content_key_cols:
@@ -1779,74 +1825,71 @@ def process_directory(
                     
                     content_key_cols_new = [c for c in content_key_cols if c in df.columns]
                     
-                    if len(content_key_cols_new) >= 2:
-                        # Build label maps
-                        exact_label_map = {}
-                        content_label_map = {}
-                        
-                        # Build exact key map
-                        if len(exact_key_cols_old_actual) >= 3:
-                            labeled_df['_exact_key'] = labeled_df[exact_key_cols_old_actual].fillna('').astype(str).agg('|'.join, axis=1)
-                            for _, row in labeled_df.iterrows():
-                                key = row['_exact_key']
-                                if key not in exact_label_map:
-                                    exact_label_map[key] = row['_label']
-                        
-                        # Build content key map (for propagating to duplicates)
+                    if len(content_key_cols_old) >= 2:
                         labeled_df['_content_key'] = labeled_df[content_key_cols_old].fillna('').astype(str).agg('|'.join, axis=1)
                         for _, row in labeled_df.iterrows():
                             key = row['_content_key']
                             if key not in content_label_map:
                                 content_label_map[key] = row['_label']
-                        
-                        # Create keys for new data
-                        if len(exact_key_cols_new) >= 3:
-                            df['_exact_key'] = df[exact_key_cols_new].fillna('').astype(str).agg('|'.join, axis=1)
+                    
+                    # BUILD KEYS FOR NEW DATA
+                    if len(exact_key_cols_new) >= 3:
+                        df['_exact_key'] = df[exact_key_cols_new].fillna('').astype(str).agg('|'.join, axis=1)
+                    if len(content_key_cols_new) >= 2:
                         df['_content_key'] = df[content_key_cols_new].fillna('').astype(str).agg('|'.join, axis=1)
+                    
+                    # Count labels before
+                    labels_before = df['_label'].notna().sum() if '_label' in df.columns else 0
+                    
+                    # Apply labels: fingerprint > exact > content > existing
+                    match_stats = {'fingerprint': 0, 'exact': 0, 'content': 0, 'existing': 0}
+                    
+                    def get_label(row):
+                        # Priority 1: Fingerprint match (most stable across re-extractions)
+                        if has_fingerprint_new:
+                            fp = str(row.get('_fingerprint', ''))
+                            if fp and fp in fingerprint_label_map:
+                                match_stats['fingerprint'] += 1
+                                return fingerprint_label_map[fp]
                         
-                        # Count labels before
-                        labels_before = df['_label'].notna().sum() if '_label' in df.columns else 0
+                        # Priority 2: Exact match (doc + section + page + title)
+                        if '_exact_key' in row and row['_exact_key'] in exact_label_map:
+                            match_stats['exact'] += 1
+                            return exact_label_map[row['_exact_key']]
                         
-                        # Apply labels: exact match takes priority, then content match
-                        def get_label(row):
-                            # Try exact match first
-                            if '_exact_key' in row and row['_exact_key'] in exact_label_map:
-                                return exact_label_map[row['_exact_key']]
-                            # Fall back to content match (propagates to all similar rows)
-                            if row['_content_key'] in content_label_map:
-                                return content_label_map[row['_content_key']]
-                            # Keep existing label if any
-                            if '_label' in row and pd.notna(row.get('_label', None)):
-                                return row['_label']
-                            return pd.NA
+                        # Priority 3: Content match (propagates to all similar rows)
+                        if '_content_key' in row and row['_content_key'] in content_label_map:
+                            match_stats['content'] += 1
+                            return content_label_map[row['_content_key']]
                         
-                        df['_label'] = df.apply(get_label, axis=1)
-                        
-                        labels_after = df['_label'].notna().sum()
-                        
-                        # Clean up merge keys
-                        if '_exact_key' in df.columns:
-                            df = df.drop(columns=['_exact_key'])
-                        df = df.drop(columns=['_content_key'])
-                        
-                        preserved = labels_after - labels_before
-                        print(f"  Preserved {preserved} labels from existing file")
-                        
-                        # Count how many came from content matching (propagated)
-                        exact_matches = len([k for k in exact_label_map.keys()])
-                        content_matches = len([k for k in content_label_map.keys()])
-                        print(f"  (Exact key matches: {exact_matches}, Content key patterns: {content_matches})")
-                        
-                        # Check for labels that couldn't be matched at all
-                        unique_old_content_keys = set(labeled_df['_content_key'])
-                        unique_new_content_keys = set(df[content_key_cols_new].fillna('').astype(str).agg('|'.join, axis=1))
-                        unmatched_keys = unique_old_content_keys - unique_new_content_keys
-                        
-                        if unmatched_keys:
-                            print(f"  Warning: {len(unmatched_keys)} labeled patterns from old file could not be matched")
-                            print(f"           (sections may have been removed or changed)")
-                    else:
-                        print(f"  Warning: Not enough key columns for matching (need at least 2)")
+                        # Priority 4: Keep existing label if any
+                        if '_label' in row and pd.notna(row.get('_label', None)):
+                            match_stats['existing'] += 1
+                            return row['_label']
+                        return pd.NA
+                    
+                    df['_label'] = df.apply(get_label, axis=1)
+                    
+                    labels_after = df['_label'].notna().sum()
+                    
+                    # Clean up merge keys
+                    for col in ['_exact_key', '_content_key']:
+                        if col in df.columns:
+                            df = df.drop(columns=[col])
+                    
+                    preserved = labels_after - labels_before
+                    print(f"  Preserved {preserved} labels from existing file")
+                    print(f"  Match breakdown: fingerprint={match_stats['fingerprint']}, "
+                          f"exact={match_stats['exact']}, content={match_stats['content']}, "
+                          f"existing={match_stats['existing']}")
+                    
+                    # Check for labels that couldn't be matched at all
+                    all_old_labels = len(labeled_df)
+                    all_matched = sum(match_stats.values())
+                    unmatched = all_old_labels - all_matched
+                    if unmatched > 0:
+                        print(f"  Warning: {unmatched}/{all_old_labels} labeled rows from old file could not be matched")
+                        print(f"           (sections may have been removed or changed)")
                 else:
                     print("  No existing labels found to preserve")
             else:
