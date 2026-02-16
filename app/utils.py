@@ -350,17 +350,18 @@ def call_llm(
     model_name: str,
     base_url: str,
     api_key: str = None,
-    provider: str = "ollama"
+    provider: str = "ollama",
+    timeout: float = 120.0
 ) -> Optional[str]:
     """
     Sends a prompt to either Ollama or Mission Assist API.
     """
     if provider == "ollama":
-        return _call_ollama(prompt, model_name, base_url)
+        return _call_ollama(prompt, model_name, base_url, timeout=timeout)
     elif provider == "mission_assist":
         if not api_key:
             raise ValueError("api_key is required for mission_assist provider")
-        return _call_mission_assist(prompt, model_name, base_url, api_key)
+        return _call_mission_assist(prompt, model_name, base_url, api_key, timeout=timeout)
     else:
         raise ValueError(f"Unknown provider: {provider}. Use 'ollama' or 'mission_assist'")
 
@@ -368,7 +369,8 @@ def call_llm(
 def _call_ollama(
     prompt: str,
     model_name: str,
-    base_url: str
+    base_url: str,
+    timeout: float = 120.0
 ) -> Optional[str]:
     """
     Sends a prompt to Ollama and expects a JSON object in the response.
@@ -382,7 +384,7 @@ def _call_ollama(
         "options": {"temperature": 0.0}
     }
 
-    response = requests.post(api_url, json=payload, timeout=600)
+    response = requests.post(api_url, json=payload, timeout=timeout)
     response.raise_for_status()
 
     if response.status_code == 200:
@@ -395,7 +397,8 @@ def _call_mission_assist(
     prompt: str,
     model_name: str,
     base_url: str,
-    api_key: str
+    api_key: str,
+    timeout: float = 120.0
 ) -> Optional[str]:
     """
     Sends a prompt to Mission Assist API using the openai client and chat completions endpoint.
@@ -411,14 +414,12 @@ def _call_mission_assist(
     client = openai.OpenAI(
         default_headers=headers,
         api_key=api_key,
-        base_url=api_url
+        base_url=api_url,
+        timeout=timeout
     )
 
-    available_models = client.models.list()
-    if not available_models.data:
-        raise ValueError(f"No models available at endpoint: {api_url}")
-    
-    client_model_name = available_models.data[0].id
+    # Resolve model name once and cache it
+    client_model_name = _resolve_mission_assist_model(client, api_url)
 
     system_prompt = """You are an expert-level JSON generation API. Your sole purpose is to respond with a single, valid JSON object or array.
 
@@ -442,3 +443,26 @@ def _call_mission_assist(
     )
     
     return response.choices[0].message.content
+
+
+# Cache for resolved Mission Assist model names (keyed by API URL)
+_mission_assist_model_cache: Dict[str, str] = {}
+
+
+def _resolve_mission_assist_model(client: openai.OpenAI, api_url: str) -> str:
+    """
+    Resolve the actual model name from a Mission Assist endpoint.
+    Caches the result so models.list() is only called once per endpoint.
+    """
+    if api_url in _mission_assist_model_cache:
+        return _mission_assist_model_cache[api_url]
+    
+    print(f"  [LLM] Resolving model for endpoint: {api_url}")
+    available_models = client.models.list()
+    if not available_models.data:
+        raise ValueError(f"No models available at endpoint: {api_url}")
+    
+    model_name = available_models.data[0].id
+    _mission_assist_model_cache[api_url] = model_name
+    print(f"  [LLM] Resolved model: {model_name}")
+    return model_name
