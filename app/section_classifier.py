@@ -115,6 +115,59 @@ SELECTED_FEATURES = [
     'ocr_is_first_word_in_line', # First word in OCR line (word_num <= 1)
 ]
 
+# =============================================================================
+# MONOTONIC CONSTRAINTS
+# =============================================================================
+# Tell XGBoost which direction a feature is allowed to push predictions.
+#   -1 = higher value can ONLY push prediction toward 0 (reject)
+#   +1 = higher value can ONLY push prediction toward 1 (accept)
+#    0 = no constraint (default, omitted features)
+#
+# This encodes domain knowledge without hard rules. The model still learns
+# *how much* to penalize — it just can't learn the wrong direction.
+
+MONOTONIC_CONSTRAINTS_MAP = {
+    # --- Strong negative signals (higher = more likely false positive) ---
+    'looks_like_date':            -1,  # Dates are never valid sections
+    'title_is_blank':             -1,  # No title text = not a real section
+    'title_is_useless':           -1,  # Blank/junk title
+    'title_is_empty':             -1,  # Empty title
+    'title_is_punctuation_only':  -1,  # Only punctuation
+    'is_simple_number':           -1,  # Just a bare number, no title
+    'content_is_empty':           -1,  # No content after the "section"
+    'height_is_very_tall':        -1,  # Multi-line block, not a header
+    'is_in_footer_zone':          -1,  # Footer area junk
+    'lang_is_complete_sentence':  -1,  # Full sentence = body text, not title
+    'lang_has_finite_verb':       -1,  # Conjugated verb = sentence
+    'ocr_conf_below_30':          -1,  # Very low OCR confidence = misread
+    'ocr_conf_below_50':          -1,  # Low OCR confidence
+    'ocr_mostly_low_conf':        -1,  # Most words are low confidence
+    'ocr_spans_multiple_blocks':  -1,  # Merged OCR blocks = suspicious
+    'late_page_bad_sequence':     -1,  # Late page + bad sequence = junk
+    'late_page_useless_title':    -1,  # Late page + no real title
+    'major_section_gt_20':        -1,  # Section 20+ almost never real
+    'section_num_ratio_suspicious': -1, # Ratio looks wrong
+    
+    # --- Strong positive signals (higher = more likely valid section) ---
+    'toc_fuzzy_score':            +1,  # Matches table of contents
+    'parent_exists':              +1,  # Has a parent section in the tree
+    'sequence_fit_score':         +1,  # Fits the numbering sequence
+    'extended_sequence_score':    +1,  # Extended sequence analysis
+    'title_starts_capital':       +1,  # Capitalized title
+    'format_consistency_score':   +1,  # Consistent with other sections
+    'title_quality_score':        +1,  # Good title text
+    'x_near_left_margin':         +1,  # Near left margin (typical for headers)
+    'lang_root_is_noun':          +1,  # Noun-rooted = title-like
+}
+
+
+def _build_monotonic_constraints(available_features: list) -> tuple:
+    """Build the monotonic_constraints tuple aligned to the available feature order."""
+    return tuple(
+        MONOTONIC_CONSTRAINTS_MAP.get(f, 0)
+        for f in available_features
+    )
+
 def train_and_predict(
     csv_path: str, 
     threshold: float = 0.5
@@ -169,6 +222,11 @@ def train_and_predict(
     
     scale_weight = (neg_count / pos_count) * 1.5 if pos_count > 0 else 1
 
+    # Build monotonic constraints aligned to feature order
+    monotonic_constraints = _build_monotonic_constraints(available)
+    constrained_count = sum(1 for c in monotonic_constraints if c != 0)
+    print(f"  Monotonic constraints: {constrained_count}/{len(available)} features constrained")
+
     # Search space for hyperparameter tuning
     param_distributions = {
         'n_estimators': randint(80, 300),
@@ -185,6 +243,7 @@ def train_and_predict(
     fixed_params = {
         'random_state': 42,
         'scale_pos_weight': scale_weight,
+        'monotone_constraints': monotonic_constraints,
     }
 
     metrics = {}
