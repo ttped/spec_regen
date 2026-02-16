@@ -49,12 +49,24 @@ DEFAULT_IMAGES_DIR = "docs_images"  # Page images for YOLO
 DEFAULT_YOLO_EXPORTS_DIR = "yolo_exports"  # YOLO-extracted assets
 DEFAULT_RESULTS_DIR = "results_simple"
 
+## --- LLM Provider Toggle ---
+## Uncomment ONE of the following configs:
+
+# Option A: Ollama (local)
 LLM_CONFIG = {
-    "provider": "mission_assist",
-    "model_name": "gemma3", 
-    "base_url": "http://devmissionassist.api.us.baesystems.com",
-    "api_key": "aTOIT9hJM3DBYMQbEY"
+    "provider": "ollama",
+    "model_name": "gemma3:27b",
+    "base_url": "http://localhost:11434",
+    "api_key": None
 }
+
+# Option B: Mission Assist (remote)
+# LLM_CONFIG = {
+#     "provider": "mission_assist",
+#     "model_name": "gemma3", 
+#     "base_url": "http://devmissionassist.api.us.baesystems.com",
+#     "api_key": "aTOIT9hJM3DBYMQbEY"
+# }
 
 
 def get_document_stems(input_dir: str) -> List[str]:
