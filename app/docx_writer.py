@@ -467,7 +467,7 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
 
         elif element_type == "figure":
             image_filename = element.get("export", {}).get("image_file")
-            caption_name = element.get('asset_id', 'Untitled Figure')
+            caption_name = element.get('caption_text') or element.get('asset_id', 'Untitled Figure')
             
             if image_filename:
                 image_path = os.path.join(figures_image_folder, image_filename)
@@ -484,7 +484,7 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
                 add_figure_caption(doc, caption_name)
         
         elif element_type == "table":
-            caption_name = element.get('asset_id', 'Untitled Table')
+            caption_name = element.get('caption_text') or element.get('asset_id', 'Untitled Table')
             table_data = element.get("table_data")
             image_filename = element.get("export", {}).get("image_file")
 
@@ -510,7 +510,7 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
 
         elif element_type == "equation":
             image_filename = element.get("export", {}).get("image_file")
-            caption_name = element.get('asset_id', 'Untitled Equation')
+            caption_name = element.get('caption_text') or element.get('asset_id', 'Untitled Equation')
             
             if image_filename:
                 image_path = os.path.join(figures_image_folder, image_filename)
