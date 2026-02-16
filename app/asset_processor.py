@@ -266,7 +266,7 @@ def normalize_all_element_bboxes(
     elements: List[Dict],
     page_metadata: Dict,
     verbose: bool = False,
-    strict: bool = True
+    strict: bool = False
 ) -> List[Dict]:
     """
     Add normalized bbox coordinates to ALL elements that have bboxes.
@@ -292,7 +292,7 @@ def normalize_all_element_bboxes(
         page = elem.get('page_number', 9999)
         
         # Enable verbose on first failure to help debug
-        debug_this = verbose or (strict and skipped_no_dims == 0)
+        debug_this = verbose or (skipped_no_dims == 0)
         page_width, page_height = get_page_ocr_dimensions(page_metadata, page, verbose=debug_this)
         
         if not page_width or not page_height:
@@ -314,10 +314,12 @@ def normalize_all_element_bboxes(
         normalized_count += 1
     
     print(f"    Normalized {normalized_count} element bboxes")
-    if skipped_no_bbox > 0 and verbose:
-        print(f"    Skipped {skipped_no_bbox} elements (no bbox)")
+    if skipped_no_bbox > 0:
+        print(f"    [WARNING] {skipped_no_bbox} elements had no bbox at all")
     if skipped_no_dims > 0:
-        print(f"    [WARNING] Failed to normalize {skipped_no_dims} elements on pages: {failed_pages}")
+        print(f"    [WARNING] Failed to normalize {skipped_no_dims} elements on pages: {sorted(failed_pages)}")
+        print(f"    [WARNING] These elements will use fallback positioning (may be inaccurate)")
+        print(f"    [WARNING] Check that page_metadata contains dimensions for these pages")
     
     # Verify normalization worked
     if normalized_count > 0:

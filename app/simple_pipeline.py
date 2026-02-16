@@ -89,37 +89,28 @@ def extract_title_from_first_page(raw_input_path: str, output_path: str):
     """Extract title page information from page 1."""
     print(f"  Loading: {raw_input_path}")
     
-    try:
-        data = load_json_with_recovery(raw_input_path)
-    except Exception as e:
-        print(f"  [Error] Failed to load raw OCR JSON: {e}")
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump([], f)
-        return
+    data = load_json_with_recovery(raw_input_path)
 
     page_text = ""
-    try:
-        if isinstance(data, list) and len(data) > 0:
-            data.sort(key=lambda x: int(x.get('page_num', 0) or x.get('page_Id', 0) or 0))
-            first_item = data[0]
-            page_dict = first_item.get('page_dict', first_item)
+    if isinstance(data, list) and len(data) > 0:
+        data.sort(key=lambda x: int(x.get('page_num', 0) or x.get('page_Id', 0) or 0))
+        first_item = data[0]
+        page_dict = first_item.get('page_dict', first_item)
+        text_list = page_dict.get('text', [])
+        if isinstance(text_list, list):
+            page_text = " ".join([str(t) for t in text_list])
+        else:
+            page_text = str(text_list)
+    elif isinstance(data, dict):
+        key = "1" if "1" in data else next(iter(data), None)
+        if key:
+            page_obj = data[key]
+            page_dict = page_obj.get('page_dict', page_obj) if isinstance(page_obj, dict) else page_obj
             text_list = page_dict.get('text', [])
             if isinstance(text_list, list):
                 page_text = " ".join([str(t) for t in text_list])
             else:
                 page_text = str(text_list)
-        elif isinstance(data, dict):
-            key = "1" if "1" in data else next(iter(data), None)
-            if key:
-                page_obj = data[key]
-                page_dict = page_obj.get('page_dict', page_obj) if isinstance(page_obj, dict) else page_obj
-                text_list = page_dict.get('text', [])
-                if isinstance(text_list, list):
-                    page_text = " ".join([str(t) for t in text_list])
-                else:
-                    page_text = str(text_list)
-    except Exception as e:
-        print(f"  [Warning] Error parsing page text structure: {e}")
 
     info = None
     if page_text and page_text.strip():
@@ -132,7 +123,9 @@ def extract_title_from_first_page(raw_input_path: str, output_path: str):
                 LLM_CONFIG['provider']
             )
         except Exception as e:
-            print(f"  [Warning] Title extraction LLM failure: {e}")
+            # LLM calls are external/flaky — warn but don't crash the pipeline
+            print(f"  [WARNING] Title extraction LLM call failed: {e}")
+            print(f"            Document will be created without title page.")
             info = None
     
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
@@ -298,24 +291,22 @@ def main():
         # STEP 1: CLASSIFY
         if args.step in ["classify", "all"]:
             print("[1: Classify]")
-            try:
-                run_classification_on_file(raw_input, classify_out, LLM_CONFIG, max_workers=4)
-                result = load_classification_result(classify_out)
-                if result and result.get('is_stub'):
-                    print("  [Info] Document is a stub, skipping remaining steps.")
-                    continue
-            except Exception as e:
-                print(f"  [Error] Classification failed: {e}")
+            run_classification_on_file(raw_input, classify_out, LLM_CONFIG, max_workers=4)
+            result = load_classification_result(classify_out)
+            if result and result.get('is_stub'):
+                print("  [Info] Document is a stub, skipping remaining steps.")
+                continue
                 
         # STEP 2: TITLE
         if args.step in ["title", "all"]:
             print("[2: Title]")
-            try:
-                result = load_classification_result(classify_out)
-            except Exception as e:
-                print(f"  [Warning] Could not load classification for title step: {e}")
-                result = None
+            if not os.path.exists(classify_out):
+                print(f"  [FAIL] Classification output not found: {classify_out}")
+                print(f"         Step 1 (classify) must complete successfully first.")
+                print(f"         Skipping remaining steps for {stem}.")
+                continue
             
+            result = load_classification_result(classify_out)
             doc_type = result.get('document_type', 'unknown') if result else 'unknown'
             
             if doc_type == 'no_title':
@@ -326,73 +317,97 @@ def main():
         # STEP 3: STRUCTURE
         if args.step in ["structure", "all"]:
             print("[3: Structure]")
-            try:
-                content_start = load_content_start_page(classify_out, default=1)
-                run_section_processing_on_file(
-                    raw_input, 
-                    organized_out, 
-                    content_start_page=content_start,
-                    yolo_exports_dir=figures_dir,  # Pass YOLO exports for overlap filtering
-                    doc_stem=stem
-                )
-            except Exception as e:
-                print(f"  [Error] Structure processing failed: {e}")
+            if not os.path.exists(classify_out):
+                print(f"  [FAIL] Classification output not found: {classify_out}")
+                print(f"         Step 1 (classify) must complete successfully first.")
+                print(f"         Skipping remaining steps for {stem}.")
+                continue
+            content_start = load_content_start_page(classify_out, default=1)
+            run_section_processing_on_file(
+                raw_input, 
+                organized_out, 
+                content_start_page=content_start,
+                yolo_exports_dir=figures_dir,  # Pass YOLO exports for overlap filtering
+                doc_stem=stem
+            )
+            if not os.path.exists(organized_out):
+                print(f"  [FAIL] Structure processing produced no output: {organized_out}")
+                print(f"         Skipping remaining steps for {stem}.")
+                continue
 
         # STEP 4: ML FILTER
         if args.step in ["ml_filter", "all"]:
             print("[4: ML Reclassify]")
             if not os.path.exists(organized_out):
-                print(f"  [Skip] Organized output not found.")
+                print(f"  [FAIL] Organized output not found: {organized_out}")
+                print(f"         Step 3 (structure) must complete successfully first.")
+                print(f"         Skipping remaining steps for {stem}.")
+                continue
+            
+            if stem not in sections_to_keep_by_doc:
+                shutil.copy(organized_out, ml_filtered_out)
             else:
-                if stem not in sections_to_keep_by_doc:
-                    shutil.copy(organized_out, ml_filtered_out)
-                else:
-                    try:
-                        sections_to_keep = sections_to_keep_by_doc[stem]
-                        with open(organized_out, 'r') as f: data = json.load(f)
-                        
-                        elements = data.get('elements', []) if isinstance(data, dict) else data
-                        page_metadata = data.get('page_metadata', {}) if isinstance(data, dict) else {}
-                        
-                        reclassified_elements, kept, converted = reclassify_elements(elements, sections_to_keep)
-                        print(f"  Sections kept: {kept}, converted to text blocks: {converted}")
-                        
-                        with open(ml_filtered_out, 'w') as f:
-                            json.dump({'page_metadata': page_metadata, 'elements': reclassified_elements}, f, indent=4)
-                    except Exception as e:
-                        print(f"  [Error] ML Reclassify failed: {e}")
-                        shutil.copy(organized_out, ml_filtered_out)
+                sections_to_keep = sections_to_keep_by_doc[stem]
+                with open(organized_out, 'r') as f: data = json.load(f)
+                
+                elements = data.get('elements', []) if isinstance(data, dict) else data
+                page_metadata = data.get('page_metadata', {}) if isinstance(data, dict) else {}
+                
+                reclassified_elements, kept, converted = reclassify_elements(elements, sections_to_keep)
+                print(f"  Sections kept: {kept}, converted to text blocks: {converted}")
+                
+                with open(ml_filtered_out, 'w') as f:
+                    json.dump({'page_metadata': page_metadata, 'elements': reclassified_elements}, f, indent=4)
 
         # STEP 5: ASSETS (using YOLO exports or manual exports)
         if args.step in ["assets", "all"]:
             print("[5: Assets]")
             input_file = ml_filtered_out if os.path.exists(ml_filtered_out) else organized_out
-            if os.path.exists(input_file):
-                run_asset_integration(input_file, with_assets_out, figures_dir, stem, positioning_mode="bbox")
-            else:
-                print(f"  [Skip] Input file for assets not found: {input_file}")
+            if not os.path.exists(input_file):
+                print(f"  [FAIL] Asset input not found: {input_file}")
+                print(f"         Expected from step 4 (ml_filter) or step 3 (structure).")
+                print(f"         Skipping remaining steps for {stem}.")
+                continue
+            run_asset_integration(input_file, with_assets_out, figures_dir, stem, positioning_mode="bbox")
+            if not os.path.exists(with_assets_out):
+                print(f"  [FAIL] Asset integration produced no output: {with_assets_out}")
+                print(f"         Skipping remaining steps for {stem}.")
+                continue
 
         # STEP 6: TABLES
         if args.step in ["tables", "all"]:
             print("[6: Tables]")
-            input_file = with_assets_out if os.path.exists(with_assets_out) else ml_filtered_out
-            if os.path.exists(input_file):
-                run_table_processing_on_file(input_file, tables_out, figures_dir, stem, LLM_CONFIG, use_llm_ocr=not args.no_table_ocr)
-            else:
-                print(f"  [Skip] Input file for tables not found: {input_file}")
+            if not os.path.exists(with_assets_out):
+                print(f"  [FAIL] Tables input not found: {with_assets_out}")
+                print(f"         Step 5 (assets) must complete successfully first.")
+                print(f"         Skipping remaining steps for {stem}.")
+                continue
+            run_table_processing_on_file(with_assets_out, tables_out, figures_dir, stem, LLM_CONFIG, use_llm_ocr=not args.no_table_ocr)
 
         # STEP 7: WRITE
         if args.step in ["write", "all"]:
             print("[7: Write]")
-            input_file = tables_out if os.path.exists(tables_out) else with_assets_out
-            if os.path.exists(input_file):
-                run_docx_creation(input_file, final_docx, figures_dir, stem, title_out)
+            # Prefer tables_out (has both assets + tables), fall back to with_assets_out
+            # (has assets but no table processing). Never silently skip assets.
+            if os.path.exists(tables_out):
+                input_file = tables_out
+            elif os.path.exists(with_assets_out):
+                print(f"  [WARNING] Tables output not found, writing from asset output instead.")
+                print(f"            Table processing may have failed for {stem}.")
+                input_file = with_assets_out
             else:
-                print(f"  [Skip] Input file for write not found: {input_file}")
+                print(f"  [FAIL] No input available for write step.")
+                print(f"         Neither {tables_out} nor {with_assets_out} exist.")
+                print(f"         Steps 5-6 must complete successfully first.")
+                continue
+            run_docx_creation(input_file, final_docx, figures_dir, stem, title_out)
 
         # STEP 8: VALIDATE
         if args.step in ["validate", "all"]:
             print("[8: Validate]")
+            if not os.path.exists(final_docx):
+                print(f"  [FAIL] Cannot validate - DOCX not found: {final_docx}")
+                continue
             try:
                 result = run_validation_on_file(stem, args.raw_ocr_dir, args.results_dir)
                 if result:
@@ -403,7 +418,7 @@ def main():
                         'precision': result.precision,
                     })
             except Exception as e:
-                print(f"  [Warning] Validation failed: {e}")
+                print(f"  [WARNING] Validation failed: {e}")
         print()
 
     # ==========================================================================
