@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 try:
     from .utils import _extract_json_from_llm_string, call_llm, save_results_to_json, load_json_with_recovery
 except ImportError:
-    from utils import _extract_json_from_llm_string, call_llm, save_results_to_json
+    from utils import _extract_json_from_llm_string, call_llm, save_results_to_json, load_json_with_recovery
 
 
 # =============================================================================
