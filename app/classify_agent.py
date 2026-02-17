@@ -104,6 +104,74 @@ MIN_TOC_ENTRIES_FOR_TOC = 8
 # OCR often mangles these: "......" becomes "....eee..cc.c....e..."
 MIN_PERIODS_FOR_TOC_HINT = 40
 
+# Pattern for garbled dot leaders - OCR turns "............" into ".....sscee...cc.."
+# Matches runs of dots mixed with short bursts of letters (1-3 chars between dots)
+# e.g., "...sce..." or ".eee..cc.c...e.." or just "............"
+GARBLED_DOT_LEADER_PATTERN = re.compile(
+    r'(?:\.{2,}[a-zA-Z]{0,3}){3,}'  # 3+ repetitions of (2+ dots + 0-3 letters)
+)
+
+# Pattern for top-level section numbers (no dot required): "1", "2", "10"
+# Used specifically for TOC line detection where "1 Scope" is a valid TOC entry
+TOP_LEVEL_SECTION_PATTERN = re.compile(
+    r'^(\d{1,2})$'
+)
+
+# Line-level TOC entry pattern: number + title text + optional dots/garble + page number
+# This is more permissive than TOC_ENTRY_PATTERN and works per-line.
+# Matches:
+#   "1.1 Introduction .............. 5"
+#   "3 Terms and definitions ....... 8"
+#   "1.2.3 Scope .....sscee...cc.. 12"
+#   "2 References 5"
+#   "I. Scope ..................... 3"     (Roman numerals)
+#   "A.1 Annex A requirements ..... 45"   (Annex numbering)
+LINE_TOC_ENTRY_PATTERN = re.compile(
+    r'^\s*'
+    r'(?:'
+    r'[IVXLC]+\.?\s+'                      # Roman numeral: "I.", "IV ", "IX."
+    r'|[A-Z]\.\d+(?:\.\d+)*\.?\s+'         # Annex: "A.1", "B.2.3"
+    r'|\d{1,2}(?:\.\d{1,2}){0,5}\.?\s+'    # Arabic: "1", "1.1", "1.2.3"
+    r')'
+    r'[A-Z][A-Za-z]'                        # Title must start with capital letter
+    r'.{3,80}'                              # Title body (3-80 chars)
+    r'[\s.]{0,200}'                         # Optional dot leaders / garbled dots / spaces
+    r'\d{1,4}'                              # Page number at end
+    r'\s*$',
+    re.MULTILINE
+)
+
+
+def count_garbled_dot_leaders(text: str) -> int:
+    """
+    Count garbled dot leader sequences in text.
+    
+    OCR frequently turns dot leaders ("..............") into garbled sequences
+    like ".....sscee..cc.." or "....eee..c.....". This function counts how
+    many such sequences appear, which is a strong TOC signal.
+    
+    Returns:
+        Number of garbled dot leader sequences found.
+    """
+    return len(GARBLED_DOT_LEADER_PATTERN.findall(text))
+
+
+def count_toc_lines(text: str) -> int:
+    """
+    Count lines that look like individual TOC entries.
+    
+    Analyzes each line for the pattern: section_number + title + page_number.
+    More robust than page-level regex because it handles:
+    - Top-level numbers without dots ("1 Scope ... 3")
+    - Roman numerals ("IV. Requirements ... 12")
+    - Garbled dot leaders between title and page number
+    - Missing dot leaders ("3 Definitions 8")
+    
+    Returns:
+        Number of lines that match a TOC entry pattern.
+    """
+    return len(LINE_TOC_ENTRY_PATTERN.findall(text))
+
 
 def fast_classify_page(page_text: str) -> Optional[str]:
     """
@@ -152,8 +220,14 @@ def fast_classify_page(page_text: str) -> Optional[str]:
     
     unique_section_numbers = set(filtered_section_numbers)
     
-    # Count TOC-style entries (section + title + page number)
+    # Count TOC-style entries (section + title + page number) - original pattern
     toc_entries = TOC_ENTRY_PATTERN.findall(page_text)
+    
+    # Count line-level TOC entries (more permissive, handles top-level + garbled dots)
+    toc_line_count = count_toc_lines(page_text)
+    
+    # Count garbled dot leader sequences (strong TOC signal even without section numbers)
+    garbled_dot_count = count_garbled_dot_leaders(page_text)
     
     # Check for explicit TOC header
     has_toc_header = bool(TOC_HEADER_PATTERN.search(page_text))
@@ -174,8 +248,10 @@ def fast_classify_page(page_text: str) -> Optional[str]:
     # 1. Many unique section numbers (10+) AND not dominated by measurements → definitely TOC
     # 2. TOC header + several section numbers (5+) → definitely TOC  
     # 3. Many TOC-style entries (8+) → definitely TOC
-    # 4. List of Figures/Tables header with numbered items → TOC
-    # 5. FALLBACK: Many periods (dot leaders) + TOC header → likely TOC even without section numbers
+    # 4. Many line-level TOC entries (6+) → definitely TOC (catches top-level numbers)
+    # 5. List of Figures/Tables header with numbered items → TOC
+    # 6. Many garbled dot leaders (8+) + some section-like patterns → TOC
+    # 7. FALLBACK: Many periods (dot leaders) + TOC header → likely TOC
     
     if len(unique_section_numbers) >= MIN_SECTION_NUMBERS_FOR_TOC and not has_many_measurements:
         return "TABLE_OF_CONTENTS"
@@ -186,6 +262,14 @@ def fast_classify_page(page_text: str) -> Optional[str]:
     if len(toc_entries) >= MIN_TOC_ENTRIES_FOR_TOC:
         return "TABLE_OF_CONTENTS"
     
+    # NEW: Line-level TOC detection (catches "1 Scope ... 3" style entries)
+    if toc_line_count >= 6:
+        return "TABLE_OF_CONTENTS"
+    
+    # NEW: TOC header + fewer line entries is still a TOC
+    if has_toc_header and toc_line_count >= 3:
+        return "TABLE_OF_CONTENTS"
+    
     # For List of Figures/Tables, we have the header but numbering is simpler
     # Still auto-classify if we have the header AND multiple numbered items
     if has_list_of_header:
@@ -193,6 +277,15 @@ def fast_classify_page(page_text: str) -> Optional[str]:
         fig_tab_numbers = re.findall(r'\b(?:Figure|Table|Fig\.?)\s*\d+', page_text, re.IGNORECASE)
         if len(fig_tab_numbers) >= 5:
             return "TABLE_OF_CONTENTS"
+    
+    # NEW: Garbled dot leaders — strong signal for OCR-mangled TOC pages
+    # 8+ garbled dot sequences + at least a couple section numbers or line entries
+    if garbled_dot_count >= 8 and (len(unique_section_numbers) >= 2 or toc_line_count >= 2):
+        return "TABLE_OF_CONTENTS"
+    
+    # NEW: TOC header + garbled dot leaders (OCR destroyed the numbers but dots remain)
+    if has_toc_header and garbled_dot_count >= 4:
+        return "TABLE_OF_CONTENTS"
     
     # FALLBACK: Dot leader detection for TOC pages where OCR missed section numbers
     # If we have TOC header + lots of periods, it's probably a TOC even without parsed numbers
@@ -316,6 +409,8 @@ def get_fast_classification_reason(page_text: str) -> str:
     
     unique_section_numbers = set(filtered_section_numbers)
     toc_entries = TOC_ENTRY_PATTERN.findall(page_text)
+    toc_line_count = count_toc_lines(page_text)
+    garbled_dot_count = count_garbled_dot_leaders(page_text)
     has_toc_header = bool(TOC_HEADER_PATTERN.search(page_text))
     has_list_of_header = bool(LIST_OF_PATTERN.search(page_text))
     
@@ -331,10 +426,22 @@ def get_fast_classification_reason(page_text: str) -> str:
     if len(toc_entries) >= MIN_TOC_ENTRIES_FOR_TOC:
         return f"Found {len(toc_entries)} TOC-style entries"
     
+    if toc_line_count >= 6:
+        return f"Found {toc_line_count} TOC line entries (line-level detection)"
+    
+    if has_toc_header and toc_line_count >= 3:
+        return f"TOC header + {toc_line_count} TOC line entries"
+    
     if has_list_of_header:
         fig_tab_numbers = re.findall(r'\b(?:Figure|Table|Fig\.?)\s*\d+', page_text, re.IGNORECASE)
         if len(fig_tab_numbers) >= 5:
             return f"List of Figures/Tables header + {len(fig_tab_numbers)} items"
+    
+    if garbled_dot_count >= 8 and (len(unique_section_numbers) >= 2 or toc_line_count >= 2):
+        return f"{garbled_dot_count} garbled dot leaders + {len(unique_section_numbers)} section numbers + {toc_line_count} line entries"
+    
+    if has_toc_header and garbled_dot_count >= 4:
+        return f"TOC header + {garbled_dot_count} garbled dot leader sequences"
     
     # Dot leader fallback
     if has_toc_header and period_count >= MIN_PERIODS_FOR_TOC_HINT:
@@ -998,13 +1105,29 @@ def test_fast_classification(text: str) -> None:
         if len(set(rejected)) > 10:
             print(f"  ... and {len(set(rejected)) - 10} more")
     
-    # Find TOC entries
+    # Find TOC entries (original pattern)
     toc_entries = TOC_ENTRY_PATTERN.findall(text)
     print(f"\nTOC-style entries found ({len(toc_entries)}):")
     for entry in toc_entries[:10]:
         print(f"  - {entry}")
     if len(toc_entries) > 10:
         print(f"  ... and {len(toc_entries) - 10} more")
+    
+    # Line-level TOC entries (new)
+    toc_line_count = count_toc_lines(text)
+    print(f"\nLine-level TOC entries: {toc_line_count}")
+    if toc_line_count > 0:
+        for match in LINE_TOC_ENTRY_PATTERN.finditer(text):
+            line = match.group().strip()
+            print(f"  - {line[:80]}{'...' if len(line) > 80 else ''}")
+    
+    # Garbled dot leaders (new)
+    garbled_dot_count = count_garbled_dot_leaders(text)
+    print(f"\nGarbled dot leader sequences: {garbled_dot_count}")
+    if garbled_dot_count > 0:
+        for match in GARBLED_DOT_LEADER_PATTERN.finditer(text):
+            snippet = match.group()[:60]
+            print(f"  - '{snippet}{'...' if len(match.group()) > 60 else ''}'")
     
     # Check for measurement contexts
     measurements = MEASUREMENT_CONTEXT_PATTERN.findall(text)
@@ -1020,6 +1143,10 @@ def test_fast_classification(text: str) -> None:
     print(f"\nHeaders detected:")
     print(f"  - TOC header: {has_toc}")
     print(f"  - List of Figures/Tables header: {has_list_of}")
+    
+    # Period count
+    period_count = text.count('.')
+    print(f"\nPeriod count: {period_count}")
     
     # Final result
     result = fast_classify_page(text)

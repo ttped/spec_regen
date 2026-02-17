@@ -308,6 +308,67 @@ def train_and_predict(
     print(f"  Training Fit: Precision: {t_prec:.3f}, Recall: {t_rec:.3f}, F1: {t_f1:.3f}")
     
     # =========================================================================
+    # LABEL AUDIT: Find likely human labeling errors
+    # =========================================================================
+    # Use the trained model's probabilities to find rows where the model is
+    # confident but the human label disagrees. These are candidates for
+    # mislabeled data — either the model learned a strong pattern the human
+    # missed, or vice versa.
+    #
+    # Output: CSV sorted by disagreement strength (most suspicious first).
+    
+    labeled_probs = final_model.predict_proba(X_labeled)[:, 1]
+    
+    audit_df = labeled_df[['_doc_name', '_section_number_raw', '_page', '_title', '_label']].copy()
+    if '_fingerprint' in labeled_df.columns:
+        audit_df['_fingerprint'] = labeled_df['_fingerprint']
+    audit_df['model_prob'] = labeled_probs
+    audit_df['model_pred'] = (labeled_probs >= threshold).astype(int)
+    audit_df['disagrees'] = (audit_df['model_pred'] != audit_df['_label'].astype(int))
+    
+    # Disagreement strength: how far the model's probability is from the label
+    # Label=1 but prob=0.05 → strength=0.95 (model very confident it's wrong)
+    # Label=0 but prob=0.98 → strength=0.98 (model very confident it's valid)
+    audit_df['disagreement_strength'] = audit_df.apply(
+        lambda r: abs(r['model_prob'] - float(r['_label'])), axis=1
+    )
+    
+    disagreements = audit_df[audit_df['disagrees']].sort_values('disagreement_strength', ascending=False)
+    
+    n_disagree = len(disagreements)
+    n_total = len(audit_df)
+    print(f"\n  --- Label Audit ---")
+    print(f"  Disagreements: {n_disagree}/{n_total} ({100*n_disagree/n_total:.1f}%)")
+    
+    if n_disagree > 0:
+        # Break down by type
+        false_pos_suspects = disagreements[disagreements['_label'].astype(int) == 1]
+        false_neg_suspects = disagreements[disagreements['_label'].astype(int) == 0]
+        print(f"  Labeled 1 but model says 0: {len(false_pos_suspects)} (possible invalid sections you marked valid)")
+        print(f"  Labeled 0 but model says 1: {len(false_neg_suspects)} (possible valid sections you marked invalid)")
+        
+        # Show top suspicious rows
+        top_n = min(10, n_disagree)
+        print(f"\n  Top {top_n} most suspicious labels:")
+        for _, row in disagreements.head(top_n).iterrows():
+            label_str = "valid" if int(row['_label']) == 1 else "invalid"
+            model_str = f"{row['model_prob']:.2f}"
+            print(f"    [{row['_doc_name']}] p{int(row['_page'])} "
+                  f"'{row['_section_number_raw']}' '{str(row['_title'])[:40]}' "
+                  f"— labeled {label_str}, model={model_str}")
+        
+        # Save full audit CSV next to the input
+        audit_path = csv_path.rsplit('.', 1)[0] + '_label_audit.csv'
+        disagreements.to_csv(audit_path, index=False)
+        print(f"\n  Full audit saved to: {audit_path}")
+    
+    metrics['audit'] = {
+        'total_labeled': n_total,
+        'disagreements': n_disagree,
+        'disagreement_rate': n_disagree / n_total if n_total > 0 else 0,
+    }
+    
+    # =========================================================================
     # PREDICT ON EVERYTHING
     # =========================================================================
     X_all = df[available].fillna(0).replace([np.inf, -np.inf], 0)
