@@ -6,6 +6,10 @@ into the complex_table_maker schema for rendering in Word documents.
 
 Lives in: root/app/
 
+Pipeline:
+  OCR JSON → consolidate_columns (sparse grid → logical columns) →
+  convert_ocr_to_table_schema → complex_table_maker schema
+
 The OCR JSON has:
   - n_rows, n_cols: grid dimensions
   - header_rows: list of row indices that are headers
@@ -19,6 +23,8 @@ The complex_table_maker schema expects:
 """
 
 from typing import Dict, List, Optional, Tuple
+
+from consolidate_columns import consolidate_ocr_data, compute_consolidated_widths_pct
 
 
 def _build_cell_grid(
@@ -48,6 +54,38 @@ def _build_cell_grid(
     return grid, n_rows, n_cols
 
 
+def _build_occupied_map(
+    grid: List[List[Optional[Dict]]],
+    n_rows: int,
+    n_cols: int,
+) -> List[List[Optional[Tuple[int, int]]]]:
+    """
+    Build an occupation map: occupied[r][c] = (origin_r, origin_c) if
+    position (r, c) is covered by a span from that origin cell, else None.
+
+    This replaces the old _is_occupied scan-based approach with an
+    O(cells * span_area) precomputation that is both faster and correct.
+    """
+    occupied: List[List[Optional[Tuple[int, int]]]] = [
+        [None for _ in range(n_cols)] for _ in range(n_rows)
+    ]
+
+    for r in range(n_rows):
+        for c in range(n_cols):
+            cell = grid[r][c]
+            if cell is None:
+                continue
+            rs = cell.get("row_span", 1)
+            cs = cell.get("col_span", 1)
+            for dr in range(rs):
+                for dc in range(cs):
+                    rr, cc = r + dr, c + dc
+                    if rr < n_rows and cc < n_cols:
+                        occupied[rr][cc] = (r, c)
+
+    return occupied
+
+
 def _compute_column_widths(
     grid: List[List[Optional[Dict]]],
     n_rows: int,
@@ -70,7 +108,6 @@ def _compute_column_widths(
             if cell is None:
                 continue
             cs = cell.get("col_span", 1)
-            # Only use single-column cells for boundary estimation
             if cs == 1:
                 x1, _, x2, _ = cell["bbox"]
                 col_x1s[c].append(x1)
@@ -86,6 +123,63 @@ def _compute_column_widths(
             extents.append(None)
 
     return extents
+
+
+def _distribute_spanning_widths(
+    grid: List[List[Optional[Dict]]],
+    extents: List[Optional[Tuple[int, int]]],
+    n_rows: int,
+    n_cols: int,
+) -> List[Optional[Tuple[int, int]]]:
+    """
+    For columns with no single-span width data, estimate from
+    multi-span cells that cross them.
+
+    If a cell spans cols [a, b] and we know the extents of cols
+    a..b except for some gap columns, we can infer the gap's width
+    from the cell's bbox minus the known columns.
+    """
+    result = list(extents)
+
+    for r in range(n_rows):
+        for c in range(n_cols):
+            cell = grid[r][c]
+            if cell is None:
+                continue
+            cs = cell.get("col_span", 1)
+            if cs <= 1:
+                continue
+
+            bbox = cell.get("bbox")
+            if not bbox or len(bbox) < 4:
+                continue
+
+            cell_x1, _, cell_x2, _ = bbox
+            cell_width = cell_x2 - cell_x1
+
+            spanned_cols = range(c, min(c + cs, n_cols))
+            missing = [sc for sc in spanned_cols if result[sc] is None]
+
+            if not missing:
+                continue
+
+            known_width = 0
+            for sc in spanned_cols:
+                if result[sc] is not None:
+                    known_width += result[sc][1] - result[sc][0]
+
+            remaining = max(cell_width - known_width, len(missing) * 10)
+            per_missing = remaining // len(missing)
+
+            cursor = cell_x1
+            for sc in spanned_cols:
+                if result[sc] is not None:
+                    cursor = result[sc][1]
+                elif sc in missing:
+                    result[sc] = (cursor, cursor + per_missing)
+                    cursor += per_missing
+
+    return result
 
 
 def _extents_to_percentages(
@@ -110,7 +204,6 @@ def _extents_to_percentages(
             widths_px.append(None)
             unknown_count += 1
 
-    # Estimate unknown columns as average of known ones
     avg_known = total_known / max(len(widths_px) - unknown_count, 1)
     for i, w in enumerate(widths_px):
         if w is None:
@@ -118,33 +211,6 @@ def _extents_to_percentages(
 
     total = sum(widths_px)
     return [round((w / total) * 100, 1) for w in widths_px]
-
-
-def _is_occupied(
-    grid: List[List[Optional[Dict]]],
-    r: int,
-    c: int,
-    n_rows: int,
-    n_cols: int,
-) -> bool:
-    """
-    Check if grid position (r, c) is covered by a spanning cell
-    originating from a different position.
-    """
-    for scan_r in range(r, -1, -1):
-        for scan_c in range(c, -1, -1):
-            cell = grid[scan_r][scan_c]
-            if cell is None:
-                continue
-            rs = cell.get("row_span", 1)
-            cs = cell.get("col_span", 1)
-            if (scan_r + rs > r and scan_c + cs > c
-                    and (scan_r, scan_c) != (r, c)):
-                return True
-            # Only need to check cells that could span to (r, c)
-            if scan_c + cs <= c:
-                continue
-    return False
 
 
 def convert_ocr_to_table_schema(
@@ -156,7 +222,7 @@ def convert_ocr_to_table_schema(
     Convert OCR pipeline JSON into the complex_table_maker schema.
 
     Args:
-        ocr_data: The full OCR JSON dict.
+        ocr_data: The full OCR JSON dict (already consolidated if desired).
         confidence_threshold: Cells below this confidence get flagged.
         mark_low_confidence_italic: If True, low-confidence cells render italic.
 
@@ -167,9 +233,18 @@ def convert_ocr_to_table_schema(
     header_row_indices = set(ocr_data.get("header_rows", []))
     col_alignment = ocr_data.get("column_alignment", {})
 
-    # Column definitions
-    extents = _compute_column_widths(grid, n_rows, n_cols)
-    pcts = _extents_to_percentages(extents, n_cols)
+    # Precompute occupation map (replaces per-cell _is_occupied scans)
+    occupied = _build_occupied_map(grid, n_rows, n_cols)
+
+    # Column definitions — use consolidated extents if available,
+    # otherwise compute from grid with spanning-cell backfill.
+    if "_column_extents" in ocr_data:
+        pcts = compute_consolidated_widths_pct(ocr_data)
+    else:
+        extents = _compute_column_widths(grid, n_rows, n_cols)
+        extents = _distribute_spanning_widths(grid, extents, n_rows, n_cols)
+        pcts = _extents_to_percentages(extents, n_cols)
+
     columns = [{"name": "", "width_pct": pcts[c]} for c in range(n_cols)]
 
     # Build rows
@@ -184,8 +259,9 @@ def convert_ocr_to_table_schema(
             cell = grid[r][c]
 
             if cell is None:
-                # Check if covered by a span from above/left
-                if _is_occupied(grid, r, c, n_rows, n_cols):
+                # Check if covered by a span using precomputed map
+                origin = occupied[r][c]
+                if origin is not None and origin != (r, c):
                     cells.append(None)
                 else:
                     cells.append({"text": ""})
@@ -212,16 +288,19 @@ def convert_ocr_to_table_schema(
 
             cells.append(schema_cell)
 
-            # Skip columns covered by this cell's colspan
+            # Insert None placeholders for columns covered by this colspan.
+            # This keeps the cell list aligned with physical column positions
+            # so the renderer doesn't desync its iterator.
+            for _ in range(1, cs):
+                cells.append(None)
+
             c += cs
-            continue
 
         schema_rows.append({
             "is_header": is_header,
             "cells": cells,
         })
 
-    # Count header rows
     header_count = len(header_row_indices)
 
     return {
@@ -234,15 +313,24 @@ def convert_ocr_to_table_schema(
 def convert_and_strip_empty(
     ocr_data: Dict,
     confidence_threshold: float = 0.3,
+    consolidate: bool = True,
+    gap_threshold_px: int = 50,
 ) -> Dict:
     """
-    Convert OCR JSON and strip fully-empty leading/trailing rows and columns.
+    Convert OCR JSON to schema, optionally consolidating phantom columns
+    first, then stripping fully-empty leading/trailing rows and columns.
 
-    This is useful since the OCR grid is often much larger than the actual
-    table content (e.g. 23x19 grid but only a few columns have data).
+    Args:
+        ocr_data: Raw OCR JSON dict.
+        confidence_threshold: Cells below this get flagged.
+        consolidate: If True, run column consolidation before conversion.
+        gap_threshold_px: Pixel gap threshold for column merging.
 
     Returns a cleaned complex_table_maker schema dict.
     """
+    if consolidate:
+        ocr_data = consolidate_ocr_data(ocr_data, gap_threshold_px)
+
     schema = convert_ocr_to_table_schema(ocr_data, confidence_threshold)
 
     rows = schema["rows"]
@@ -267,17 +355,27 @@ def convert_and_strip_empty(
                 col_has_data[i] = True
 
     first_col = next((i for i, v in enumerate(col_has_data) if v), 0)
-    last_col = next((i for i in range(n_cols - 1, -1, -1) if col_has_data[i]), n_cols - 1)
+    last_col = next(
+        (i for i in range(n_cols - 1, -1, -1) if col_has_data[i]),
+        n_cols - 1,
+    )
 
     # Find occupied row range
     row_has_data = []
     for row in rows:
         cells = row.get("cells", [])
-        has = any(_cell_has_content(cells[i]) for i in range(first_col, last_col + 1) if i < len(cells))
+        has = any(
+            _cell_has_content(cells[i])
+            for i in range(first_col, last_col + 1)
+            if i < len(cells)
+        )
         row_has_data.append(has)
 
     first_row = next((i for i, v in enumerate(row_has_data) if v), 0)
-    last_row = next((i for i in range(n_rows - 1, -1, -1) if row_has_data[i]), n_rows - 1)
+    last_row = next(
+        (i for i in range(n_rows - 1, -1, -1) if row_has_data[i]),
+        n_rows - 1,
+    )
 
     # Slice
     trimmed_columns = columns[first_col:last_col + 1]
