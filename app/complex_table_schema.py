@@ -215,6 +215,8 @@ def compute_column_widths_dxa(columns: List[Dict], total_width_dxa: int) -> List
     Resolve column widths to absolute DXA values.
 
     Priority: width_dxa > width_pct > equal distribution.
+    The final values are guaranteed to sum exactly to total_width_dxa
+    so Word doesn't clip the right edge or leave a gap.
     """
     n = len(columns)
     widths = [None] * n
@@ -236,6 +238,17 @@ def compute_column_widths_dxa(columns: List[Dict], total_width_dxa: int) -> List
         per_col = max(remaining // len(unresolved), 360)  # minimum ~0.25 inch
         for i in unresolved:
             widths[i] = per_col
+            remaining -= per_col
+
+    # Distribute rounding remainder so widths sum exactly to total_width_dxa
+    current_total = sum(widths)
+    diff = total_width_dxa - current_total
+    if diff != 0 and n > 0:
+        # Add/subtract 1 DXA from the widest columns until exact
+        step = 1 if diff > 0 else -1
+        sorted_indices = sorted(range(n), key=lambda i: widths[i], reverse=True)
+        for j in range(abs(diff)):
+            widths[sorted_indices[j % n]] += step
 
     return widths
 

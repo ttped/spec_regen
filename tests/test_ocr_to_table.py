@@ -2,7 +2,7 @@
 test_ocr_to_table.py
 
 Loads OCR JSON, converts through ocr_to_table, and renders via
-complex_table_maker to verify the full pipeline.
+complex_table_schema to verify the full pipeline.
 
 Lives in: root/tests/
 Run from project root:
@@ -26,7 +26,7 @@ from docx.shared import Pt
 
 from ocr_to_table import convert_ocr_to_table_schema, convert_and_strip_empty
 from consolidate_columns import consolidate_ocr_data
-from complex_table_maker import add_complex_table
+from complex_table_schema import add_complex_table
 
 
 OUTPUT_DIR = os.path.join(_TESTS_DIR, "test_outputs")
@@ -63,7 +63,8 @@ def test_consolidated_grid(ocr_data: Dict, doc):
     schema = convert_and_strip_empty(ocr_data, consolidate=True)
     n_cols = len(schema["columns"])
     n_rows = len(schema["rows"])
-    doc.add_paragraph(f"After strip: {n_rows} rows x {n_cols} cols")
+    widths = [c.get("width_pct", 0) for c in schema["columns"]]
+    doc.add_paragraph(f"After strip: {n_rows} rows x {n_cols} cols, widths: {widths}")
     add_complex_table(doc, schema)
     doc.add_paragraph()
 
@@ -160,13 +161,14 @@ def test_schema_dump(ocr_data: Dict):
             if cell.get("italic"):
                 low_conf += 1
 
+    widths = [c.get("width_pct") for c in schema["columns"]]
     print(f"  Columns: {len(schema['columns'])}")
     print(f"  Rows: {len(schema['rows'])}")
     print(f"  Cells with content: {total_cells}")
     print(f"  Spanned cells: {spanned_cells}")
     print(f"  Low confidence (italic): {low_conf}")
     print(f"  Header rows: {schema['header_rows']}")
-    print(f"  Col widths: {[c.get('width_pct') for c in schema['columns']]}")
+    print(f"  Col widths: {widths}")
 
     return schema
 
