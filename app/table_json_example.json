@@ -1,0 +1,186 @@
+{
+  "table_id": "4b7b9a06-a121-431a-9e46-0e28972bacbf",
+  "source_image": "test_table_images\\S-133-1001-1-6_D_page008_Table_0.jpg",
+  "page_number": 8,
+  "dpi": 200,
+  "confidence": 0.8213809523809523,
+  "structure_confidence": 0.7701936512568945,
+  "n_rows": 23,
+  "n_cols": 19,
+  "multi_page": false,
+  "next_table_id": null,
+  "warnings": [
+    "Using non-default Tesseract PSM=3.",
+    "Some OCR tokens have low confidence (< 30 %). Consider re-running with a different"
+  ],
+  "header_rows": [3],
+  "column_types": {
+    "8": "text",
+    "9": "text",
+    "7": "text",
+    "3": "text",
+    "10": "text",
+    "11": "text",
+    "15": "text",
+    "17": "text",
+    "18": "text",
+    "14": "text",
+    "0": "text",
+    "1": "text",
+    "2": "text",
+    "4": "text",
+    "16": "text",
+    "5": "text",
+    "6": "text",
+    "12": "text"
+  },
+  "column_alignment": {
+    "8": "right",
+    "9": "center",
+    "7": "right",
+    "3": "right",
+    "10": "right",
+    "11": "right",
+    "15": "right",
+    "17": "right",
+    "18": "right",
+    "14": "right",
+    "0": "right",
+    "1": "right",
+    "2": "right",
+    "4": "right",
+    "16": "right",
+    "5": "right",
+    "6": "right",
+    "12": "center"
+  },
+  "layout_type": "borderless_text_table",
+  "normalization_score": 0.528687913558005,
+  "outliers_detected": 16,
+  "column_semantics": {
+    "3": "other",
+    "10": "other",
+    "11": "other",
+    "15": "other",
+    "17": "other",
+    "18": "other"
+  },
+  "rows": [
+    {
+      "row_index": 0,
+      "cells": [
+        {
+          "row": 0,
+          "col": 9,
+          "row_span": 1,
+          "col_span": 1,
+          "bbox": [794, 32, 803, 56],
+          "text": "I",
+          "confidence": 0.93,
+          "alignment": "center"
+        }
+      ]
+    },
+    {
+      "row_index": 1,
+      "cells": [
+        {
+          "row": 1,
+          "col": 7,
+          "row_span": 1,
+          "col_span": 2,
+          "bbox": [648, 79, 788, 103],
+          "text": "In-Process",
+          "confidence": 0.92,
+          "alignment": "right"
+        },
+        {
+          "row": 1,
+          "col": 9,
+          "row_span": 1,
+          "col_span": 2,
+          "bbox": [797, 80, 865, 103],
+          "text": "Tests",
+          "confidence": 0.96,
+          "alignment": "right"
+        }
+      ]
+    },
+    {
+      "row_index": 2,
+      "cells": [
+        {
+          "row": 2,
+          "col": 3,
+          "row_span": 1,
+          "col_span": 1,
+          "bbox": [426, 110, 482, 117],
+          "text": "seme",
+          "confidence": 0.26,
+          "alignment": "center",
+          "low_confidence": true
+        }
+      ]
+    },
+    {
+      "row_index": 3,
+      "cells": [
+        {
+          "row": 3,
+          "col": 3,
+          "row_span": 1,
+          "col_span": 1,
+          "bbox": [418, 129, 473, 168],
+          "text": "Test",
+          "confidence": 0.96,
+          "alignment": "left"
+        },
+        {
+          "row": 3,
+          "col": 10,
+          "row_span": 1,
+          "col_span": 1,
+          "bbox": [833, 133, 889, 157],
+          "text": "Test",
+          "confidence": 0.96,
+          "alignment": "right"
+        },
+        {
+          "row": 3,
+          "col": 11,
+          "row_span": 1,
+          "col_span": 2,
+          "bbox": [898, 133, 1035, 164],
+          "text": "Paragraph",
+          "confidence": 0.96,
+          "alignment": "left"
+        }
+      ]
+    },
+    {
+      "row_index": 4,
+      "cells": [
+        {
+          "row": 4,
+          "col": 14,
+          "row_span": 1,
+          "col_span": 3,
+          "bbox": [1094, 173, 1246, 205],
+          "text": "Acceptance",
+          "confidence": 0.96,
+          "alignment": "right"
+        },
+        {
+          "row": 4,
+          "col": 17,
+          "row_span": 1,
+          "col_span": 2,
+          "bbox": [1257, 172, 1402, 196],
+          "text": "Procedures",
+          "confidence": 0.96,
+          "alignment": "right"
+        }
+      ]
+    }
+  ]
+}

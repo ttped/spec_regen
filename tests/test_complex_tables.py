@@ -3,18 +3,26 @@ test_complex_tables.py
 
 Generates a .docx file with several complex tables to verify the schema
 and renderer work correctly. Open the output in Word to inspect.
+
+Lives in: root/tests/
+Imports from: root/app/complex_table_maker.py
+
+Run from project root:
+    python -m tests.test_complex_tables
 """
 
-import sys
 import os
-sys.path.insert(0, os.path.dirname(__file__))
 
 import docx
 from docx.shared import Pt
-from complex_table_schema import add_complex_table, add_docx_table_from_data
+
+from app.complex_table_maker import add_complex_table, add_docx_table_from_data
 
 
-def make_test_doc():
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "test_outputs")
+
+
+def make_test_doc(output_path: str):
     doc = docx.Document()
     style = doc.styles["Normal"]
     style.font.name = "Calibri"
@@ -109,14 +117,14 @@ def make_test_doc():
             },
             {
                 "cells": [
-                    None,  # covered by rowspan above
+                    None,
                     {"text": "Pressure"},
                     {"text": "300 PSI"},
                 ],
             },
             {
                 "cells": [
-                    None,  # covered by rowspan above
+                    None,
                     {"text": "Temperature"},
                     {"text": "250°F"},
                 ],
@@ -171,7 +179,7 @@ def make_test_doc():
             },
             {
                 "cells": [
-                    None, None,  # covered by 2x2 block
+                    None, None,
                     {"text": "C2"},
                     {"text": "Wide D+E", "colspan": 2, "halign": "center", "shading": "FFF2CC"},
                 ],
@@ -189,7 +197,7 @@ def make_test_doc():
                 "cells": [
                     {"text": "A4"},
                     {"text": "B4"},
-                    None,  # covered by rowspan
+                    None,
                     {"text": "D4"},
                     {"text": "E4"},
                 ],
@@ -197,7 +205,7 @@ def make_test_doc():
             {
                 "cells": [
                     {"text": "Footer spans A+B", "colspan": 2, "bold": True, "shading": "FCE4D6"},
-                    None,  # covered by rowspan
+                    None,
                     {"text": "Footer D+E", "colspan": 2, "bold": True, "shading": "FCE4D6"},
                 ],
             },
@@ -288,11 +296,11 @@ def make_test_doc():
     # ------------------------------------------------------------------
     # Save
     # ------------------------------------------------------------------
-    output_path = "/home/claude/complex_table_tests.docx"
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     doc.save(output_path)
     print(f"Test document saved to {output_path}")
-    return output_path
 
 
 if __name__ == "__main__":
-    make_test_doc()
+    output = os.path.join(OUTPUT_DIR, "complex_table_tests.docx")
+    make_test_doc(output)
