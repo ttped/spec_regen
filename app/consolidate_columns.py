@@ -1,463 +1,375 @@
 """
-complex_table_schema.py
+consolidate_columns.py
 
-Schema definition and Word renderer for complex/irregular tables.
+Transforms a sparse OCR pixel-grid into a true logical table structure by:
+1. Profiling which grid columns actually carry content
+2. Clustering adjacent grid columns into logical columns via bbox overlap analysis
+3. Remapping cell positions and spans to the consolidated grid
+4. Recomputing column widths from the merged extents with content-aware minimums
 
-Supports:
-- Column and row spanning (merged cells)
-- Per-cell alignment (horizontal and vertical)
-- Per-cell shading/background colors
-- Header row designation (repeated across pages)
-- Column width control (absolute or proportional)
-- Cell-level font overrides (bold, italic, size)
-- Nested content (multiple paragraphs per cell)
-- Row height hints
-- Border style overrides per cell
+Sits between OCR JSON parsing and schema generation (ocr_to_table.py).
 
-Schema Design
-=============
-The schema uses an explicit grid model where every logical cell declares its
-position and span. This avoids the ambiguity of "repeat this value for merged
-rows" that the flat columns+rows format suffered from.
-
-Example minimal table_data:
-{
-    "columns": [
-        {"name": "Part No.", "width_pct": 25},
-        {"name": "Description", "width_pct": 50},
-        {"name": "QTY", "width_pct": 25}
-    ],
-    "rows": [
-        {"cells": [
-            {"text": "123-456"},
-            {"text": "Screw, Pan Head"},
-            {"text": "4"}
-        ]}
-    ]
-}
-
-Example complex table_data with merges:
-{
-    "columns": [
-        {"name": "Category", "width_pct": 30},
-        {"name": "Sub-A", "width_pct": 35},
-        {"name": "Sub-B", "width_pct": 35}
-    ],
-    "header_rows": 1,
-    "rows": [
-        {
-            "is_header": true,
-            "cells": [
-                {"text": "Category", "bold": true, "shading": "D9E2F3"},
-                {"text": "Sub-A", "bold": true, "shading": "D9E2F3"},
-                {"text": "Sub-B", "bold": true, "shading": "D9E2F3"}
-            ]
-        },
-        {
-            "cells": [
-                {"text": "Mechanical", "rowspan": 2, "bold": true, "valign": "center"},
-                {"text": "Torque specs"},
-                {"text": "15 Nm"}
-            ]
-        },
-        {
-            "cells": [
-                null,
-                {"text": "Pressure rating"},
-                {"text": "300 PSI"}
-            ]
-        },
-        {
-            "cells": [
-                {"text": "Electrical", "colspan": 1, "bold": true},
-                {"text": "Voltage & Current combined", "colspan": 2}
-            ]
-        }
-    ]
-}
-
-Backward Compatibility
-======================
-The renderer accepts BOTH the old flat format:
-    {"columns": ["A", "B"], "rows": [["x", "y"]]}
-and the new rich format. It auto-detects which is in use.
+Lives in: root/app/
 """
 
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Union
-from enum import Enum
+from typing import Dict, List, Optional, Tuple, Set
 
 
 # ---------------------------------------------------------------------------
-# Schema types (for documentation / validation — the renderer works off dicts)
+# Grid analysis helpers
 # ---------------------------------------------------------------------------
 
-class HAlign(Enum):
-    LEFT = "left"
-    CENTER = "center"
-    RIGHT = "right"
+
+def _build_cell_lookup(ocr_data: Dict) -> List[Dict]:
+    """Flatten all cells from the OCR rows into a single list."""
+    cells = []
+    for row_entry in ocr_data.get("rows", []):
+        for cell in row_entry.get("cells", []):
+            cells.append(cell)
+    return cells
 
 
-class VAlign(Enum):
-    TOP = "top"
-    CENTER = "center"
-    BOTTOM = "bottom"
-
-
-@dataclass
-class CellSchema:
-    """Schema for a single table cell."""
-    # Content — either a simple string or a list of paragraph strings
-    text: Union[str, List[str]] = ""
-
-    # Spanning
-    colspan: int = 1
-    rowspan: int = 1
-
-    # Formatting
-    bold: bool = False
-    italic: bool = False
-    font_size_pt: Optional[float] = None  # None = inherit from doc default
-    halign: str = "left"     # "left", "center", "right"
-    valign: str = "top"      # "top", "center", "bottom"
-
-    # Appearance
-    shading: Optional[str] = None  # hex color e.g. "D9E2F3", None = no fill
-
-    # None sentinel: a null cell means "this grid position is covered by a
-    # spanning cell above or to the left — skip it."
-
-
-@dataclass
-class ColumnSchema:
-    """Schema for a column definition."""
-    name: str = ""
-    width_pct: Optional[float] = None   # percentage of table width (0-100)
-    width_dxa: Optional[int] = None     # absolute width in DXA (1440 = 1 inch)
-
-
-@dataclass
-class RowSchema:
-    """Schema for a single row."""
-    cells: List[Optional[CellSchema]] = field(default_factory=list)
-    is_header: bool = False              # repeat this row on every page
-    height_dxa: Optional[int] = None     # row height hint
-
-
-@dataclass
-class TableSchema:
-    """Top-level table schema."""
-    columns: List[ColumnSchema] = field(default_factory=list)
-    rows: List[RowSchema] = field(default_factory=list)
-    header_rows: int = 0                 # number of header rows to repeat
-    total_width_dxa: int = 9360          # default = US Letter content width (1" margins)
-    style: str = "Table Grid"
-
-
-# ---------------------------------------------------------------------------
-# Normalization: convert dict (from JSON) into validated native dicts
-# ---------------------------------------------------------------------------
-
-def is_legacy_format(table_data: Dict) -> bool:
-    """Detect old flat format: columns is a list of strings, rows is list of lists."""
-    columns = table_data.get("columns", [])
-    rows = table_data.get("rows", [])
-    if not columns:
-        return False
-    # Legacy: columns are plain strings and rows are plain lists
-    return isinstance(columns[0], str) and rows and isinstance(rows[0], list)
-
-
-def normalize_table_data(table_data: Dict) -> Dict:
+def _column_content_profile(
+    cells: List[Dict],
+    n_rows: int,
+    n_cols: int,
+) -> List[Set[int]]:
     """
-    Convert any supported table_data format into the canonical rich format.
+    For each grid column, collect the set of rows that have content
+    originating in that column (ignoring spanning).
 
-    Accepts:
-      - Legacy flat: {"columns": ["A","B"], "rows": [["x","y"]]}
-      - New rich: {"columns": [{"name":"A", ...}], "rows": [{"cells": [...]}]}
-
-    Returns the rich format dict (always).
+    Returns: list of length n_cols, each element a set of row indices.
     """
-    if is_legacy_format(table_data):
-        return _normalize_legacy(table_data)
-    return table_data
+    profile: List[Set[int]] = [set() for _ in range(n_cols)]
+
+    for cell in cells:
+        col = cell["col"]
+        row = cell["row"]
+        text = cell.get("text", "").strip()
+        if text and 0 <= col < n_cols:
+            profile[col].add(row)
+
+    return profile
 
 
-def _normalize_legacy(table_data: Dict) -> Dict:
-    """Upgrade legacy flat format to the rich schema."""
-    col_names = table_data["columns"]
-    raw_rows = table_data["rows"]
-
-    columns = [{"name": name} for name in col_names]
-
-    rows = []
-    # First row as header
-    header_cells = [{"text": name, "bold": True} for name in col_names]
-    rows.append({"is_header": True, "cells": header_cells})
-
-    for raw_row in raw_rows:
-        cells = [{"text": str(v)} for v in raw_row]
-        rows.append({"cells": cells})
-
-    return {
-        "columns": columns,
-        "rows": rows,
-        "header_rows": 1,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Renderer: dict → python-docx Table
-# ---------------------------------------------------------------------------
-
-def compute_column_widths_dxa(columns: List[Dict], total_width_dxa: int) -> List[int]:
+def _column_bbox_extents(
+    cells: List[Dict],
+    n_cols: int,
+) -> List[Optional[Tuple[int, int]]]:
     """
-    Resolve column widths to absolute DXA values.
+    For each grid column, compute the (x_min, x_max) pixel extent
+    from all cells originating there (single-span only).
 
-    Priority: width_dxa > width_pct > equal distribution.
+    Returns: list of (x_min, x_max) or None per grid column.
     """
-    n = len(columns)
-    widths = [None] * n
-    remaining = total_width_dxa
-    unresolved = []
+    col_x_min: Dict[int, List[int]] = {}
+    col_x_max: Dict[int, List[int]] = {}
 
-    for i, col in enumerate(columns):
-        if col.get("width_dxa"):
-            widths[i] = col["width_dxa"]
-            remaining -= widths[i]
-        elif col.get("width_pct"):
-            w = int(total_width_dxa * col["width_pct"] / 100)
-            widths[i] = w
-            remaining -= w
+    for cell in cells:
+        col = cell["col"]
+        cs = cell.get("col_span", 1)
+        if cs != 1:
+            continue
+        bbox = cell.get("bbox")
+        if not bbox or len(bbox) < 4:
+            continue
+        x1, _, x2, _ = bbox
+        col_x_min.setdefault(col, []).append(x1)
+        col_x_max.setdefault(col, []).append(x2)
+
+    extents: List[Optional[Tuple[int, int]]] = []
+    for c in range(n_cols):
+        if c in col_x_min and c in col_x_max:
+            x1 = sorted(col_x_min[c])[len(col_x_min[c]) // 2]
+            x2 = sorted(col_x_max[c])[len(col_x_max[c]) // 2]
+            extents.append((x1, x2))
         else:
-            unresolved.append(i)
+            extents.append(None)
 
-    if unresolved:
-        per_col = max(remaining // len(unresolved), 360)  # minimum ~0.25 inch
-        for i in unresolved:
-            widths[i] = per_col
-
-    return widths
+    return extents
 
 
-def add_complex_table(doc, table_data: Dict, total_width_dxa: int = 9360):
+def _column_max_text_length(
+    cells: List[Dict],
+    n_cols: int,
+) -> List[int]:
     """
-    Render a complex table into a python-docx Document.
+    For each grid column, find the longest text string (character count)
+    from single-span cells. Used for minimum width estimation.
+    """
+    max_len: List[int] = [0] * n_cols
+    for cell in cells:
+        col = cell["col"]
+        cs = cell.get("col_span", 1)
+        if cs != 1 or col >= n_cols:
+            continue
+        text = cell.get("text", "").strip()
+        max_len[col] = max(max_len[col], len(text))
+    return max_len
+
+
+# ---------------------------------------------------------------------------
+# Core consolidation logic
+# ---------------------------------------------------------------------------
+
+
+def compute_column_groups(
+    content_profile: List[Set[int]],
+    extents: List[Optional[Tuple[int, int]]],
+    n_cols: int,
+    gap_threshold_px: int = 50,
+) -> List[List[int]]:
+    """
+    Cluster adjacent grid columns into logical column groups.
+
+    Two adjacent grid columns are merged if:
+      - At least one of them has no content (phantom column), OR
+      - They have no rows where BOTH have content (no conflict), OR
+      - Their bbox extents overlap or are very close (< gap_threshold_px)
+
+    Returns: list of groups, where each group is a sorted list of grid
+             column indices. Groups are ordered left-to-right.
+    """
+    groups: List[List[int]] = [[c] for c in range(n_cols)]
+
+    def _should_merge(group_a: List[int], group_b: List[int]) -> bool:
+        rows_a: Set[int] = set()
+        rows_b: Set[int] = set()
+        for c in group_a:
+            rows_a |= content_profile[c]
+        for c in group_b:
+            rows_b |= content_profile[c]
+
+        # If either side is completely empty, merge (phantom gap)
+        if not rows_a or not rows_b:
+            return True
+
+        # If they share content in the same rows, they're separate columns
+        if rows_a & rows_b:
+            return False
+
+        # Check spatial proximity
+        extent_a = _group_extent(group_a, extents)
+        extent_b = _group_extent(group_b, extents)
+
+        if extent_a is not None and extent_b is not None:
+            gap = extent_b[0] - extent_a[1]
+            if gap < gap_threshold_px:
+                return True
+
+        # No row conflicts and no strong spatial separation → merge
+        return True
+
+    # Greedy left-to-right merge
+    merged = [groups[0]]
+    for i in range(1, len(groups)):
+        if _should_merge(merged[-1], groups[i]):
+            merged[-1] = merged[-1] + groups[i]
+        else:
+            merged.append(groups[i])
+
+    return merged
+
+
+def _group_extent(
+    group: List[int],
+    extents: List[Optional[Tuple[int, int]]],
+) -> Optional[Tuple[int, int]]:
+    """Compute the combined (x_min, x_max) for a group of grid columns."""
+    x_mins = []
+    x_maxs = []
+    for c in group:
+        ext = extents[c] if c < len(extents) else None
+        if ext is not None:
+            x_mins.append(ext[0])
+            x_maxs.append(ext[1])
+    if x_mins and x_maxs:
+        return (min(x_mins), max(x_maxs))
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Remapping
+# ---------------------------------------------------------------------------
+
+
+def build_column_remap(groups: List[List[int]]) -> Dict[int, int]:
+    """
+    Build a mapping from grid column index → logical column index.
+    """
+    remap: Dict[int, int] = {}
+    for logical_col, group in enumerate(groups):
+        for grid_col in group:
+            remap[grid_col] = logical_col
+    return remap
+
+
+def consolidate_ocr_data(
+    ocr_data: Dict,
+    gap_threshold_px: int = 50,
+) -> Dict:
+    """
+    Transform OCR data from the sparse pixel-grid into a consolidated
+    logical-column structure.
+
+    Modifies cell col indices, col_span values, and updates n_cols.
+    Also updates column_alignment and column_types for the new indices.
 
     Args:
-        doc: python-docx Document instance.
-        table_data: Table data dict (legacy or rich format accepted).
-        total_width_dxa: Total table width in DXA units (default: US Letter content area).
+        ocr_data: The raw OCR JSON dict (not mutated).
+        gap_threshold_px: Max pixel gap between columns to consider merging.
 
     Returns:
-        The python-docx Table object that was added.
+        A new OCR data dict with consolidated columns.
     """
-    from docx.shared import Pt, Inches, Emu
-    from docx.oxml.ns import qn
-    from docx.oxml import OxmlElement
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.enum.table import WD_TABLE_ALIGNMENT
+    n_rows = ocr_data["n_rows"]
+    n_cols = ocr_data["n_cols"]
+    cells = _build_cell_lookup(ocr_data)
 
-    table_data = normalize_table_data(table_data)
+    content_profile = _column_content_profile(cells, n_rows, n_cols)
+    extents = _column_bbox_extents(cells, n_cols)
+    groups = compute_column_groups(content_profile, extents, n_cols, gap_threshold_px)
+    remap = build_column_remap(groups)
+    new_n_cols = len(groups)
 
-    columns = table_data.get("columns", [])
-    rows = table_data.get("rows", [])
-    header_rows_count = table_data.get("header_rows", 0)
-    style_name = table_data.get("style", "Table Grid")
+    # Remap cells
+    new_rows = []
+    for row_entry in ocr_data.get("rows", []):
+        new_cells = []
+        for cell in row_entry.get("cells", []):
+            new_cell = dict(cell)
+            old_col = cell["col"]
+            old_span = cell.get("col_span", 1)
 
-    num_cols = len(columns)
-    num_rows = len(rows)
+            new_col = remap.get(old_col, old_col)
+            end_grid_col = old_col + old_span - 1
+            new_end_col = remap.get(end_grid_col, new_col)
+            new_span = max(new_end_col - new_col + 1, 1)
 
-    if num_cols == 0 or num_rows == 0:
-        return None
+            new_cell["col"] = new_col
+            new_cell["col_span"] = new_span
+            new_cells.append(new_cell)
 
-    col_widths = compute_column_widths_dxa(columns, total_width_dxa)
+        new_rows.append({
+            "row_index": row_entry["row_index"],
+            "cells": new_cells,
+        })
 
-    # ------------------------------------------------------------------
-    # Create the table
-    # ------------------------------------------------------------------
-    table = doc.add_table(rows=num_rows, cols=num_cols)
-    table.style = style_name
-    table.autofit = False
+    # Remap column metadata using first grid col in each group
+    old_alignment = ocr_data.get("column_alignment", {})
+    old_types = ocr_data.get("column_types", {})
+    old_semantics = ocr_data.get("column_semantics", {})
 
-    # Set table width
-    tbl = table._tbl
-    tblPr = tbl.tblPr if tbl.tblPr is not None else OxmlElement("w:tblPr")
-    tblW = OxmlElement("w:tblW")
-    tblW.set(qn("w:w"), str(total_width_dxa))
-    tblW.set(qn("w:type"), "dxa")
-    for existing in tblPr.findall(qn("w:tblW")):
-        tblPr.remove(existing)
-    tblPr.append(tblW)
+    new_alignment = {}
+    new_types = {}
+    new_semantics = {}
 
-    # Set column widths via tblGrid
-    tblGrid = tbl.find(qn("w:tblGrid"))
-    if tblGrid is None:
-        tblGrid = OxmlElement("w:tblGrid")
-        tbl.insert(tbl.index(tblPr) + 1, tblGrid)
-    for gc in tblGrid.findall(qn("w:gridCol")):
-        tblGrid.remove(gc)
-    for w in col_widths:
-        gridCol = OxmlElement("w:gridCol")
-        gridCol.set(qn("w:w"), str(w))
-        tblGrid.append(gridCol)
+    for logical_col, group in enumerate(groups):
+        for grid_col in group:
+            key = str(grid_col)
+            if key in old_alignment:
+                new_alignment[str(logical_col)] = old_alignment[key]
+                break
+        for grid_col in group:
+            key = str(grid_col)
+            if key in old_types:
+                new_types[str(logical_col)] = old_types[key]
+                break
+        for grid_col in group:
+            key = str(grid_col)
+            if key in old_semantics:
+                new_semantics[str(logical_col)] = old_semantics[key]
+                break
 
-    # ------------------------------------------------------------------
-    # Populate cells — POSITION-INDEXED approach
-    #
-    # The cell list is consumed by index, not by iterator.  cells[c]
-    # maps directly to physical column c:
-    #   None  → covered by a span (skip)
-    #   dict  → content or empty cell to render
-    #
-    # This eliminates the iterator+occupied-skip desync that caused
-    # cells to shift right and fall off the edge with rowspans.
-    # ------------------------------------------------------------------
-    HALIGN_MAP = {
-        "left": WD_ALIGN_PARAGRAPH.LEFT,
-        "center": WD_ALIGN_PARAGRAPH.CENTER,
-        "right": WD_ALIGN_PARAGRAPH.RIGHT,
-    }
-    VALIGN_XML = {
-        "top": "top",
-        "center": "center",
-        "bottom": "bottom",
-    }
+    # Compute new column extents and max text lengths (for width calc)
+    new_column_extents = []
+    for group in groups:
+        ext = _group_extent(group, extents)
+        new_column_extents.append(ext)
 
-    # Track which cells have been merged so we don't write into them twice
-    merged_away = [[False] * num_cols for _ in range(num_rows)]
+    # Aggregate max text length across grouped grid columns
+    raw_text_lengths = _column_max_text_length(cells, n_cols)
+    new_max_text_lengths = []
+    for group in groups:
+        group_max = max((raw_text_lengths[gc] for gc in group), default=0)
+        new_max_text_lengths.append(group_max)
 
-    for r, row_data in enumerate(rows):
-        row_obj = table.rows[r]
+    result = dict(ocr_data)
+    result["rows"] = new_rows
+    result["n_cols"] = new_n_cols
+    result["column_alignment"] = new_alignment
+    result["column_types"] = new_types
+    result["column_semantics"] = new_semantics
+    result["_column_groups"] = groups
+    result["_column_extents"] = [
+        list(e) if e else None for e in new_column_extents
+    ]
+    result["_max_text_lengths"] = new_max_text_lengths
+    result["_original_n_cols"] = n_cols
 
-        # Header row repeat
-        is_header = row_data.get("is_header", False) or r < header_rows_count
-        if is_header:
-            trPr = row_obj._tr.get_or_add_trPr()
-            tblHeader = OxmlElement("w:tblHeader")
-            trPr.append(tblHeader)
-
-        # Row height
-        height_dxa = row_data.get("height_dxa")
-        if height_dxa:
-            trPr = row_obj._tr.get_or_add_trPr()
-            trHeight = OxmlElement("w:trHeight")
-            trHeight.set(qn("w:val"), str(height_dxa))
-            trHeight.set(qn("w:hRule"), "atLeast")
-            trPr.append(trHeight)
-
-        cells_list = row_data.get("cells", [])
-
-        for c in range(num_cols):
-            cell_obj = row_obj.cells[c]
-
-            # Get cell data by position (not from an iterator)
-            cell_data = cells_list[c] if c < len(cells_list) else None
-
-            if cell_data is None:
-                # Covered by a span — just set width, don't write content
-                _set_cell_width(cell_obj, col_widths[c])
-                continue
-
-            if merged_away[r][c]:
-                # Already consumed by a merge from an earlier cell
-                _set_cell_width(cell_obj, col_widths[c])
-                continue
-
-            cs = cell_data.get("colspan", 1)
-            rs = cell_data.get("rowspan", 1)
-
-            # Perform merge if needed
-            if cs > 1 or rs > 1:
-                end_r = min(r + rs - 1, num_rows - 1)
-                end_c = min(c + cs - 1, num_cols - 1)
-                merge_target = table.cell(end_r, end_c)
-                cell_obj = cell_obj.merge(merge_target)
-
-                # Mark spanned positions so we don't overwrite them
-                for dr in range(rs):
-                    for dc in range(cs):
-                        rr, cc = r + dr, c + dc
-                        if (rr, cc) != (r, c) and rr < num_rows and cc < num_cols:
-                            merged_away[rr][cc] = True
-
-            # ---- Set cell width (sum of spanned columns) ----
-            spanned_width = sum(col_widths[c:c + cs])
-            _set_cell_width(cell_obj, spanned_width)
-
-            # ---- Set cell content ----
-            text = cell_data.get("text", "")
-            paragraphs_text = text if isinstance(text, list) else [text]
-
-            for i, para_text in enumerate(paragraphs_text):
-                if i == 0:
-                    p = cell_obj.paragraphs[0]
-                    p.clear()
-                else:
-                    p = cell_obj.add_paragraph()
-
-                run = p.add_run(str(para_text))
-
-                # Font overrides
-                if cell_data.get("bold"):
-                    run.bold = True
-                if cell_data.get("italic"):
-                    run.italic = True
-                font_size = cell_data.get("font_size_pt")
-                if font_size:
-                    run.font.size = Pt(font_size)
-
-                # Horizontal alignment
-                halign = cell_data.get("halign", "left")
-                p.alignment = HALIGN_MAP.get(halign, WD_ALIGN_PARAGRAPH.LEFT)
-
-            # ---- Vertical alignment ----
-            valign = cell_data.get("valign", "top")
-            tc = cell_obj._tc
-            tcPr = tc.get_or_add_tcPr()
-            vAlign_el = OxmlElement("w:vAlign")
-            vAlign_el.set(qn("w:val"), VALIGN_XML.get(valign, "top"))
-            for existing in tcPr.findall(qn("w:vAlign")):
-                tcPr.remove(existing)
-            tcPr.append(vAlign_el)
-
-            # ---- Shading ----
-            shading_color = cell_data.get("shading")
-            if shading_color:
-                shd = OxmlElement("w:shd")
-                shd.set(qn("w:val"), "clear")
-                shd.set(qn("w:color"), "auto")
-                shd.set(qn("w:fill"), shading_color)
-                for existing in tcPr.findall(qn("w:shd")):
-                    tcPr.remove(existing)
-                tcPr.append(shd)
-
-    return table
-
-
-def _set_cell_width(cell, width_dxa: int):
-    """Set the preferred width on a table cell."""
-    from docx.oxml.ns import qn
-    from docx.oxml import OxmlElement
-
-    tc = cell._tc
-    tcPr = tc.get_or_add_tcPr()
-    tcW = OxmlElement("w:tcW")
-    tcW.set(qn("w:w"), str(width_dxa))
-    tcW.set(qn("w:type"), "dxa")
-    # Remove existing
-    for existing in tcPr.findall(qn("w:tcW")):
-        tcPr.remove(existing)
-    tcPr.append(tcW)
+    return result
 
 
 # ---------------------------------------------------------------------------
-# Convenience: drop-in replacement for the old add_docx_table_from_data
+# Column width estimation
 # ---------------------------------------------------------------------------
 
-def add_docx_table_from_data(doc, table_data: Dict):
+# Approximate pixels per character at typical OCR DPI.
+# Calibrated for ~10pt text at 200 DPI.
+_APPROX_PX_PER_CHAR = 12
+
+
+def compute_consolidated_widths_pct(
+    ocr_data: Dict,
+    min_col_pct: float = 5.0,
+) -> List[float]:
     """
-    Drop-in replacement for docx_writer.add_docx_table_from_data.
-    Accepts both legacy flat format and the new rich format.
+    Compute width percentages for consolidated columns.
+
+    Uses bbox extents with a content-aware minimum: columns are guaranteed
+    at least enough width for their longest text string (estimated from
+    character count), and at least min_col_pct % of total width.
+
+    Args:
+        ocr_data: Consolidated OCR data dict.
+        min_col_pct: Absolute minimum column width as percentage.
+
+    Returns: list of width percentages summing to ~100.
     """
-    return add_complex_table(doc, table_data)
+    extents = ocr_data.get("_column_extents", [])
+    max_text_lens = ocr_data.get("_max_text_lengths", [])
+    n_cols = ocr_data["n_cols"]
+
+    widths_px = []
+    for i in range(n_cols):
+        # Start with bbox extent
+        ext = extents[i] if i < len(extents) and extents[i] else None
+        bbox_width = (ext[1] - ext[0]) if ext is not None else 0
+
+        # Content-aware minimum from text length
+        text_len = max_text_lens[i] if i < len(max_text_lens) else 0
+        content_min = text_len * _APPROX_PX_PER_CHAR
+
+        widths_px.append(max(bbox_width, content_min, 20))
+
+    total = sum(widths_px)
+    pcts = [(w / total) * 100 for w in widths_px]
+
+    # Enforce minimum percentage per column
+    # If any column is below min_col_pct, steal proportionally from others
+    needs_boost = [i for i, p in enumerate(pcts) if p < min_col_pct]
+    if needs_boost and len(needs_boost) < n_cols:
+        deficit = sum(min_col_pct - pcts[i] for i in needs_boost)
+        donors = [i for i in range(n_cols) if i not in needs_boost]
+        donor_total = sum(pcts[i] for i in donors)
+
+        for i in needs_boost:
+            pcts[i] = min_col_pct
+
+        # Proportionally shrink donors
+        if donor_total > 0:
+            shrink_factor = (donor_total - deficit) / donor_total
+            for i in donors:
+                pcts[i] *= shrink_factor
+
+    return [round(p, 1) for p in pcts]

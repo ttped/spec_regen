@@ -273,37 +273,9 @@ def add_complex_table(doc, table_data: Dict, total_width_dxa: int = 9360):
 
     col_widths = compute_column_widths_dxa(columns, total_width_dxa)
 
-    # Build the merge map: track which grid cells are "occupied" by a spanning cell
-    # occupied[r][c] = (origin_r, origin_c) if covered by a span, else None
-    occupied = [[None for _ in range(num_cols)] for _ in range(num_rows)]
-
-    for r, row in enumerate(rows):
-        c_logical = 0  # walks across physical columns
-        for cell_data in row.get("cells", []):
-            # Skip past any columns already occupied by a prior rowspan
-            while c_logical < num_cols and occupied[r][c_logical] is not None:
-                c_logical += 1
-            if c_logical >= num_cols:
-                break
-
-            if cell_data is None:
-                # Explicit null — skip (covered by a span declared elsewhere)
-                c_logical += 1
-                continue
-
-            cs = cell_data.get("colspan", 1)
-            rs = cell_data.get("rowspan", 1)
-
-            # Mark all grid positions this cell covers
-            for dr in range(rs):
-                for dc in range(cs):
-                    rr, cc = r + dr, c_logical + dc
-                    if rr < num_rows and cc < num_cols:
-                        occupied[rr][cc] = (r, c_logical)
-
-            c_logical += cs
-
-    # Create the table with the full grid
+    # ------------------------------------------------------------------
+    # Create the table
+    # ------------------------------------------------------------------
     table = doc.add_table(rows=num_rows, cols=num_cols)
     table.style = style_name
     table.autofit = False
@@ -314,7 +286,6 @@ def add_complex_table(doc, table_data: Dict, total_width_dxa: int = 9360):
     tblW = OxmlElement("w:tblW")
     tblW.set(qn("w:w"), str(total_width_dxa))
     tblW.set(qn("w:type"), "dxa")
-    # Remove existing tblW if present
     for existing in tblPr.findall(qn("w:tblW")):
         tblPr.remove(existing)
     tblPr.append(tblW)
@@ -324,7 +295,6 @@ def add_complex_table(doc, table_data: Dict, total_width_dxa: int = 9360):
     if tblGrid is None:
         tblGrid = OxmlElement("w:tblGrid")
         tbl.insert(tbl.index(tblPr) + 1, tblGrid)
-    # Clear existing gridCol
     for gc in tblGrid.findall(qn("w:gridCol")):
         tblGrid.remove(gc)
     for w in col_widths:
@@ -332,9 +302,17 @@ def add_complex_table(doc, table_data: Dict, total_width_dxa: int = 9360):
         gridCol.set(qn("w:w"), str(w))
         tblGrid.append(gridCol)
 
-    # -----------------------------------------------------------------------
-    # Populate cells
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Populate cells — POSITION-INDEXED approach
+    #
+    # The cell list is consumed by index, not by iterator.  cells[c]
+    # maps directly to physical column c:
+    #   None  → covered by a span (skip)
+    #   dict  → content or empty cell to render
+    #
+    # This eliminates the iterator+occupied-skip desync that caused
+    # cells to shift right and fall off the edge with rowspans.
+    # ------------------------------------------------------------------
     HALIGN_MAP = {
         "left": WD_ALIGN_PARAGRAPH.LEFT,
         "center": WD_ALIGN_PARAGRAPH.CENTER,
@@ -345,6 +323,9 @@ def add_complex_table(doc, table_data: Dict, total_width_dxa: int = 9360):
         "center": "center",
         "bottom": "bottom",
     }
+
+    # Track which cells have been merged so we don't write into them twice
+    merged_away = [[False] * num_cols for _ in range(num_rows)]
 
     for r, row_data in enumerate(rows):
         row_obj = table.rows[r]
@@ -365,42 +346,22 @@ def add_complex_table(doc, table_data: Dict, total_width_dxa: int = 9360):
             trHeight.set(qn("w:hRule"), "atLeast")
             trPr.append(trHeight)
 
-        c_logical = 0
-        cell_iter = iter(row_data.get("cells", []))
+        cells_list = row_data.get("cells", [])
 
-        for c_physical in range(num_cols):
-            cell_obj = row_obj.cells[c_physical]
+        for c in range(num_cols):
+            cell_obj = row_obj.cells[c]
 
-            # Is this cell the top-left origin of a span, or is it covered?
-            origin = occupied[r][c_physical]
-
-            if origin is None:
-                # No cell data mapped here — leave empty
-                _set_cell_width(cell_obj, col_widths[c_physical])
-                continue
-
-            origin_r, origin_c = origin
-
-            if (origin_r, origin_c) != (r, c_physical):
-                # This cell is covered by a span from another cell.
-                # python-docx merge handles the XML; we just need to set width.
-                _set_cell_width(cell_obj, col_widths[c_physical])
-                continue
-
-            # This is an origin cell — find the matching cell_data
-            # Walk the cell iterator, skipping nulls
-            cell_data = None
-            while True:
-                try:
-                    candidate = next(cell_iter)
-                except StopIteration:
-                    break
-                if candidate is not None:
-                    cell_data = candidate
-                    break
+            # Get cell data by position (not from an iterator)
+            cell_data = cells_list[c] if c < len(cells_list) else None
 
             if cell_data is None:
-                _set_cell_width(cell_obj, col_widths[c_physical])
+                # Covered by a span — just set width, don't write content
+                _set_cell_width(cell_obj, col_widths[c])
+                continue
+
+            if merged_away[r][c]:
+                # Already consumed by a merge from an earlier cell
+                _set_cell_width(cell_obj, col_widths[c])
                 continue
 
             cs = cell_data.get("colspan", 1)
@@ -409,19 +370,25 @@ def add_complex_table(doc, table_data: Dict, total_width_dxa: int = 9360):
             # Perform merge if needed
             if cs > 1 or rs > 1:
                 end_r = min(r + rs - 1, num_rows - 1)
-                end_c = min(c_physical + cs - 1, num_cols - 1)
+                end_c = min(c + cs - 1, num_cols - 1)
                 merge_target = table.cell(end_r, end_c)
                 cell_obj = cell_obj.merge(merge_target)
 
+                # Mark spanned positions so we don't overwrite them
+                for dr in range(rs):
+                    for dc in range(cs):
+                        rr, cc = r + dr, c + dc
+                        if (rr, cc) != (r, c) and rr < num_rows and cc < num_cols:
+                            merged_away[rr][cc] = True
+
             # ---- Set cell width (sum of spanned columns) ----
-            spanned_width = sum(col_widths[c_physical:c_physical + cs])
+            spanned_width = sum(col_widths[c:c + cs])
             _set_cell_width(cell_obj, spanned_width)
 
             # ---- Set cell content ----
             text = cell_data.get("text", "")
             paragraphs_text = text if isinstance(text, list) else [text]
 
-            # Clear default empty paragraph
             for i, para_text in enumerate(paragraphs_text):
                 if i == 0:
                     p = cell_obj.paragraphs[0]
@@ -450,7 +417,6 @@ def add_complex_table(doc, table_data: Dict, total_width_dxa: int = 9360):
             tcPr = tc.get_or_add_tcPr()
             vAlign_el = OxmlElement("w:vAlign")
             vAlign_el.set(qn("w:val"), VALIGN_XML.get(valign, "top"))
-            # Remove existing vAlign
             for existing in tcPr.findall(qn("w:vAlign")):
                 tcPr.remove(existing)
             tcPr.append(vAlign_el)
@@ -462,7 +428,6 @@ def add_complex_table(doc, table_data: Dict, total_width_dxa: int = 9360):
                 shd.set(qn("w:val"), "clear")
                 shd.set(qn("w:color"), "auto")
                 shd.set(qn("w:fill"), shading_color)
-                # Remove existing shading
                 for existing in tcPr.findall(qn("w:shd")):
                     tcPr.remove(existing)
                 tcPr.append(shd)
