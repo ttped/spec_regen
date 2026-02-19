@@ -7,13 +7,12 @@ into the complex_table_schema format for rendering in Word documents.
 Lives in: root/app/
 
 Pipeline:
-  OCR JSON → consolidate_columns (sparse grid → logical columns) →
+  OCR JSON → consolidate (remove empty unspanned columns) →
   build position-indexed cell grid → compute widths from FINAL cells →
   emit complex_table_schema dict
 
-IMPORTANT: The cell list for each row is **position-indexed**, meaning
-cells[c] corresponds directly to column c. Positions covered by a span
-(rowspan or colspan) are None.  The renderer MUST consume cells by index.
+The cell list for each row is position-indexed: cells[c] corresponds
+directly to column c.  The renderer MUST consume cells by index.
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -22,14 +21,11 @@ from consolidate_columns import consolidate_ocr_data
 
 
 # ---------------------------------------------------------------------------
-# Approximate DXA per character for width estimation.
+# Width estimation constants.
 #
-# At 10-11pt Calibri, a character averages ~100-120 DXA (~0.07-0.08 in).
-# We use 110 as a middle ground. The total table width is typically 9360 DXA
-# (US Letter with 1" margins), so "Acceptance" (10 chars) needs ~1100 DXA
-# which is ~11.7% of page width — about right for a readable column.
-#
-# Cell padding in Word eats ~216 DXA (108 each side) on top of this.
+# At 10-11pt Calibri a character averages ~100-120 DXA.
+# Cell padding in Word eats ~216 DXA (108 each side).
+# US Letter content width with 1" margins = 9360 DXA.
 # ---------------------------------------------------------------------------
 _DXA_PER_CHAR = 110
 _CELL_PADDING_DXA = 216
@@ -42,9 +38,8 @@ def _build_cell_grid(
     """
     Flatten the OCR rows into a 2D grid of cell dicts.
 
-    Returns:
-        (grid, n_rows, n_cols) where grid[r][c] is the origin cell dict
-        or None if that position is covered by a span or empty.
+    Returns (grid, n_rows, n_cols) where grid[r][c] is the origin
+    cell dict or None.
     """
     n_rows = ocr_data["n_rows"]
     n_cols = ocr_data["n_cols"]
@@ -69,8 +64,8 @@ def _build_occupied_map(
     n_cols: int,
 ) -> List[List[Optional[Tuple[int, int]]]]:
     """
-    Build an occupation map: occupied[r][c] = (origin_r, origin_c) if
-    position (r, c) is covered by a spanning cell from that origin.
+    occupied[r][c] = (origin_r, origin_c) if position (r, c) is
+    covered by a spanning cell from that origin.
     """
     occupied: List[List[Optional[Tuple[int, int]]]] = [
         [None for _ in range(n_cols)] for _ in range(n_rows)
@@ -103,18 +98,17 @@ def _build_position_indexed_rows(
     mark_low_confidence_italic: bool,
 ) -> List[Dict]:
     """
-    Build position-indexed schema rows from the cell grid.
+    Build position-indexed schema rows.
 
     cells[c] maps directly to physical column c:
-      None → covered by a row/col span
-      {"text": ""} → empty cell
-      {"text": "...", ...} → content cell
+      None           → covered by a row/col span
+      {"text": ""}   → empty cell
+      {"text": "…"}  → content cell
     """
     schema_rows = []
 
     for r in range(n_rows):
         is_header = r in header_row_indices
-
         cells: List[Optional[Dict]] = [{"text": ""} for _ in range(n_cols)]
 
         # Mark spanned positions
@@ -160,25 +154,15 @@ def _build_position_indexed_rows(
 def _compute_widths_from_final_cells(
     schema_rows: List[Dict],
     n_cols: int,
-    bbox_extents: Optional[List] = None,
     min_col_pct: float = 5.0,
 ) -> List[float]:
     """
     Compute column width percentages from the FINAL position-indexed cells.
 
-    This is the single source of truth for widths because it sees
-    post-consolidation text, including cells that were multi-span in the
-    original grid but became single-span after column merging.
-
-    Width for each column = max(bbox_hint, text_content_need, floor).
-
-    Args:
-        schema_rows: The finalized position-indexed rows.
-        n_cols: Number of columns.
-        bbox_extents: Optional pixel extents from consolidation.
-        min_col_pct: Minimum width as percentage of total.
+    Width for each column = max(text_content_need, floor).
+    Only single-span cells contribute to a column's own width;
+    multi-span cells don't inflate any individual column.
     """
-    # Pass 1: find longest single-span text per column
     max_text_len = [0] * n_cols
     for row in schema_rows:
         for c, cell in enumerate(row.get("cells", [])):
@@ -190,29 +174,18 @@ def _compute_widths_from_final_cells(
             text = cell.get("text", "").strip()
             max_text_len[c] = max(max_text_len[c], len(text))
 
-    # Pass 2: compute width needs in DXA
-    col_dxa_needs = []
+    # Compute DXA needs
+    col_dxa = []
+    floor_dxa = int(_TABLE_WIDTH_DXA * min_col_pct / 100)
+
     for c in range(n_cols):
-        # Content-based: characters * dxa_per_char + cell padding
         content_dxa = max_text_len[c] * _DXA_PER_CHAR + _CELL_PADDING_DXA
+        col_dxa.append(max(content_dxa, floor_dxa))
 
-        # Bbox-based: pixel extent scaled to DXA (rough: 1px ≈ 7.2 DXA at 200dpi)
-        bbox_dxa = 0
-        if bbox_extents and c < len(bbox_extents) and bbox_extents[c]:
-            ext = bbox_extents[c]
-            px_width = ext[1] - ext[0] if isinstance(ext, (list, tuple)) else 0
-            bbox_dxa = int(px_width * 7.2)
+    total = sum(col_dxa)
+    pcts = [(d / total) * 100 for d in col_dxa]
 
-        # Floor: at least enough for a few characters
-        floor_dxa = int(_TABLE_WIDTH_DXA * min_col_pct / 100)
-
-        col_dxa_needs.append(max(content_dxa, bbox_dxa, floor_dxa))
-
-    # Normalize to percentages
-    total_dxa = sum(col_dxa_needs)
-    pcts = [(need / total_dxa) * 100 for need in col_dxa_needs]
-
-    # Enforce minimum percentage floor
+    # Enforce floor
     needs_boost = [i for i, p in enumerate(pcts) if p < min_col_pct]
     if needs_boost and len(needs_boost) < n_cols:
         deficit = sum(min_col_pct - pcts[i] for i in needs_boost)
@@ -238,39 +211,26 @@ def convert_ocr_to_table_schema(
     """
     Convert OCR pipeline JSON into the complex_table_schema format.
 
-    Args:
-        ocr_data: The full OCR JSON dict (already consolidated if desired).
-        confidence_threshold: Cells below this confidence get flagged.
-        mark_low_confidence_italic: If True, low-confidence cells render italic.
-
-    Returns:
-        A dict compatible with complex_table_schema.add_complex_table().
+    Returns a dict compatible with complex_table_schema.add_complex_table().
     """
     grid, n_rows, n_cols = _build_cell_grid(ocr_data)
     header_row_indices = set(ocr_data.get("header_rows", []))
     col_alignment = ocr_data.get("column_alignment", {})
     occupied = _build_occupied_map(grid, n_rows, n_cols)
 
-    # Build the final cell grid first
     schema_rows = _build_position_indexed_rows(
         grid, occupied, n_rows, n_cols,
         header_row_indices, col_alignment,
         confidence_threshold, mark_low_confidence_italic,
     )
 
-    # Compute widths from the FINAL cells (not from raw OCR extents)
-    bbox_extents = ocr_data.get("_column_extents")
-    pcts = _compute_widths_from_final_cells(
-        schema_rows, n_cols, bbox_extents,
-    )
-
+    pcts = _compute_widths_from_final_cells(schema_rows, n_cols)
     columns = [{"name": "", "width_pct": pcts[c]} for c in range(n_cols)]
-    header_count = len(header_row_indices)
 
     return {
         "columns": columns,
         "rows": schema_rows,
-        "header_rows": header_count,
+        "header_rows": len(header_row_indices),
     }
 
 
@@ -278,14 +238,13 @@ def convert_and_strip_empty(
     ocr_data: Dict,
     confidence_threshold: float = 0.3,
     consolidate: bool = True,
-    gap_threshold_px: int = 50,
 ) -> Dict:
     """
-    Convert OCR JSON to schema, optionally consolidating phantom columns
-    first, then stripping fully-empty leading/trailing rows and columns.
+    Convert OCR JSON to schema, optionally removing empty unspanned
+    columns first, then stripping empty leading/trailing rows and cols.
     """
     if consolidate:
-        ocr_data = consolidate_ocr_data(ocr_data, gap_threshold_px)
+        ocr_data = consolidate_ocr_data(ocr_data)
 
     schema = convert_ocr_to_table_schema(ocr_data, confidence_threshold)
 
@@ -346,7 +305,6 @@ def convert_and_strip_empty(
 
     header_count = sum(1 for row in trimmed_rows if row.get("is_header"))
 
-    # Renormalize percentages to sum to 100
     total_pct = sum(c.get("width_pct", 0) for c in trimmed_columns)
     if total_pct > 0:
         for col in trimmed_columns:

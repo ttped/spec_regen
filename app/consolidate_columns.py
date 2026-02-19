@@ -1,23 +1,18 @@
 """
 consolidate_columns.py
 
-Transforms a sparse OCR pixel-grid into a true logical table structure by:
-1. Profiling which grid columns actually carry content
-2. Clustering adjacent grid columns into logical columns via bbox overlap analysis
-3. Remapping cell positions and spans to the consolidated grid
+Reduces the sparse OCR pixel-grid to a tighter grid by removing
+columns that are provably unused: no cell originates there AND no
+cell's span covers it.
 
-Width computation is NOT done here — it happens downstream in ocr_to_table
-after the final cell grid is built, where we have accurate text lengths.
+This is the SAFE consolidation — it never merges two content-bearing
+columns, so it is guaranteed to never lose text.  The result may still
+have more columns than the "true" table, but no data is destroyed.
 
 Lives in: root/app/
 """
 
-from typing import Dict, List, Optional, Tuple, Set
-
-
-# ---------------------------------------------------------------------------
-# Grid analysis helpers
-# ---------------------------------------------------------------------------
+from typing import Dict, List, Optional, Set, Tuple
 
 
 def _build_cell_lookup(ocr_data: Dict) -> List[Dict]:
@@ -29,194 +24,104 @@ def _build_cell_lookup(ocr_data: Dict) -> List[Dict]:
     return cells
 
 
-def _column_content_profile(
+def _find_needed_columns(
     cells: List[Dict],
-    n_rows: int,
     n_cols: int,
-) -> List[Set[int]]:
+) -> Set[int]:
     """
-    For each grid column, collect the set of rows that have content
-    originating in that column (ignoring spanning).
+    A grid column is "needed" if any cell either originates there
+    or spans across it.
+
+    Returns the set of grid column indices that must be kept.
     """
-    profile: List[Set[int]] = [set() for _ in range(n_cols)]
+    needed: Set[int] = set()
 
     for cell in cells:
         col = cell["col"]
-        row = cell["row"]
-        text = cell.get("text", "").strip()
-        if text and 0 <= col < n_cols:
-            profile[col].add(row)
+        span = cell.get("col_span", 1)
+        for dc in range(span):
+            c = col + dc
+            if 0 <= c < n_cols:
+                needed.add(c)
 
-    return profile
+    return needed
 
 
-def _column_bbox_extents(
-    cells: List[Dict],
+def _build_remap(
+    needed: Set[int],
     n_cols: int,
-) -> List[Optional[Tuple[int, int]]]:
+) -> Tuple[Dict[int, int], int]:
     """
-    For each grid column, compute the (x_min, x_max) pixel extent
-    from all cells originating there (single-span only).
+    Build a mapping from old grid column index → new dense column index.
+
+    Only columns in `needed` get a new index; removed columns are absent
+    from the map.
+
+    Returns (remap_dict, new_n_cols).
     """
-    col_x_min: Dict[int, List[int]] = {}
-    col_x_max: Dict[int, List[int]] = {}
-
-    for cell in cells:
-        col = cell["col"]
-        cs = cell.get("col_span", 1)
-        if cs != 1:
-            continue
-        bbox = cell.get("bbox")
-        if not bbox or len(bbox) < 4:
-            continue
-        x1, _, x2, _ = bbox
-        col_x_min.setdefault(col, []).append(x1)
-        col_x_max.setdefault(col, []).append(x2)
-
-    extents: List[Optional[Tuple[int, int]]] = []
-    for c in range(n_cols):
-        if c in col_x_min and c in col_x_max:
-            x1 = sorted(col_x_min[c])[len(col_x_min[c]) // 2]
-            x2 = sorted(col_x_max[c])[len(col_x_max[c]) // 2]
-            extents.append((x1, x2))
-        else:
-            extents.append(None)
-
-    return extents
-
-
-# ---------------------------------------------------------------------------
-# Core consolidation logic
-# ---------------------------------------------------------------------------
-
-
-def compute_column_groups(
-    content_profile: List[Set[int]],
-    extents: List[Optional[Tuple[int, int]]],
-    n_cols: int,
-    gap_threshold_px: int = 50,
-) -> List[List[int]]:
-    """
-    Cluster adjacent grid columns into logical column groups.
-
-    Two adjacent grid columns are merged if:
-      - At least one of them has no content (phantom column), OR
-      - They have no rows where BOTH have content (no conflict), OR
-      - Their bbox extents overlap or are very close (< gap_threshold_px)
-    """
-    groups: List[List[int]] = [[c] for c in range(n_cols)]
-
-    def _should_merge(group_a: List[int], group_b: List[int]) -> bool:
-        rows_a: Set[int] = set()
-        rows_b: Set[int] = set()
-        for c in group_a:
-            rows_a |= content_profile[c]
-        for c in group_b:
-            rows_b |= content_profile[c]
-
-        if not rows_a or not rows_b:
-            return True
-
-        if rows_a & rows_b:
-            return False
-
-        extent_a = _group_extent(group_a, extents)
-        extent_b = _group_extent(group_b, extents)
-
-        if extent_a is not None and extent_b is not None:
-            gap = extent_b[0] - extent_a[1]
-            if gap < gap_threshold_px:
-                return True
-
-        return True
-
-    merged = [groups[0]]
-    for i in range(1, len(groups)):
-        if _should_merge(merged[-1], groups[i]):
-            merged[-1] = merged[-1] + groups[i]
-        else:
-            merged.append(groups[i])
-
-    return merged
-
-
-def _group_extent(
-    group: List[int],
-    extents: List[Optional[Tuple[int, int]]],
-) -> Optional[Tuple[int, int]]:
-    """Compute the combined (x_min, x_max) for a group of grid columns."""
-    x_mins = []
-    x_maxs = []
-    for c in group:
-        ext = extents[c] if c < len(extents) else None
-        if ext is not None:
-            x_mins.append(ext[0])
-            x_maxs.append(ext[1])
-    if x_mins and x_maxs:
-        return (min(x_mins), max(x_maxs))
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Remapping
-# ---------------------------------------------------------------------------
-
-
-def build_column_remap(groups: List[List[int]]) -> Dict[int, int]:
-    """Build a mapping from grid column index → logical column index."""
     remap: Dict[int, int] = {}
-    for logical_col, group in enumerate(groups):
-        for grid_col in group:
-            remap[grid_col] = logical_col
-    return remap
+    new_idx = 0
+    for c in range(n_cols):
+        if c in needed:
+            remap[c] = new_idx
+            new_idx += 1
+    return remap, new_idx
 
 
 def consolidate_ocr_data(
     ocr_data: Dict,
-    gap_threshold_px: int = 50,
+    **_kwargs,
 ) -> Dict:
     """
-    Transform OCR data from the sparse pixel-grid into a consolidated
-    logical-column structure.
+    Remove empty, unspanned columns from the OCR grid.
 
-    Modifies cell col indices, col_span values, and updates n_cols.
-    Also updates column_alignment and column_types for the new indices.
-
-    Does NOT compute final column widths — that happens in ocr_to_table
-    after the position-indexed cell grid is built, where post-consolidation
-    text lengths are known.
+    This is a safe transformation: it only removes columns that no cell
+    touches (neither as origin nor as part of a span).  Two content-
+    bearing columns are NEVER merged, so no text can be lost.
 
     Args:
         ocr_data: The raw OCR JSON dict (not mutated).
-        gap_threshold_px: Max pixel gap between columns to consider merging.
 
     Returns:
-        A new OCR data dict with consolidated columns.
+        A new OCR data dict with unused columns removed.
     """
     n_rows = ocr_data["n_rows"]
     n_cols = ocr_data["n_cols"]
     cells = _build_cell_lookup(ocr_data)
 
-    content_profile = _column_content_profile(cells, n_rows, n_cols)
-    extents = _column_bbox_extents(cells, n_cols)
-    groups = compute_column_groups(content_profile, extents, n_cols, gap_threshold_px)
-    remap = build_column_remap(groups)
-    new_n_cols = len(groups)
+    needed = _find_needed_columns(cells, n_cols)
+    remap, new_n_cols = _build_remap(needed, n_cols)
+
+    if new_n_cols == n_cols:
+        # Nothing to remove — return a shallow copy with debug info
+        result = dict(ocr_data)
+        result["_removed_cols"] = []
+        result["_original_n_cols"] = n_cols
+        return result
+
+    removed = sorted(set(range(n_cols)) - needed)
 
     # Remap cells
     new_rows = []
     for row_entry in ocr_data.get("rows", []):
         new_cells = []
         for cell in row_entry.get("cells", []):
-            new_cell = dict(cell)
             old_col = cell["col"]
             old_span = cell.get("col_span", 1)
 
-            new_col = remap.get(old_col, old_col)
-            end_grid_col = old_col + old_span - 1
-            new_end_col = remap.get(end_grid_col, new_col)
-            new_span = max(new_end_col - new_col + 1, 1)
+            # New start column
+            new_col = remap.get(old_col)
+            if new_col is None:
+                # Origin column was removed — shouldn't happen since
+                # we keep all columns that have cells, but guard anyway
+                continue
 
+            # New span: count how many of the spanned columns survived
+            end_old = old_col + old_span - 1
+            new_end = remap.get(end_old, new_col)
+            new_span = max(new_end - new_col + 1, 1)
+
+            new_cell = dict(cell)
             new_cell["col"] = new_col
             new_cell["col_span"] = new_span
             new_cells.append(new_cell)
@@ -235,28 +140,20 @@ def consolidate_ocr_data(
     new_types = {}
     new_semantics = {}
 
-    for logical_col, group in enumerate(groups):
-        for grid_col in group:
-            key = str(grid_col)
-            if key in old_alignment:
-                new_alignment[str(logical_col)] = old_alignment[key]
-                break
-        for grid_col in group:
-            key = str(grid_col)
-            if key in old_types:
-                new_types[str(logical_col)] = old_types[key]
-                break
-        for grid_col in group:
-            key = str(grid_col)
-            if key in old_semantics:
-                new_semantics[str(logical_col)] = old_semantics[key]
-                break
+    for old_c_str, val in old_alignment.items():
+        new_c = remap.get(int(old_c_str))
+        if new_c is not None:
+            new_alignment[str(new_c)] = val
 
-    # Column extents (pixel-space, for bbox-based width hints)
-    new_column_extents = []
-    for group in groups:
-        ext = _group_extent(group, extents)
-        new_column_extents.append(ext)
+    for old_c_str, val in old_types.items():
+        new_c = remap.get(int(old_c_str))
+        if new_c is not None:
+            new_types[str(new_c)] = val
+
+    for old_c_str, val in old_semantics.items():
+        new_c = remap.get(int(old_c_str))
+        if new_c is not None:
+            new_semantics[str(new_c)] = val
 
     result = dict(ocr_data)
     result["rows"] = new_rows
@@ -264,10 +161,7 @@ def consolidate_ocr_data(
     result["column_alignment"] = new_alignment
     result["column_types"] = new_types
     result["column_semantics"] = new_semantics
-    result["_column_groups"] = groups
-    result["_column_extents"] = [
-        list(e) if e else None for e in new_column_extents
-    ]
+    result["_removed_cols"] = removed
     result["_original_n_cols"] = n_cols
 
     return result

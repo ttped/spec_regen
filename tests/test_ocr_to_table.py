@@ -47,24 +47,24 @@ def test_full_grid(ocr_data: Dict, doc):
 
 
 def test_consolidated_grid(ocr_data: Dict, doc):
-    """Render with column consolidation + edge stripping."""
-    doc.add_paragraph("Consolidated Grid (phantom columns merged)", style="Heading 1")
+    """Render with safe consolidation (remove empty unspanned cols) + edge stripping."""
+    doc.add_paragraph("Consolidated Grid (empty columns removed)", style="Heading 1")
 
     consolidated = consolidate_ocr_data(ocr_data)
+    removed = consolidated.get("_removed_cols", [])
     doc.add_paragraph(
         f"Original: {ocr_data['n_rows']}x{ocr_data['n_cols']} → "
-        f"Consolidated: {consolidated['n_rows']}x{consolidated['n_cols']} cols"
+        f"After removing {len(removed)} empty cols: "
+        f"{consolidated['n_rows']}x{consolidated['n_cols']}"
     )
-
-    groups = consolidated.get("_column_groups", [])
-    for i, group in enumerate(groups):
-        doc.add_paragraph(f"  Logical col {i}: grid cols {group}", style="List Bullet")
+    if removed:
+        doc.add_paragraph(f"  Removed grid cols: {removed}", style="List Bullet")
 
     schema = convert_and_strip_empty(ocr_data, consolidate=True)
     n_cols = len(schema["columns"])
     n_rows = len(schema["rows"])
     widths = [c.get("width_pct", 0) for c in schema["columns"]]
-    doc.add_paragraph(f"After strip: {n_rows} rows x {n_cols} cols, widths: {widths}")
+    doc.add_paragraph(f"After edge strip: {n_rows} rows x {n_cols} cols")
     add_complex_table(doc, schema)
     doc.add_paragraph()
 

@@ -215,8 +215,7 @@ def compute_column_widths_dxa(columns: List[Dict], total_width_dxa: int) -> List
     Resolve column widths to absolute DXA values.
 
     Priority: width_dxa > width_pct > equal distribution.
-    The final values are guaranteed to sum exactly to total_width_dxa
-    so Word doesn't clip the right edge or leave a gap.
+    Values are adjusted so they sum exactly to total_width_dxa.
     """
     n = len(columns)
     widths = [None] * n
@@ -235,20 +234,19 @@ def compute_column_widths_dxa(columns: List[Dict], total_width_dxa: int) -> List
             unresolved.append(i)
 
     if unresolved:
-        per_col = max(remaining // len(unresolved), 360)  # minimum ~0.25 inch
+        per_col = max(remaining // len(unresolved), 360)
         for i in unresolved:
             widths[i] = per_col
             remaining -= per_col
 
-    # Distribute rounding remainder so widths sum exactly to total_width_dxa
+    # Distribute rounding remainder across widest columns
     current_total = sum(widths)
     diff = total_width_dxa - current_total
     if diff != 0 and n > 0:
-        # Add/subtract 1 DXA from the widest columns until exact
         step = 1 if diff > 0 else -1
-        sorted_indices = sorted(range(n), key=lambda i: widths[i], reverse=True)
+        by_width = sorted(range(n), key=lambda i: widths[i], reverse=True)
         for j in range(abs(diff)):
-            widths[sorted_indices[j % n]] += step
+            widths[by_width[j % n]] += step
 
     return widths
 
@@ -293,7 +291,6 @@ def add_complex_table(doc, table_data: Dict, total_width_dxa: int = 9360):
     table.style = style_name
     table.autofit = False
 
-    # Set table width
     tbl = table._tbl
     tblPr = tbl.tblPr if tbl.tblPr is not None else OxmlElement("w:tblPr")
     tblW = OxmlElement("w:tblW")
@@ -303,7 +300,6 @@ def add_complex_table(doc, table_data: Dict, total_width_dxa: int = 9360):
         tblPr.remove(existing)
     tblPr.append(tblW)
 
-    # Set column widths via tblGrid
     tblGrid = tbl.find(qn("w:tblGrid"))
     if tblGrid is None:
         tblGrid = OxmlElement("w:tblGrid")
@@ -316,15 +312,11 @@ def add_complex_table(doc, table_data: Dict, total_width_dxa: int = 9360):
         tblGrid.append(gridCol)
 
     # ------------------------------------------------------------------
-    # Populate cells — POSITION-INDEXED approach
+    # Populate cells — POSITION-INDEXED
     #
-    # The cell list is consumed by index, not by iterator.  cells[c]
-    # maps directly to physical column c:
-    #   None  → covered by a span (skip)
-    #   dict  → content or empty cell to render
-    #
-    # This eliminates the iterator+occupied-skip desync that caused
-    # cells to shift right and fall off the edge with rowspans.
+    # cells[c] maps directly to physical column c.
+    #   None → covered by a span (skip)
+    #   dict → content or empty cell to render
     # ------------------------------------------------------------------
     HALIGN_MAP = {
         "left": WD_ALIGN_PARAGRAPH.LEFT,
@@ -337,20 +329,17 @@ def add_complex_table(doc, table_data: Dict, total_width_dxa: int = 9360):
         "bottom": "bottom",
     }
 
-    # Track which cells have been merged so we don't write into them twice
     merged_away = [[False] * num_cols for _ in range(num_rows)]
 
     for r, row_data in enumerate(rows):
         row_obj = table.rows[r]
 
-        # Header row repeat
         is_header = row_data.get("is_header", False) or r < header_rows_count
         if is_header:
             trPr = row_obj._tr.get_or_add_trPr()
             tblHeader = OxmlElement("w:tblHeader")
             trPr.append(tblHeader)
 
-        # Row height
         height_dxa = row_data.get("height_dxa")
         if height_dxa:
             trPr = row_obj._tr.get_or_add_trPr()
@@ -363,42 +352,34 @@ def add_complex_table(doc, table_data: Dict, total_width_dxa: int = 9360):
 
         for c in range(num_cols):
             cell_obj = row_obj.cells[c]
-
-            # Get cell data by position (not from an iterator)
             cell_data = cells_list[c] if c < len(cells_list) else None
 
             if cell_data is None:
-                # Covered by a span — just set width, don't write content
                 _set_cell_width(cell_obj, col_widths[c])
                 continue
 
             if merged_away[r][c]:
-                # Already consumed by a merge from an earlier cell
                 _set_cell_width(cell_obj, col_widths[c])
                 continue
 
             cs = cell_data.get("colspan", 1)
             rs = cell_data.get("rowspan", 1)
 
-            # Perform merge if needed
             if cs > 1 or rs > 1:
                 end_r = min(r + rs - 1, num_rows - 1)
                 end_c = min(c + cs - 1, num_cols - 1)
                 merge_target = table.cell(end_r, end_c)
                 cell_obj = cell_obj.merge(merge_target)
 
-                # Mark spanned positions so we don't overwrite them
                 for dr in range(rs):
                     for dc in range(cs):
                         rr, cc = r + dr, c + dc
                         if (rr, cc) != (r, c) and rr < num_rows and cc < num_cols:
                             merged_away[rr][cc] = True
 
-            # ---- Set cell width (sum of spanned columns) ----
             spanned_width = sum(col_widths[c:c + cs])
             _set_cell_width(cell_obj, spanned_width)
 
-            # ---- Set cell content ----
             text = cell_data.get("text", "")
             paragraphs_text = text if isinstance(text, list) else [text]
 
@@ -411,7 +392,6 @@ def add_complex_table(doc, table_data: Dict, total_width_dxa: int = 9360):
 
                 run = p.add_run(str(para_text))
 
-                # Font overrides
                 if cell_data.get("bold"):
                     run.bold = True
                 if cell_data.get("italic"):
@@ -420,11 +400,9 @@ def add_complex_table(doc, table_data: Dict, total_width_dxa: int = 9360):
                 if font_size:
                     run.font.size = Pt(font_size)
 
-                # Horizontal alignment
                 halign = cell_data.get("halign", "left")
                 p.alignment = HALIGN_MAP.get(halign, WD_ALIGN_PARAGRAPH.LEFT)
 
-            # ---- Vertical alignment ----
             valign = cell_data.get("valign", "top")
             tc = cell_obj._tc
             tcPr = tc.get_or_add_tcPr()
@@ -434,7 +412,6 @@ def add_complex_table(doc, table_data: Dict, total_width_dxa: int = 9360):
                 tcPr.remove(existing)
             tcPr.append(vAlign_el)
 
-            # ---- Shading ----
             shading_color = cell_data.get("shading")
             if shading_color:
                 shd = OxmlElement("w:shd")
