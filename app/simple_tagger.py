@@ -10,7 +10,8 @@ Features:
 - Clear visual interface with instructions
 - Navigation buttons and keyboard shortcuts
 - Progress tracking and statistics
-- View/edit existing labels
+- View/edit existing labels (Click to select, drag edges to resize)
+- Fades unselected boxes to easily spot your active selection
 - Zoom controls
 
 Classes (matching DocLayout-YOLO DocStructBench):
@@ -24,11 +25,6 @@ Classes (matching DocLayout-YOLO DocStructBench):
   7: table_footnote  - Footnotes within tables
   8: isolate_formula - Mathematical formulas
   9: formula_caption - Captions for formulas
-
-Setup for Auto-Label:
-  1. pip install doclayout-yolo
-  2. Download model from HuggingFace: juliozhao/DocLayout-YOLO-DocStructBench
-  3. Place .pt file in same directory as this script, or set MODEL_PATH below
 """
 
 import tkinter as tk
@@ -39,13 +35,9 @@ import glob
 from pathlib import Path
 from datetime import datetime
 
-# Try to import DocLayout-YOLO (optional - only needed for auto-label)
-DOCLAYOUT_AVAILABLE = False
-try:
-    from doclayout_yolo import YOLOv10
-    DOCLAYOUT_AVAILABLE = True
-except ImportError:
-    pass
+# Assume DocLayout-YOLO is available
+from doclayout_yolo import YOLOv10
+DOCLAYOUT_AVAILABLE = True
 
 # ================= CONFIGURATION =================
 def get_paths():
@@ -79,15 +71,9 @@ CLASSES = {
 # Reverse lookup: key -> class_id
 KEY_TO_CLASS = {v[2]: k for k, v in CLASSES.items()}
 
-# ===== MODEL CONFIGURATION =====
-# Path to DocLayout-YOLO model file (.pt)
-# Options:
-#   1. Place model in same directory as this script
-#   2. Set full path below
-#   3. Will search common locations automatically
-MODEL_PATH = None  # Set this to your model path, e.g. "/path/to/doclayout_yolo_docstructbench_imgsz1024.pt"
-MODEL_CONFIDENCE = 0.25  # Confidence threshold for auto-labeling
-MODEL_IMAGE_SIZE = 1024  # Image size for inference
+MODEL_PATH = None  
+MODEL_CONFIDENCE = 0.25  
+MODEL_IMAGE_SIZE = 1024  
 # =================================================
 
 
@@ -102,13 +88,19 @@ class DocLayoutTagger:
         self.image_list = []
         self.current_index = 0
         self.scale = 1.0
-        self.boxes = []  # List of (x1, y1, x2, y2, class_id) for current image
+        self.boxes = []  
         self.current_rect = None
         self.start_x = None
         self.start_y = None
-        self.selected_class = 5  # Default to table (most common use case)
+        self.selected_class = 5  
         
-        # Model for auto-labeling
+        # Interaction State
+        self.selected_box_index = None
+        self.interaction_mode = None
+        self._drag_start_box = None
+        self._listbox_bound = False
+        
+        # Model
         self.model = None
         self.model_loaded = False
         
@@ -122,38 +114,30 @@ class DocLayoutTagger:
         self._create_ui()
         self._bind_keys()
         
-        # Try to load images
+        # Load directories and model
         self._load_directory()
-        
-        # Try to load model in background
         self._try_load_model()
     
     def _setup_styles(self):
-        """Configure ttk styles for a modern look."""
         style = ttk.Style()
         style.theme_use('clam')
         
-        # Custom button styles
         style.configure('Nav.TButton', font=('Segoe UI', 11), padding=10)
         style.configure('Action.TButton', font=('Segoe UI', 10, 'bold'), padding=8)
         style.configure('Class.TButton', font=('Segoe UI', 10), padding=6)
         
-        # Labels
         style.configure('Header.TLabel', font=('Segoe UI', 14, 'bold'))
         style.configure('Status.TLabel', font=('Segoe UI', 10))
         style.configure('Stats.TLabel', font=('Consolas', 10))
     
     def _create_ui(self):
-        """Build the complete UI layout."""
-        # Main container
         main_frame = ttk.Frame(self.root, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
         
-        # ===== LEFT PANEL (Canvas + Navigation) =====
+        # ===== LEFT PANEL =====
         left_frame = ttk.Frame(main_frame)
         left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
-        # -- Top bar with file info --
         top_bar = ttk.Frame(left_frame)
         top_bar.pack(fill=tk.X, pady=(0, 10))
         
@@ -163,11 +147,9 @@ class DocLayoutTagger:
         self.progress_label = ttk.Label(top_bar, text="0 / 0", style='Status.TLabel')
         self.progress_label.pack(side=tk.RIGHT)
         
-        # -- Canvas with scrollbars --
         canvas_frame = ttk.Frame(left_frame, relief='sunken', borderwidth=2)
         canvas_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Scrollbars
         self.h_scroll = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL)
         self.h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
         self.v_scroll = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL)
@@ -185,14 +167,12 @@ class DocLayoutTagger:
         self.h_scroll.config(command=self.canvas.xview)
         self.v_scroll.config(command=self.canvas.yview)
         
-        # -- Navigation bar --
         nav_frame = ttk.Frame(left_frame)
         nav_frame.pack(fill=tk.X, pady=10)
         
         ttk.Button(nav_frame, text="◀◀ First", command=self.first_image, style='Nav.TButton').pack(side=tk.LEFT, padx=2)
         ttk.Button(nav_frame, text="◀ Prev (←)", command=self.prev_image, style='Nav.TButton').pack(side=tk.LEFT, padx=2)
         
-        # Jump to specific image
         ttk.Label(nav_frame, text="Go to:").pack(side=tk.LEFT, padx=(20, 5))
         self.jump_var = tk.StringVar()
         self.jump_entry = ttk.Entry(nav_frame, textvariable=self.jump_var, width=6)
@@ -204,12 +184,11 @@ class DocLayoutTagger:
         ttk.Button(nav_frame, text="Last ▶▶", command=self.last_image, style='Nav.TButton').pack(side=tk.RIGHT, padx=2)
         ttk.Button(nav_frame, text="Skip (Space)", command=self.skip_to_unlabeled, style='Nav.TButton').pack(side=tk.RIGHT, padx=20)
         
-        # ===== RIGHT PANEL (Controls) - Make scrollable =====
+        # ===== RIGHT PANEL =====
         right_outer = ttk.Frame(main_frame, width=350)
         right_outer.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
         right_outer.pack_propagate(False)
         
-        # Create canvas for scrolling
         right_canvas = tk.Canvas(right_outer, highlightthickness=0, width=330)
         right_scrollbar = ttk.Scrollbar(right_outer, orient="vertical", command=right_canvas.yview)
         right_frame = ttk.Frame(right_canvas)
@@ -228,13 +207,11 @@ class DocLayoutTagger:
             right_canvas.itemconfig(right_canvas_window, width=event.width)
         right_canvas.bind("<Configure>", configure_width)
         
-        # Mouse wheel scrolling for right panel
         def on_right_mousewheel(event):
             right_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
         right_canvas.bind("<MouseWheel>", on_right_mousewheel)
         right_frame.bind("<MouseWheel>", on_right_mousewheel)
         
-        # -- Model & Auto-Label (TOP PRIORITY) --
         model_frame = ttk.LabelFrame(right_frame, text="🤖 Auto-Label", padding=8)
         model_frame.pack(fill=tk.X, pady=(0, 8))
         
@@ -251,7 +228,6 @@ class DocLayoutTagger:
         
         ttk.Button(model_frame, text="📂 Load Model...", command=self._select_model_file).pack(fill=tk.X, pady=(4,0))
         
-        # -- Directory Selection (compact) --
         dir_frame = ttk.LabelFrame(right_frame, text="Directory", padding=8)
         dir_frame.pack(fill=tk.X, pady=(0, 8))
         
@@ -259,14 +235,12 @@ class DocLayoutTagger:
         self.dir_display = ttk.Label(dir_frame, text="...", wraplength=300, font=('Segoe UI', 8))
         self.dir_display.pack(fill=tk.X)
         
-        # -- Class Selection (compact) --
         class_frame = ttk.LabelFrame(right_frame, text="Class (1-9, 0)", padding=8)
         class_frame.pack(fill=tk.X, pady=(0, 8))
         
-        self.class_var = tk.IntVar(value=5)  # Default to table
+        self.class_var = tk.IntVar(value=5) 
         self.class_buttons = {}
         
-        # Create 2-column grid for classes
         class_grid = ttk.Frame(class_frame)
         class_grid.pack(fill=tk.X)
         
@@ -277,14 +251,12 @@ class DocLayoutTagger:
             btn_frame = ttk.Frame(class_grid)
             btn_frame.grid(row=row, column=col, sticky='w', pady=1, padx=2)
             
-            # Color swatch (smaller)
             swatch = tk.Canvas(btn_frame, width=12, height=12, bg=color, highlightthickness=1)
             swatch.pack(side=tk.LEFT, padx=(0, 3))
             
-            # Radio button with hotkey
             rb = ttk.Radiobutton(
                 btn_frame, 
-                text=f"{key}:{name[:8]}",  # Truncate long names
+                text=f"{key}:{name[:8]}",
                 variable=self.class_var,
                 value=class_id,
                 command=lambda cid=class_id: self._select_class(cid)
@@ -292,11 +264,9 @@ class DocLayoutTagger:
             rb.pack(side=tk.LEFT)
             self.class_buttons[class_id] = rb
         
-        # -- Current Labels (compact) --
         labels_frame = ttk.LabelFrame(right_frame, text="Current Labels", padding=8)
         labels_frame.pack(fill=tk.X, pady=(0, 8))
         
-        # Listbox with scrollbar (shorter)
         list_container = ttk.Frame(labels_frame)
         list_container.pack(fill=tk.X)
         
@@ -307,14 +277,12 @@ class DocLayoutTagger:
         list_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.labels_listbox.config(yscrollcommand=list_scroll.set)
         
-        # Label actions (horizontal)
         label_btn_frame = ttk.Frame(labels_frame)
         label_btn_frame.pack(fill=tk.X, pady=(4, 0))
         
-        ttk.Button(label_btn_frame, text="Delete Sel", command=self._delete_selected_label, width=10).pack(side=tk.LEFT, padx=1)
+        ttk.Button(label_btn_frame, text="Delete Sel", command=self._delete_last_box, width=10).pack(side=tk.LEFT, padx=1)
         ttk.Button(label_btn_frame, text="Clear All", command=self._clear_all_labels, width=10).pack(side=tk.LEFT, padx=1)
         
-        # -- Quick Actions (compact) --
         action_frame = ttk.LabelFrame(right_frame, text="Actions", padding=8)
         action_frame.pack(fill=tk.X, pady=(0, 8))
         
@@ -323,14 +291,12 @@ class DocLayoutTagger:
         ttk.Button(btn_row, text="💾 Save (S)", command=self.save_labels, width=12).pack(side=tk.LEFT, padx=1)
         ttk.Button(btn_row, text="🔄 Reload (R)", command=self.reload_image, width=12).pack(side=tk.LEFT, padx=1)
         
-        # -- Statistics (compact) --
         stats_frame = ttk.LabelFrame(right_frame, text="Stats", padding=8)
         stats_frame.pack(fill=tk.X, pady=(0, 8))
         
         self.stats_text = tk.Text(stats_frame, height=5, font=('Consolas', 8), state='disabled', bg='#f5f5f5')
         self.stats_text.pack(fill=tk.X)
         
-        # -- Instructions (compact) --
         instr_frame = ttk.LabelFrame(right_frame, text="Keys", padding=8)
         instr_frame.pack(fill=tk.X)
         
@@ -338,7 +304,6 @@ class DocLayoutTagger:
         ttk.Label(instr_frame, text=instructions, font=('Consolas', 8), justify=tk.LEFT).pack(anchor='w')
     
     def _bind_keys(self):
-        """Set up keyboard shortcuts."""
         self.root.bind("<Left>", lambda e: self.prev_image())
         self.root.bind("<Right>", lambda e: self.next_image())
         self.root.bind("<space>", lambda e: self.skip_to_unlabeled())
@@ -352,36 +317,30 @@ class DocLayoutTagger:
         self.root.bind("<a>", lambda e: self.auto_label())
         self.root.bind("<A>", lambda e: self.auto_label())
         
-        # Class selection keys (1-9 and 0) - bind directly to the key characters
         for key, class_id in KEY_TO_CLASS.items():
             self.root.bind(key, lambda e, cid=class_id: self._select_class(cid))
         
-        # Canvas bindings
         self.canvas.bind("<ButtonPress-1>", self._on_mouse_down)
         self.canvas.bind("<B1-Motion>", self._on_mouse_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_mouse_up)
         
-        # Mouse wheel zoom
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
-        self.canvas.bind("<Button-4>", self._on_mousewheel)  # Linux
-        self.canvas.bind("<Button-5>", self._on_mousewheel)  # Linux
+        self.canvas.bind("<Button-4>", self._on_mousewheel) 
+        self.canvas.bind("<Button-5>", self._on_mousewheel) 
     
     def _select_image_dir(self):
-        """Open dialog to select image directory."""
         dir_path = filedialog.askdirectory(
             title="Select Image Directory",
             initialdir=self.img_dir if os.path.exists(self.img_dir) else os.getcwd()
         )
         if dir_path:
             self.img_dir = dir_path
-            # Update label directories based on new image dir
             base = Path(dir_path).parent
             self.lbl_dir = str(base / "docs_labels")
             self.crop_dir = str(base / "docs_crops")
             self._load_directory()
     
     def _load_directory(self):
-        """Load images from the current directory."""
         os.makedirs(self.lbl_dir, exist_ok=True)
         os.makedirs(self.crop_dir, exist_ok=True)
         
@@ -389,7 +348,6 @@ class DocLayoutTagger:
             self.dir_display.config(text=f"⚠ Not found: {self.img_dir}")
             return
         
-        # Find images
         patterns = ["*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG"]
         self.image_list = []
         for pattern in patterns:
@@ -407,14 +365,12 @@ class DocLayoutTagger:
         self._update_stats()
     
     def _load_image(self):
-        """Load and display the current image."""
         if not self.image_list:
             return
         
         self.img_path = self.image_list[self.current_index]
         self.original_image = Image.open(self.img_path)
         
-        # Calculate scale to fit canvas (max 900px height)
         canvas_h = 750
         w, h = self.original_image.size
         self.scale = min(1.0, canvas_h / h)
@@ -425,28 +381,24 @@ class DocLayoutTagger:
         self.display_image = self.original_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
         self.tk_image = ImageTk.PhotoImage(self.display_image)
         
-        # Update canvas
         self.canvas.delete("all")
         self.canvas.config(scrollregion=(0, 0, new_w, new_h))
         self.canvas.create_image(0, 0, image=self.tk_image, anchor=tk.NW, tags="image")
         
-        # Load existing labels
         self._load_labels()
         self._draw_boxes()
         
-        # Update UI
         filename = os.path.basename(self.img_path)
         labeled = "✓ LABELED" if self.boxes else ""
         self.file_label.config(text=f"{filename} {labeled}")
         self.progress_label.config(text=f"{self.current_index + 1} / {len(self.image_list)}")
         
-        # Clear current drawing
         self.current_rect = None
         self.start_x = None
         self.start_y = None
+        self.selected_box_index = None
     
     def _load_labels(self):
-        """Load existing YOLO labels for current image."""
         self.boxes = []
         txt_filename = os.path.splitext(os.path.basename(self.img_path))[0] + ".txt"
         txt_path = os.path.join(self.lbl_dir, txt_filename)
@@ -461,7 +413,6 @@ class DocLayoutTagger:
                         class_id = int(parts[0])
                         cx, cy, bw, bh = map(float, parts[1:5])
                         
-                        # Convert YOLO format back to pixel coords
                         x1 = (cx - bw/2) * img_w
                         y1 = (cy - bh/2) * img_h
                         x2 = (cx + bw/2) * img_w
@@ -472,25 +423,36 @@ class DocLayoutTagger:
         self._update_labels_list()
     
     def _draw_boxes(self):
-        """Draw all bounding boxes on the canvas."""
+        """Draw all bounding boxes on the canvas with fading for unselected."""
         self.canvas.delete("box")
         self.canvas.delete("box_label")
         
         for i, (x1, y1, x2, y2, class_id) in enumerate(self.boxes):
-            # Scale to display coords
             dx1, dy1 = x1 * self.scale, y1 * self.scale
             dx2, dy2 = x2 * self.scale, y2 * self.scale
             
-            color = CLASSES.get(class_id, ("unknown", "#999999", "?"))[1]
+            base_color = CLASSES.get(class_id, ("unknown", "#999999", "?"))[1]
             name = CLASSES.get(class_id, ("unknown", "#999999", "?"))[0]
             
-            # Draw rectangle
+            is_selected = getattr(self, 'selected_box_index', None) == i
+            has_selection = getattr(self, 'selected_box_index', None) is not None
+            
+            if has_selection and not is_selected:
+                color = "#555555"
+                width = 1
+                dash = (2, 4)
+                text_color = "#AAAAAA"
+            else:
+                color = base_color
+                width = 4 if is_selected else 2
+                dash = ()
+                text_color = "white"
+                
             self.canvas.create_rectangle(
                 dx1, dy1, dx2, dy2,
-                outline=color, width=3, tags="box"
+                outline=color, width=width, dash=dash, tags="box"
             )
             
-            # Draw label background
             label_text = f"{i+1}. {name}"
             label_width = max(80, len(label_text) * 7)
             self.canvas.create_rectangle(
@@ -498,26 +460,44 @@ class DocLayoutTagger:
                 fill=color, outline=color, tags="box_label"
             )
             
-            # Draw label text
             self.canvas.create_text(
                 dx1 + label_width/2, dy1 - 9,
                 text=label_text,
-                fill="white", font=('Segoe UI', 8, 'bold'),
+                fill=text_color, font=('Segoe UI', 8, 'bold'),
                 tags="box_label"
             )
-    
+
     def _update_labels_list(self):
-        """Update the listbox showing current labels."""
+        """Update the listbox showing current labels and sync selection."""
         self.labels_listbox.delete(0, tk.END)
         
         for i, (x1, y1, x2, y2, class_id) in enumerate(self.boxes):
             name = CLASSES.get(class_id, ("unknown", "#999999", "?"))[0]
             w = int(x2 - x1)
             h = int(y2 - y1)
-            self.labels_listbox.insert(tk.END, f"{i+1}. {name} ({w}x{h})")
+            
+            prefix = "▶ " if getattr(self, 'selected_box_index', None) == i else "  "
+            self.labels_listbox.insert(tk.END, f"{prefix}{i+1}. {name} ({w}x{h})")
+            
+            if getattr(self, 'selected_box_index', None) == i:
+                self.labels_listbox.selection_set(i)
+                self.labels_listbox.see(i)
+                
+        if not getattr(self, '_listbox_bound', False):
+            self.labels_listbox.bind('<<ListboxSelect>>', self._on_listbox_select)
+            self._listbox_bound = True
+
+    def _on_listbox_select(self, event):
+        """Handle listbox selection."""
+        selection = self.labels_listbox.curselection()
+        if selection:
+            self.selected_box_index = selection[0]
+        else:
+            self.selected_box_index = None
+        self._draw_boxes()
+        self._update_labels_list()
     
     def _update_stats(self):
-        """Update the statistics display."""
         total = len(self.image_list)
         labeled = 0
         label_counts = {cid: 0 for cid in CLASSES}
@@ -535,7 +515,6 @@ class DocLayoutTagger:
                             if cid in label_counts:
                                 label_counts[cid] += 1
         
-        # Build stats text
         stats = f"Images: {labeled}/{total} labeled\n"
         stats += f"─────────────────────\n"
         for cid, (name, _, _) in CLASSES.items():
@@ -548,18 +527,64 @@ class DocLayoutTagger:
         self.stats_text.config(state='disabled')
     
     def _select_class(self, class_id):
-        """Select a class for labeling."""
+        """Select a class for labeling, or update selected box."""
         self.selected_class = class_id
         self.class_var.set(class_id)
         name = CLASSES[class_id][0]
-        self.root.title(f"DocLayout-YOLO Labeler - Drawing: {name}")
-    
-    # ===== Drawing Methods =====
-    
+        
+        if getattr(self, 'selected_box_index', None) is not None:
+            idx = self.selected_box_index
+            x1, y1, x2, y2, _ = self.boxes[idx]
+            self.boxes[idx] = (x1, y1, x2, y2, class_id)
+            self._draw_boxes()
+            self._update_labels_list()
+            self.file_label.config(text=f"Changed box {idx+1} to {name}")
+        else:
+            self.root.title(f"DocLayout-YOLO Labeler - Drawing: {name}")
+
+    def _get_hit_target(self, canvas_x, canvas_y):
+        """Determine if a click hits an existing box for moving or resizing."""
+        img_x = canvas_x / self.scale
+        img_y = canvas_y / self.scale
+        margin = 10 / self.scale 
+        
+        for i in range(len(self.boxes)-1, -1, -1):
+            x1, y1, x2, y2, cid = self.boxes[i]
+            
+            if abs(img_x - x1) < margin and abs(img_y - y1) < margin: return i, 'resize_tl'
+            if abs(img_x - x2) < margin and abs(img_y - y2) < margin: return i, 'resize_br'
+            if abs(img_x - x2) < margin and abs(img_y - y1) < margin: return i, 'resize_tr'
+            if abs(img_x - x1) < margin and abs(img_y - y2) < margin: return i, 'resize_bl'
+            
+            if abs(img_x - x1) < margin and y1 < img_y < y2: return i, 'resize_l'
+            if abs(img_x - x2) < margin and y1 < img_y < y2: return i, 'resize_r'
+            if abs(img_y - y1) < margin and x1 < img_x < x2: return i, 'resize_t'
+            if abs(img_y - y2) < margin and x1 < img_x < x2: return i, 'resize_b'
+            
+            if x1 < img_x < x2 and y1 < img_y < y2:
+                return i, 'move'
+                
+        return None, None
+
     def _on_mouse_down(self, event):
-        """Start drawing a box."""
+        """Start drawing a box, or select/interact with an existing one."""
         self.start_x = self.canvas.canvasx(event.x)
         self.start_y = self.canvas.canvasy(event.y)
+        
+        hit_idx, hit_mode = self._get_hit_target(self.start_x, self.start_y)
+        
+        if hit_idx is not None:
+            self.selected_box_index = hit_idx
+            self.interaction_mode = hit_mode
+            self._draw_boxes()
+            self._update_labels_list()
+            self._drag_start_box = self.boxes[hit_idx]
+            return
+            
+        self.selected_box_index = None
+        self.interaction_mode = 'draw'
+        self._draw_boxes()
+        self._update_labels_list()
         
         if self.current_rect:
             self.canvas.delete(self.current_rect)
@@ -569,88 +594,125 @@ class DocLayoutTagger:
             self.start_x, self.start_y, self.start_x, self.start_y,
             outline=color, width=2, dash=(4, 4), tags="drawing"
         )
-    
+
     def _on_mouse_drag(self, event):
-        """Update the drawing box."""
-        if self.current_rect:
-            cur_x = self.canvas.canvasx(event.x)
-            cur_y = self.canvas.canvasy(event.y)
+        """Update the drawing box or resize/move selected box."""
+        cur_x = self.canvas.canvasx(event.x)
+        cur_y = self.canvas.canvasy(event.y)
+        
+        mode = getattr(self, 'interaction_mode', None)
+        
+        if mode == 'draw' and self.current_rect:
             self.canvas.coords(self.current_rect, self.start_x, self.start_y, cur_x, cur_y)
-    
+            return
+            
+        if mode and mode != 'draw' and self.selected_box_index is not None:
+            idx = self.selected_box_index
+            ox1, oy1, ox2, oy2, cid = self._drag_start_box
+            
+            img_cur_x = cur_x / self.scale
+            img_cur_y = cur_y / self.scale
+            img_start_x = self.start_x / self.scale
+            img_start_y = self.start_y / self.scale
+            
+            dx = img_cur_x - img_start_x
+            dy = img_cur_y - img_start_y
+            
+            nx1, ny1, nx2, ny2 = ox1, oy1, ox2, oy2
+            
+            if mode == 'move':
+                nx1 += dx; nx2 += dx; ny1 += dy; ny2 += dy
+            elif mode == 'resize_tl':
+                nx1 += dx; ny1 += dy
+            elif mode == 'resize_br':
+                nx2 += dx; ny2 += dy
+            elif mode == 'resize_tr':
+                nx2 += dx; ny1 += dy
+            elif mode == 'resize_bl':
+                nx1 += dx; ny2 += dy
+            elif mode == 'resize_l':
+                nx1 += dx
+            elif mode == 'resize_r':
+                nx2 += dx
+            elif mode == 'resize_t':
+                ny1 += dy
+            elif mode == 'resize_b':
+                ny2 += dy
+                
+            self.boxes[idx] = (min(nx1, nx2), min(ny1, ny2), max(nx1, nx2), max(ny1, ny2), cid)
+            self._draw_boxes()
+
     def _on_mouse_up(self, event):
-        """Finish drawing and add the box."""
+        """Finish drawing, moving, or resizing."""
+        mode = getattr(self, 'interaction_mode', None)
+        self.interaction_mode = None
+        
+        if mode != 'draw':
+            self._update_labels_list()
+            return
+            
         if not self.current_rect or self.start_x is None:
             return
         
         end_x = self.canvas.canvasx(event.x)
         end_y = self.canvas.canvasy(event.y)
         
-        # Check minimum size
         if abs(end_x - self.start_x) < 10 or abs(end_y - self.start_y) < 10:
             self.canvas.delete(self.current_rect)
             self.current_rect = None
             return
         
-        # Convert to original image coordinates
         x1 = min(self.start_x, end_x) / self.scale
         y1 = min(self.start_y, end_y) / self.scale
         x2 = max(self.start_x, end_x) / self.scale
         y2 = max(self.start_y, end_y) / self.scale
         
-        # Add to boxes
         self.boxes.append((x1, y1, x2, y2, self.selected_class))
+        self.selected_box_index = len(self.boxes) - 1 
         
-        # Clean up and redraw
         self.canvas.delete(self.current_rect)
         self.current_rect = None
         self._draw_boxes()
         self._update_labels_list()
         
-        # Auto-save feedback
         name = CLASSES[self.selected_class][0]
         self.file_label.config(text=f"{os.path.basename(self.img_path)} - Added {name}")
     
     def _cancel_drawing(self):
-        """Cancel the current drawing."""
         if self.current_rect:
             self.canvas.delete(self.current_rect)
             self.current_rect = None
     
     def _delete_last_box(self):
-        """Delete the last drawn box."""
-        if self.boxes:
-            self.boxes.pop()
-            self._draw_boxes()
-            self._update_labels_list()
-    
-    def _delete_selected_label(self):
-        """Delete the selected label from the listbox."""
-        selection = self.labels_listbox.curselection()
-        if selection:
-            idx = selection[0]
+        """Delete the selected box, or the last drawn box if none selected."""
+        if not self.boxes:
+            return
+            
+        idx = getattr(self, 'selected_box_index', None)
+        if idx is not None and idx < len(self.boxes):
             self.boxes.pop(idx)
-            self._draw_boxes()
-            self._update_labels_list()
+            self.selected_box_index = None
+        else:
+            self.boxes.pop()
+            
+        self._draw_boxes()
+        self._update_labels_list()
     
     def _clear_all_labels(self):
-        """Clear all labels for current image."""
         if self.boxes:
             if messagebox.askyesno("Confirm", "Delete all labels for this image?"):
                 self.boxes = []
+                self.selected_box_index = None
                 self._draw_boxes()
                 self._update_labels_list()
     
     def _on_mousewheel(self, event):
-        """Handle mouse wheel for scrolling."""
         if event.num == 5 or event.delta < 0:
             self.canvas.yview_scroll(1, "units")
         elif event.num == 4 or event.delta > 0:
             self.canvas.yview_scroll(-1, "units")
     
-    # ===== Save/Load Methods =====
-    
     def save_labels(self):
-        """Save all labels in YOLO format."""
         if not self.image_list:
             return
         
@@ -661,7 +723,6 @@ class DocLayoutTagger:
         
         with open(txt_path, 'w') as f:
             for x1, y1, x2, y2, class_id in self.boxes:
-                # Convert to YOLO format
                 cx = ((x1 + x2) / 2) / img_w
                 cy = ((y1 + y2) / 2) / img_h
                 bw = (x2 - x1) / img_w
@@ -669,7 +730,6 @@ class DocLayoutTagger:
                 
                 f.write(f"{class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
         
-        # Save crops (optional)
         for i, (x1, y1, x2, y2, class_id) in enumerate(self.boxes):
             crop_img = self.original_image.crop((int(x1), int(y1), int(x2), int(y2)))
             class_name = CLASSES[class_id][0]
@@ -680,10 +740,7 @@ class DocLayoutTagger:
         self.file_label.config(text=f"{os.path.basename(self.img_path)} ✓ SAVED")
     
     def reload_image(self):
-        """Reload the current image and its labels."""
         self._load_image()
-    
-    # ===== Navigation Methods =====
     
     def first_image(self):
         self.save_labels()
@@ -708,7 +765,6 @@ class DocLayoutTagger:
             self._load_image()
     
     def skip_to_unlabeled(self):
-        """Skip to the next unlabeled image."""
         self.save_labels()
         
         start = self.current_index
@@ -720,7 +776,6 @@ class DocLayoutTagger:
                 self._load_image()
                 return
         
-        # Wrap around
         for i in range(0, start):
             txt_filename = os.path.splitext(os.path.basename(self.image_list[i]))[0] + ".txt"
             txt_path = os.path.join(self.lbl_dir, txt_filename)
@@ -732,8 +787,7 @@ class DocLayoutTagger:
         messagebox.showinfo("Done!", "All images have been labeled!")
     
     def jump_to_image(self, event=None):
-        """Jump to a specific image number."""
-        try:
+        if self.jump_var.get().isdigit():
             num = int(self.jump_var.get())
             if 1 <= num <= len(self.image_list):
                 self.save_labels()
@@ -741,59 +795,43 @@ class DocLayoutTagger:
                 self._load_image()
             else:
                 messagebox.showwarning("Invalid", f"Enter a number between 1 and {len(self.image_list)}")
-        except ValueError:
+        else:
             messagebox.showwarning("Invalid", "Please enter a valid number")
         
         self.jump_var.set("")
     
-    # ===== Model Methods =====
-    
     def _try_load_model(self):
-        """Try to find and load the DocLayout-YOLO model."""
         if not DOCLAYOUT_AVAILABLE:
             self.model_status.config(text="Model: doclayout-yolo not installed")
             self.auto_label_btn.config(state='disabled')
             return
         
-        # Search for model file
         search_paths = []
-        
-        # User-specified path
         if MODEL_PATH:
             search_paths.append(Path(MODEL_PATH))
         
-        # Try to get script directory safely
-        try:
-            script_dir = Path(__file__).resolve().parent
-        except NameError:
-            script_dir = Path.cwd()
-        
-        # Common model filenames to search for
+        script_dir = Path(__file__).resolve().parent
         model_names = [
             "doclayout_yolo_docstructbench_imgsz1024.pt",
             "doclayout_yolo_docstructbench.pt",
             "best.pt",
         ]
         
-        # Search in script directory
         for name in model_names:
             search_paths.append(script_dir / name)
         search_paths.append(script_dir / "models" / "doclayout_yolo_docstructbench_imgsz1024.pt")
         
-        # Search in current working directory
         cwd = Path.cwd()
         for name in model_names:
             search_paths.append(cwd / name)
         search_paths.append(cwd / "models" / "doclayout_yolo_docstructbench_imgsz1024.pt")
         
-        # Search in image directory's parent (project root)
         if self.img_dir and os.path.exists(self.img_dir):
             project_root = Path(self.img_dir).parent
             for name in model_names:
                 search_paths.append(project_root / name)
             search_paths.append(project_root / "models" / "doclayout_yolo_docstructbench_imgsz1024.pt")
         
-        # Try each path
         for model_path in search_paths:
             if model_path.exists():
                 self._load_model(str(model_path))
@@ -802,29 +840,18 @@ class DocLayoutTagger:
         self.model_status.config(text="Model: Not found (click Load Model)")
     
     def _load_model(self, model_path: str):
-        """Load the DocLayout-YOLO model from a file."""
-        try:
-            self.model_status.config(text="Model: Loading...")
-            self.root.update()
-            
-            self.model = YOLOv10(model_path)
-            self.model_loaded = True
-            
-            # Shorten path for display
-            display_path = Path(model_path).name
-            self.model_status.config(text=f"Model: ✓ {display_path}")
-            self.auto_label_btn.config(state='normal')
-            
-        except Exception as e:
-            self.model_status.config(text=f"Model: Error - {str(e)[:30]}")
-            self.auto_label_btn.config(state='disabled')
-            messagebox.showerror("Model Error", f"Failed to load model:\n{e}")
+        self.model_status.config(text="Model: Loading...")
+        self.root.update()
+        
+        self.model = YOLOv10(model_path)
+        self.model_loaded = True
+        
+        display_path = Path(model_path).name
+        self.model_status.config(text=f"Model: ✓ {display_path}")
+        self.auto_label_btn.config(state='normal')
     
     def _select_model_file(self):
-        """Open dialog to select model file."""
-        # Use current working directory or image directory as starting point
         start_dir = self.img_dir if os.path.exists(self.img_dir) else os.getcwd()
-        
         file_path = filedialog.askopenfilename(
             title="Select DocLayout-YOLO Model",
             filetypes=[("PyTorch Model", "*.pt"), ("All Files", "*.*")],
@@ -834,7 +861,6 @@ class DocLayoutTagger:
             self._load_model(file_path)
     
     def auto_label(self):
-        """Run the model on current image and populate boxes."""
         if not self.model_loaded:
             messagebox.showwarning(
                 "Model Not Loaded",
@@ -848,7 +874,6 @@ class DocLayoutTagger:
         if not self.image_list:
             return
         
-        # Confirm if there are existing boxes
         if self.boxes:
             result = messagebox.askyesnocancel(
                 "Existing Labels",
@@ -857,58 +882,41 @@ class DocLayoutTagger:
                 "No = Add to existing labels\n"
                 "Cancel = Abort"
             )
-            if result is None:  # Cancel
+            if result is None:
                 return
-            if result:  # Yes - replace
+            if result:
                 self.boxes = []
+                self.selected_box_index = None
         
-        # Update UI
         self.file_label.config(text=f"{os.path.basename(self.img_path)} - Running model...")
         self.root.update()
         
-        try:
-            # Run inference
-            results = self.model.predict(
-                self.img_path,
-                imgsz=MODEL_IMAGE_SIZE,
-                conf=MODEL_CONFIDENCE,
-                device='cpu',  # Use CPU for compatibility
-                verbose=False
-            )
-            
-            # Extract detections
-            detections = results[0].boxes
-            num_added = 0
-            
-            for box in detections:
-                class_id = int(box.cls)
-                confidence = float(box.conf)
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                
-                # Add to boxes
-                self.boxes.append((x1, y1, x2, y2, class_id))
-                num_added += 1
-            
-            # Redraw
-            self._draw_boxes()
-            self._update_labels_list()
-            
-            # Feedback
-            self.file_label.config(
-                text=f"{os.path.basename(self.img_path)} - Auto-labeled: {num_added} boxes"
-            )
-            
-        except Exception as e:
-            messagebox.showerror("Auto-Label Error", f"Failed to run model:\n{e}")
-            self.file_label.config(text=f"{os.path.basename(self.img_path)} - Error")
+        results = self.model.predict(
+            self.img_path,
+            imgsz=MODEL_IMAGE_SIZE,
+            conf=MODEL_CONFIDENCE,
+            device='cpu',
+            verbose=False
+        )
+        
+        detections = results[0].boxes
+        num_added = 0
+        
+        for box in detections:
+            class_id = int(box.cls)
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            self.boxes.append((x1, y1, x2, y2, class_id))
+            num_added += 1
+        
+        self._draw_boxes()
+        self._update_labels_list()
+        self.file_label.config(text=f"{os.path.basename(self.img_path)} - Auto-labeled: {num_added} boxes")
     
     def auto_label_all_unlabeled(self):
-        """Run auto-label on all unlabeled images."""
         if not self.model_loaded:
             messagebox.showwarning("Model Not Loaded", "Please load a model first.")
             return
         
-        # Count unlabeled
         unlabeled = []
         for img_path in self.image_list:
             txt_filename = os.path.splitext(os.path.basename(img_path))[0] + ".txt"
@@ -922,26 +930,19 @@ class DocLayoutTagger:
         
         result = messagebox.askyesno(
             "Auto-Label All",
-            f"Run auto-label on {len(unlabeled)} unlabeled images?\n\n"
-            "This may take a while."
+            f"Run auto-label on {len(unlabeled)} unlabeled images?\n\nThis may take a while."
         )
         if not result:
             return
         
-        # Process each
         for i, img_path in enumerate(unlabeled):
             self.file_label.config(text=f"Auto-labeling {i+1}/{len(unlabeled)}...")
             self.root.update()
             
-            # Find index and load
             idx = self.image_list.index(img_path)
             self.current_index = idx
             self._load_image()
-            
-            # Auto-label
             self.auto_label()
-            
-            # Save
             self.save_labels()
         
         messagebox.showinfo("Done", f"Auto-labeled {len(unlabeled)} images!")
