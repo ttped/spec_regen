@@ -170,7 +170,6 @@ class DocLayoutTagger:
         nav_frame = ttk.Frame(left_frame)
         nav_frame.pack(fill=tk.X, pady=10)
         
-        ttk.Button(nav_frame, text="◀◀ First", command=self.first_image, style='Nav.TButton').pack(side=tk.LEFT, padx=2)
         ttk.Button(nav_frame, text="◀ Prev (←)", command=self.prev_image, style='Nav.TButton').pack(side=tk.LEFT, padx=2)
         
         ttk.Label(nav_frame, text="Go to:").pack(side=tk.LEFT, padx=(20, 5))
@@ -181,7 +180,6 @@ class DocLayoutTagger:
         ttk.Button(nav_frame, text="Go", command=self.jump_to_image).pack(side=tk.LEFT, padx=2)
         
         ttk.Button(nav_frame, text="Next (→) ▶", command=self.next_image, style='Nav.TButton').pack(side=tk.RIGHT, padx=2)
-        ttk.Button(nav_frame, text="Last ▶▶", command=self.last_image, style='Nav.TButton').pack(side=tk.RIGHT, padx=2)
         ttk.Button(nav_frame, text="Skip (Space)", command=self.skip_to_unlabeled, style='Nav.TButton').pack(side=tk.RIGHT, padx=20)
         
         # ===== RIGHT PANEL =====
@@ -742,16 +740,6 @@ class DocLayoutTagger:
         self.file_label.config(text=f"{os.path.basename(self.img_path)} ✓ SAVED")
     
     def reload_image(self):
-        self._load_image()
-    
-    def first_image(self):
-        self.save_labels()
-        self.current_index = 0
-        self._load_image()
-    
-    def last_image(self):
-        self.save_labels()
-        self.current_index = len(self.image_list) - 1
         self._load_image()
     
     def prev_image(self):
