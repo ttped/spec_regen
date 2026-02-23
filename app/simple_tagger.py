@@ -438,34 +438,36 @@ class DocLayoutTagger:
             has_selection = getattr(self, 'selected_box_index', None) is not None
             
             if has_selection and not is_selected:
-                color = "#555555"
+                # Ultra-faded: sparse dashed line, no label to block the view
+                color = "#444444"
                 width = 1
-                dash = (2, 4)
-                text_color = "#AAAAAA"
+                dash = (1, 6)
+                draw_label = False
             else:
                 color = base_color
-                width = 4 if is_selected else 2
+                width = 3 if is_selected else 2
                 dash = ()
-                text_color = "white"
+                draw_label = True
                 
             self.canvas.create_rectangle(
                 dx1, dy1, dx2, dy2,
                 outline=color, width=width, dash=dash, tags="box"
             )
             
-            label_text = f"{i+1}. {name}"
-            label_width = max(80, len(label_text) * 7)
-            self.canvas.create_rectangle(
-                dx1, dy1 - 18, dx1 + label_width, dy1,
-                fill=color, outline=color, tags="box_label"
-            )
-            
-            self.canvas.create_text(
-                dx1 + label_width/2, dy1 - 9,
-                text=label_text,
-                fill=text_color, font=('Segoe UI', 8, 'bold'),
-                tags="box_label"
-            )
+            if draw_label:
+                label_text = f"{i+1}. {name}"
+                label_width = max(80, len(label_text) * 7)
+                self.canvas.create_rectangle(
+                    dx1, dy1 - 18, dx1 + label_width, dy1,
+                    fill=color, outline=color, tags="box_label"
+                )
+                
+                self.canvas.create_text(
+                    dx1 + label_width/2, dy1 - 9,
+                    text=label_text,
+                    fill="white", font=('Segoe UI', 8, 'bold'),
+                    tags="box_label"
+                )
 
     def _update_labels_list(self):
         """Update the listbox showing current labels and sync selection."""
