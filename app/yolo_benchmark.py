@@ -256,7 +256,7 @@ def _has_nearby_parent(bbox, all_dets, parent_cid, vertical_expand):
 @dataclass
 class EnsembleConfig:
     model_path: str
-    scales: tuple = (800, 1024, 1280)
+    scales: tuple = (600, 800, 1024, 1280)
     wbf_iou_thresh: float = 0.55
     apply_heuristics: bool = True
     # Use the lowest per-class threshold for inference, then filter per-class after
@@ -520,12 +520,12 @@ def main():
     # --- Ensemble: multi-scale with WBF ---
     config = EnsembleConfig(
         model_path=MODEL_PATH,
-        scales=(800, 1024, 1280),
+        scales=(600, 800, 1024, 1280),
         wbf_iou_thresh=0.55,
         apply_heuristics=True,
     )
     ensemble = EnsembleYOLO(config)
-    run_benchmark(ensemble, label="Ensemble WBF (800+1024+1280)")
+    run_benchmark(ensemble, label="Ensemble WBF (600+800+1024+1280)")
 
 
 if __name__ == "__main__":
