@@ -46,6 +46,104 @@ def calculate_iou(box1, box2):
     iou = intersection_area / float(box1_area + box2_area - intersection_area)
     return iou
 
+
+class EnsembleYOLO:
+    """
+    A drop-in replacement for YOLOv10 that performs multi-scale inference.
+    Uses cross-scale voting to suppress false positives and averages bounding
+    box coordinates for higher precision crops.
+    """
+    def __init__(self, model_path, scales=(800, 1024, 1280), min_votes=2, iou_thresh=0.5):
+        self.model = YOLOv10(model_path)
+        self.scales = scales
+        self.min_votes = min_votes
+        self.iou_thresh = iou_thresh
+
+    def predict(self, image_path, conf_threshold=0.25):
+        all_detections = []
+        
+        # Run inference at each specified scale
+        for scale in self.scales:
+            results = self.model.predict(
+                image_path,
+                imgsz=scale,
+                conf=conf_threshold,
+                device='cpu',
+                verbose=False
+            )
+            
+            img_height, img_width = results[0].orig_shape
+            
+            for box in results[0].boxes:
+                class_id = int(box.cls)
+                conf = float(box.conf)
+                px1, py1, px2, py2 = box.xyxy[0].tolist()
+                
+                # Normalize coordinates so different scales can be compared
+                norm_bbox = (px1/img_width, py1/img_height, px2/img_width, py2/img_height)
+                
+                all_detections.append({
+                    'class_id': class_id,
+                    'bbox': norm_bbox,
+                    'conf': conf,
+                    'scale': scale
+                })
+                
+        return self._merge_detections(all_detections)
+        
+    def _merge_detections(self, detections):
+        """Merges overlapping detections across different scales using NMS and Voting."""
+        merged_results = []
+        unique_classes = set(d['class_id'] for d in detections)
+        
+        for cid in unique_classes:
+            class_dets = [d for d in detections if d['class_id'] == cid]
+            # Prioritize higher confidence boxes during merging
+            class_dets.sort(key=lambda x: x['conf'], reverse=True)
+            
+            merged_for_class = []
+            for det in class_dets:
+                matched = False
+                for m in merged_for_class:
+                    if calculate_iou(det['bbox'], m['bbox']) >= self.iou_thresh:
+                        # Only add weight if this is from a different scale
+                        if det['scale'] not in m['scales']:
+                            m['scales'].add(det['scale'])
+                            m['votes'] += 1
+                            
+                            # Smooth the bounding box by averaging coordinates
+                            w_old = m['votes'] - 1
+                            w_new = 1
+                            m['bbox'] = tuple(
+                                (m['bbox'][i] * w_old + det['bbox'][i] * w_new) / (w_old + w_new) 
+                                for i in range(4)
+                            )
+                            # Boost confidence to the highest seen
+                            m['conf'] = max(m['conf'], det['conf'])
+                        matched = True
+                        break
+                
+                if not matched:
+                    merged_for_class.append({
+                        'class_id': cid,
+                        'bbox': det['bbox'],
+                        'conf': det['conf'],
+                        'scales': {det['scale']},
+                        'votes': 1
+                    })
+            
+            # Filter strictly by minimum cross-scale agreement
+            for m in merged_for_class:
+                if m['votes'] >= self.min_votes:
+                    merged_results.append({
+                        'class_id': m['class_id'],
+                        'bbox': m['bbox'],
+                        'conf': m['conf']
+                    })
+                    
+        return merged_results
+
+
 def yolo_to_coords(cx, cy, w, h):
     """Convert YOLO (center x, center y, width, height) to (x1, y1, x2, y2)."""
     x1 = cx - (w / 2)
@@ -53,6 +151,7 @@ def yolo_to_coords(cx, cy, w, h):
     x2 = cx + (w / 2)
     y2 = cy + (h / 2)
     return (x1, y1, x2, y2)
+
 
 def load_ground_truth(txt_path):
     """Load ground truth boxes from YOLO .txt file. Ignores non-target classes."""
@@ -71,38 +170,15 @@ def load_ground_truth(txt_path):
                     boxes.append({'class_id': class_id, 'bbox': bbox})
     return boxes
 
+
 def get_predictions(model, image_path, conf_threshold=0.25):
     """
-    Run model inference and return bounding boxes.
-    MODIFY THIS FUNCTION when testing DPI ensembles or multi-scale inference.
+    Runs inference using the active model.
+    Filters the output to only return classes specified in TARGET_CLASSES.
     """
-    boxes = []
-    results = model.predict(
-        image_path,
-        imgsz=1024,
-        conf=conf_threshold,
-        device='cpu',
-        verbose=False
-    )
-    
-    # Get original image dimensions to normalize predictions
-    img_height, img_width = results[0].orig_shape
-    
-    for box in results[0].boxes:
-        class_id = int(box.cls)
-        if class_id in TARGET_CLASSES:
-            conf = float(box.conf)
-            # YOLO results are in pixel coords, convert to normalized 0-1 coords
-            px1, py1, px2, py2 = box.xyxy[0].tolist()
-            norm_bbox = (px1/img_width, py1/img_height, px2/img_width, py2/img_height)
-            
-            boxes.append({
-                'class_id': class_id, 
-                'bbox': norm_bbox, 
-                'conf': conf
-            })
-            
-    return boxes
+    raw_detections = model.predict(image_path, conf_threshold=conf_threshold)
+    return [d for d in raw_detections if d['class_id'] in TARGET_CLASSES]
+
 
 def evaluate_image(gt_boxes, pred_boxes, iou_threshold=0.5):
     """Match predictions to ground truth and calculate TP, FP, FN per class."""
@@ -139,13 +215,19 @@ def evaluate_image(gt_boxes, pred_boxes, iou_threshold=0.5):
         
     return stats
 
+
 def run_benchmark():
-    print(f"Loading Model: {MODEL_PATH}")
+    print(f"Loading Ensemble Model: {MODEL_PATH}")
     if not os.path.exists(MODEL_PATH):
         print(f"Model file {MODEL_PATH} not found.")
         return
         
-    model = YOLOv10(MODEL_PATH)
+    # Using the new EnsembleYOLO class
+    model = EnsembleYOLO(
+        model_path=MODEL_PATH, 
+        scales=(800, 1024, 1280), 
+        min_votes=2
+    )
     
     image_paths = []
     extensions = ["*.jpg", "*.jpeg", "*.png"]
@@ -159,7 +241,7 @@ def run_benchmark():
     overall_stats = {c: {'tp': 0, 'fp': 0, 'fn': 0} for c in TARGET_CLASSES}
     evaluated_count = 0
     
-    print("\nRunning Benchmark...")
+    print("\nRunning Multi-Scale Benchmark...")
     for img_path in image_paths:
         base_name = os.path.splitext(os.path.basename(img_path))[0]
         txt_path = os.path.join(LABELS_DIR, f"{base_name}.txt")
