@@ -39,6 +39,16 @@ from datetime import datetime
 from doclayout_yolo import YOLOv10
 DOCLAYOUT_AVAILABLE = True
 
+# Try to import ensemble/post-processing from benchmark module
+try:
+    from yolo_benchmark import (
+        EnsembleYOLO, EnsembleConfig,
+        apply_geometric_heuristics, TARGET_CLASSES,
+    )
+    ENSEMBLE_AVAILABLE = True
+except ImportError:
+    ENSEMBLE_AVAILABLE = False
+
 # ================= CONFIGURATION =================
 def get_paths():
     """Calculates paths relative to this script file."""
@@ -103,6 +113,8 @@ class DocLayoutTagger:
         # Model
         self.model = None
         self.model_loaded = False
+        self.ensemble_model = None
+        self.use_ensemble = tk.BooleanVar(value=False)
         
         # Directories
         self.img_dir = str(DEFAULT_IMAGE_DIR)
@@ -223,6 +235,23 @@ class DocLayoutTagger:
         
         self.model_status = ttk.Label(model_frame, text="Model: Not loaded", font=('Segoe UI', 8))
         self.model_status.pack(fill=tk.X)
+        
+        # Ensemble mode toggle
+        self.ensemble_check = ttk.Checkbutton(
+            model_frame,
+            text="Ensemble Mode (WBF + heuristics)",
+            variable=self.use_ensemble,
+            state='disabled' if not ENSEMBLE_AVAILABLE else 'normal',
+        )
+        self.ensemble_check.pack(fill=tk.X, pady=(4, 0))
+        
+        if not ENSEMBLE_AVAILABLE:
+            ttk.Label(
+                model_frame,
+                text="(yolo_benchmark.py not found)",
+                font=('Segoe UI', 7),
+                foreground='gray',
+            ).pack(fill=tk.X)
         
         ttk.Button(model_frame, text="📂 Load Model...", command=self._select_model_file).pack(fill=tk.X, pady=(4,0))
         
@@ -836,6 +865,13 @@ class DocLayoutTagger:
         self.model = YOLOv10(model_path)
         self.model_loaded = True
         
+        # Build ensemble wrapper if available (reuses the same underlying model)
+        if ENSEMBLE_AVAILABLE:
+            config = EnsembleConfig(model_path=model_path)
+            self.ensemble_model = EnsembleYOLO(config)
+            # Share the already-loaded model weights to avoid double memory
+            self.ensemble_model.model = self.model
+        
         display_path = Path(model_path).name
         self.model_status.config(text=f"Model: ✓ {display_path}")
         self.auto_label_btn.config(state='normal')
@@ -878,9 +914,29 @@ class DocLayoutTagger:
                 self.boxes = []
                 self.selected_box_index = None
         
-        self.file_label.config(text=f"{os.path.basename(self.img_path)} - Running model...")
+        use_ensemble = self.use_ensemble.get() and self.ensemble_model is not None
+        mode_label = "ensemble" if use_ensemble else "single-scale"
+        self.file_label.config(text=f"{os.path.basename(self.img_path)} - Running {mode_label}...")
         self.root.update()
         
+        if use_ensemble:
+            detections = self._run_ensemble_inference()
+        else:
+            detections = self._run_single_inference()
+        
+        num_added = 0
+        for det in detections:
+            self.boxes.append((det['x1'], det['y1'], det['x2'], det['y2'], det['class_id']))
+            num_added += 1
+        
+        self._draw_boxes()
+        self._update_labels_list()
+        self.file_label.config(
+            text=f"{os.path.basename(self.img_path)} - Auto-labeled ({mode_label}): {num_added} boxes"
+        )
+    
+    def _run_single_inference(self):
+        """Standard single-scale inference, returns list of pixel-coord dicts."""
         results = self.model.predict(
             self.img_path,
             imgsz=MODEL_IMAGE_SIZE,
@@ -889,18 +945,33 @@ class DocLayoutTagger:
             verbose=False
         )
         
-        detections = results[0].boxes
-        num_added = 0
-        
-        for box in detections:
-            class_id = int(box.cls)
+        detections = []
+        for box in results[0].boxes:
             x1, y1, x2, y2 = box.xyxy[0].tolist()
-            self.boxes.append((x1, y1, x2, y2, class_id))
-            num_added += 1
+            detections.append({
+                'class_id': int(box.cls),
+                'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
+            })
+        return detections
+    
+    def _run_ensemble_inference(self):
+        """Multi-scale ensemble with WBF + heuristics, returns pixel-coord dicts."""
+        # Ensemble returns normalized coords
+        norm_dets = self.ensemble_model.predict(self.img_path)
         
-        self._draw_boxes()
-        self._update_labels_list()
-        self.file_label.config(text=f"{os.path.basename(self.img_path)} - Auto-labeled: {num_added} boxes")
+        # Convert normalized back to pixel coords for the tagger
+        img_w, img_h = self.original_image.size
+        detections = []
+        for d in norm_dets:
+            bx1, by1, bx2, by2 = d['bbox']
+            detections.append({
+                'class_id': d['class_id'],
+                'x1': bx1 * img_w,
+                'y1': by1 * img_h,
+                'x2': bx2 * img_w,
+                'y2': by2 * img_h,
+            })
+        return detections
     
     def auto_label_all_unlabeled(self):
         if not self.model_loaded:

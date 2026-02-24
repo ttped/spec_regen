@@ -185,8 +185,9 @@ def apply_geometric_heuristics(detections, target_classes):
     Post-processing rules for document layout:
     - Drop tables heavily nested inside figures (>80% containment)
     - Drop orphan captions with no nearby parent element
+    - Suppress cross-class duplicates (same region, different class labels)
     """
-    final = []
+    filtered = []
 
     for det in detections:
         cid = det['class_id']
@@ -205,9 +206,62 @@ def apply_geometric_heuristics(detections, target_classes):
             if not _has_nearby_parent(bbox, detections, parent_cid, vertical_expand=0.15):
                 continue
 
-        final.append(det)
+        filtered.append(det)
+
+    # Heuristic C: Cross-class duplicate suppression
+    final = _suppress_cross_class_duplicates(filtered, iou_thresh=0.60)
 
     return final
+
+
+# Class pairs that are ALLOWED to overlap (caption near its parent element)
+_ALLOWED_OVERLAP_PAIRS = {
+    frozenset({3, 4}),   # figure + figure_caption
+    frozenset({5, 6}),   # table + table_caption
+    frozenset({5, 7}),   # table + table_footnote
+    frozenset({8, 9}),   # isolate_formula + formula_caption
+}
+
+
+def _suppress_cross_class_duplicates(detections, iou_thresh=0.60):
+    """
+    When two detections of DIFFERENT classes overlap heavily, keep the one
+    with higher confidence. This handles cases like YOLO labeling the same
+    region as both 'figure' and 'table', or 'figure' and 'isolate_formula'.
+
+    Caption/parent pairs are exempted — those are expected to overlap.
+    """
+    # Sort by confidence descending so we keep the stronger detection
+    ranked = sorted(detections, key=lambda d: d.get('conf', 0), reverse=True)
+    suppressed = set()
+    result = []
+
+    for i, det_a in enumerate(ranked):
+        if i in suppressed:
+            continue
+
+        result.append(det_a)
+
+        for j in range(i + 1, len(ranked)):
+            if j in suppressed:
+                continue
+
+            det_b = ranked[j]
+
+            # Skip if this is an allowed overlap pair
+            pair = frozenset({det_a['class_id'], det_b['class_id']})
+            if pair in _ALLOWED_OVERLAP_PAIRS:
+                continue
+
+            # Same class handled by WBF already, skip
+            if det_a['class_id'] == det_b['class_id']:
+                continue
+
+            iou = calculate_iou(det_a['bbox'], det_b['bbox'])
+            if iou >= iou_thresh:
+                suppressed.add(j)
+
+    return result
 
 
 def _is_contained_in_class(bbox, all_dets, parent_cid, threshold):
