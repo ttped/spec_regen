@@ -698,9 +698,9 @@ def crop_and_save_asset(
         x2 = min(img.width, x2 + padding)
         y2 = min(img.height, y2 + padding)
         
-        # Crop and save
+        # Crop and save with 300 DPI metadata
         cropped = img.crop((x1, y1, x2, y2))
-        cropped.save(output_path, "JPEG", quality=95)
+        cropped.save(output_path, "JPEG", quality=95, dpi=(300, 300))
     
     return filename, output_path
 
@@ -739,8 +739,9 @@ def crop_and_save_caption(
         x2 = min(img.width, x2 + padding)
         y2 = min(img.height, y2 + padding)
         
+        # Crop and save with 300 DPI metadata
         cropped = img.crop((x1, y1, x2, y2))
-        cropped.save(output_path, "JPEG", quality=95)
+        cropped.save(output_path, "JPEG", quality=95, dpi=(300, 300))
     
     return filename, output_path
 
@@ -748,7 +749,7 @@ def crop_and_save_caption(
 def create_asset_metadata(
     asset: DetectedAsset,
     image_filename: str,
-    output_dpi: int = 200,
+    output_dpi: int = 300,
     caption_image_filename: str = None
 ) -> Dict:
     """
@@ -803,7 +804,6 @@ def create_asset_metadata(
         metadata["asset_id"] = asset.caption_text
     
     return metadata
-
 
 def process_document(
     model: 'YOLOv10',
