@@ -92,10 +92,11 @@ class EnsembleYOLO:
         return self._merge_detections(all_detections)
         
     def _merge_detections(self, detections):
-        """Merges overlapping detections across different scales using NMS and Voting."""
+        """Merges overlapping detections across different scales using NMS, Voting, and Geometric Heuristics."""
         merged_results = []
         unique_classes = set(d['class_id'] for d in detections)
         
+        # 1. Merge and apply Box Expansion
         for cid in unique_classes:
             class_dets = [d for d in detections if d['class_id'] == cid]
             # Prioritize higher confidence boxes during merging
@@ -111,12 +112,12 @@ class EnsembleYOLO:
                             m['scales'].add(det['scale'])
                             m['votes'] += 1
                             
-                            # Smooth the bounding box by averaging coordinates
-                            w_old = m['votes'] - 1
-                            w_new = 1
-                            m['bbox'] = tuple(
-                                (m['bbox'][i] * w_old + det['bbox'][i] * w_new) / (w_old + w_new) 
-                                for i in range(4)
+                            # BOX EXPANSION: Take the maximum outer bounds instead of averaging
+                            m['bbox'] = (
+                                min(m['bbox'][0], det['bbox'][0]),
+                                min(m['bbox'][1], det['bbox'][1]),
+                                max(m['bbox'][2], det['bbox'][2]),
+                                max(m['bbox'][3], det['bbox'][3])
                             )
                             # Boost confidence to the highest seen
                             m['conf'] = max(m['conf'], det['conf'])
@@ -135,14 +136,64 @@ class EnsembleYOLO:
             # Filter strictly by minimum cross-scale agreement
             for m in merged_for_class:
                 if m['votes'] >= self.min_votes:
-                    merged_results.append({
-                        'class_id': m['class_id'],
-                        'bbox': m['bbox'],
-                        'conf': m['conf']
-                    })
+                    merged_results.append(m)
                     
-        return merged_results
-
+        # 2. Geometric Heuristics (Post-processing)
+        final_results = []
+        
+        for det in merged_results:
+            cid = det['class_id']
+            bbox = det['bbox']
+            
+            # Heuristic A: Nesting Rule (Drop tables heavily contained inside figures)
+            if cid == 5:  # table
+                is_nested = False
+                for other in merged_results:
+                    if other['class_id'] == 3:  # figure
+                        x_left = max(bbox[0], other['bbox'][0])
+                        y_top = max(bbox[1], other['bbox'][1])
+                        x_right = min(bbox[2], other['bbox'][2])
+                        y_bottom = min(bbox[3], other['bbox'][3])
+                        
+                        if x_right > x_left and y_bottom > y_top:
+                            inter_area = (x_right - x_left) * (y_bottom - y_top)
+                            table_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+                            if inter_area / table_area > 0.80:  # 80% contained
+                                is_nested = True
+                                break
+                if is_nested:
+                    continue
+                    
+            # Heuristic B: Orphan Captions (Drop captions without nearby parent assets)
+            if cid in [4, 6, 9]:  # figure_caption, table_caption, formula_caption
+                parent_map = {4: 3, 6: 5, 9: 8}
+                parent_cid = parent_map[cid]
+                
+                has_parent = False
+                for other in merged_results:
+                    if other['class_id'] == parent_cid:
+                        # Expand parent box vertically by 15% to check for nearby captions
+                        p_bbox = other['bbox']
+                        expanded_parent = (p_bbox[0], p_bbox[1] - 0.15, p_bbox[2], p_bbox[3] + 0.15)
+                        
+                        x_left = max(bbox[0], expanded_parent[0])
+                        y_top = max(bbox[1], expanded_parent[1])
+                        x_right = min(bbox[2], expanded_parent[2])
+                        y_bottom = min(bbox[3], expanded_parent[3])
+                        
+                        if x_right > x_left and y_bottom > y_top:
+                            has_parent = True
+                            break
+                if not has_parent:
+                    continue
+                    
+            final_results.append({
+                'class_id': det['class_id'],
+                'bbox': det['bbox'],
+                'conf': det['conf']
+            })
+            
+        return final_results
 
 def yolo_to_coords(cx, cy, w, h):
     """Convert YOLO (center x, center y, width, height) to (x1, y1, x2, y2)."""
