@@ -384,10 +384,13 @@ def load_ground_truth(txt_path):
     return boxes
 
 
-def get_predictions(model, image_path, conf_threshold=0.25):
-    """Run inference and filter to TARGET_CLASSES."""
+def get_predictions(model, image_path, conf_threshold=0.25, verifier=None):
+    """Run inference, filter to TARGET_CLASSES, and optionally verify crops."""
     raw = model.predict(image_path, conf_threshold=conf_threshold)
-    return [d for d in raw if d['class_id'] in TARGET_CLASSES]
+    filtered = [d for d in raw if d['class_id'] in TARGET_CLASSES]
+    if verifier is not None:
+        filtered = verifier.verify(image_path, filtered)
+    return filtered
 
 
 def evaluate_image(gt_boxes, pred_boxes, iou_threshold=0.5):
@@ -455,7 +458,7 @@ def compute_metrics(tp, fp, fn):
     return precision, recall, f1
 
 
-def run_benchmark(model, label="Model"):
+def run_benchmark(model, label="Model", verifier=None):
     pairs = collect_labeled_images(IMAGES_DIR, LABELS_DIR)
 
     if not pairs:
@@ -464,6 +467,8 @@ def run_benchmark(model, label="Model"):
 
     print(f"\n{'=' * 60}")
     print(f"BENCHMARK: {label}")
+    if verifier is not None:
+        print(f"  + CropVerifier active")
     print(f"Evaluating {len(pairs)} labeled images")
     print(f"{'=' * 60}")
 
@@ -471,7 +476,7 @@ def run_benchmark(model, label="Model"):
 
     for idx, (img_path, txt_path) in enumerate(pairs, 1):
         gt_boxes = load_ground_truth(txt_path)
-        pred_boxes = get_predictions(model, img_path)
+        pred_boxes = get_predictions(model, img_path, verifier=verifier)
         img_stats = evaluate_image(gt_boxes, pred_boxes, iou_threshold=0.5)
 
         for cid in TARGET_CLASSES:
@@ -526,6 +531,28 @@ def main():
     )
     ensemble = EnsembleYOLO(config)
     run_benchmark(ensemble, label="Ensemble WBF (600+800+1024+1280)")
+
+    # --- Ensemble + CropVerifier (if trained models exist) ---
+    try:
+        from crop_verifier import CropVerifier, VerifierConfig
+
+        verifier_config = VerifierConfig()
+        if os.path.exists(verifier_config.model_dir):
+            verifier = CropVerifier(verifier_config)
+            if verifier.models:
+                run_benchmark(
+                    ensemble,
+                    label="Ensemble WBF + CropVerifier",
+                    verifier=verifier,
+                )
+            else:
+                print("\n[Verifier] No trained models found, skipping verified benchmark.")
+                print("           Run: python crop_verifier.py train")
+        else:
+            print(f"\n[Verifier] Model dir '{verifier_config.model_dir}' not found, skipping.")
+            print("           Run: python crop_verifier.py train")
+    except ImportError:
+        print("\n[Verifier] crop_verifier.py not found, skipping verified benchmark.")
 
 
 if __name__ == "__main__":
