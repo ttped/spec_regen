@@ -21,15 +21,12 @@ import os
 from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum
-
-# These imports are deferred to avoid hard dependency when only stubbing
-# import torch
-# import torch.nn as nn
-# import torchvision.transforms as T
-# import torchvision.models as models
-# from torch.utils.data import Dataset, DataLoader
-# from PIL import Image
-
+import torch
+import torch.nn as nn
+import torchvision.transforms as T
+import torchvision.models as models
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
 
 # =============================================================================
 # CONFIGURATION
@@ -83,35 +80,20 @@ class CropSample:
 
 
 def collect_training_data(images_dir, labels_dir, yolo_model, target_classes):
-    """
-    Bronze layer: Generate training crops by running YOLO on labeled images
-    and matching predictions to ground truth.
-
-    Positives: YOLO detections that match a GT box (IoU >= 0.5)
-    Negatives: YOLO detections that don't match any GT box (hard negatives)
-               + random background crops (easy negatives)
-
-    Returns list of CropSample.
-    """
-    from yolo_benchmark import (
-        collect_labeled_images, load_ground_truth,
-        get_predictions, calculate_iou
-    )
-
+    from yolo_benchmark import collect_labeled_images, load_ground_truth, calculate_iou
+    
     pairs = collect_labeled_images(images_dir, labels_dir)
     samples = []
 
     for img_path, txt_path in pairs:
         gt_boxes = load_ground_truth(txt_path)
-        # Use low confidence to get more candidate detections
-        pred_boxes = get_predictions(yolo_model, img_path, conf_threshold=0.10)
+        pred_boxes = yolo_model.predict(img_path, conf_threshold=0.10)
 
         for pred in pred_boxes:
             cid = pred['class_id']
             if cid not in target_classes:
                 continue
 
-            # Check if this prediction matches any GT box
             is_positive = False
             for gt in gt_boxes:
                 if gt['class_id'] == cid:
@@ -129,6 +111,32 @@ def collect_training_data(images_dir, labels_dir, yolo_model, target_classes):
 
     return samples
 
+def ensure_models_trained(config, images_dir, labels_dir, yolo_model, target_classes):
+    """Auto-training hook. Trains the models if they don't exist."""
+    model_dir = Path(config.model_dir)
+    os.makedirs(model_dir, exist_ok=True)
+    
+    all_exist = True
+    for vc in VerifierClass:
+        if not (model_dir / f"verifier_{vc.name.lower()}.pt").exists():
+            all_exist = False
+            break
+            
+    if all_exist:
+        return
+
+    print("\n[Verifier] Models missing. Starting auto-training...")
+    print("=== Bronze: Collecting training crops ===")
+    raw_samples = collect_training_data(images_dir, labels_dir, yolo_model, target_classes)
+    
+    print(f"\n=== Silver: Balancing dataset ({len(raw_samples)} raw samples) ===")
+    balanced = balance_samples(raw_samples)
+
+    print("\n=== Gold: Training verifiers ===")
+    for vc in VerifierClass:
+        train_verifier(config, balanced, vc)
+        
+    print("[Verifier] Auto-training complete.\n")
 
 # =============================================================================
 # SILVER LAYER: Balanced Dataset
@@ -207,31 +215,13 @@ def build_verifier_model(model_name="efficientnet_b0", num_classes=1):
 # =============================================================================
 
 class CropVerifier:
-    """
-    Integrates with EnsembleYOLO to filter false positives.
-
-    Usage in benchmark/pipeline:
-        ensemble = EnsembleYOLO(config)
-        verifier = CropVerifier(verifier_config)
-
-        detections = ensemble.predict(image_path)
-        verified = verifier.verify(image_path, detections)
-    """
-
     def __init__(self, config: VerifierConfig):
         self.config = config
-        self.models = {}  # VerifierClass -> loaded model
+        self.models = {} 
         self._load_models()
 
     def _load_models(self):
-        """Load trained verifier models from disk."""
-        import torch
-
         model_dir = Path(self.config.model_dir)
-        if not model_dir.exists():
-            print(f"  [Verifier] No model dir at {model_dir}, running without verification")
-            return
-
         for vc in VerifierClass:
             model_path = model_dir / f"verifier_{vc.name.lower()}.pt"
             if model_path.exists():
@@ -241,17 +231,13 @@ class CropVerifier:
                 self.models[vc] = model
                 print(f"  [Verifier] Loaded {vc.name} verifier")
 
-    def verify(self, image_path, detections):
+    def generate_votes(self, image_path, detections):
         """
-        Filter detections by running each crop through the appropriate
-        verifier model. Returns only detections that pass.
+        Evaluates YOLO detections and returns verifier predictions
+        to be used as additional votes in Weighted Box Fusion.
         """
         if not self.models:
-            return detections  # No verifiers loaded, pass everything through
-
-        import torch
-        from PIL import Image
-        import torchvision.transforms as T
+            return []
 
         img = Image.open(image_path).convert('RGB')
         img_w, img_h = img.size
@@ -262,45 +248,44 @@ class CropVerifier:
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
-        verified = []
+        votes = []
 
         for det in detections:
             cid = det['class_id']
 
-            # Determine which verifier to use
             if cid in (vc.value for vc in VerifierClass):
                 verifier_class = VerifierClass(cid)
             elif cid in CAPTION_TO_PARENT:
                 verifier_class = CAPTION_TO_PARENT[cid]
             else:
-                verified.append(det)  # No verifier for this class, keep it
                 continue
 
             if verifier_class not in self.models:
-                verified.append(det)
                 continue
 
-            # Extract crop
             x1, y1, x2, y2 = det['bbox']
-            crop = img.crop((
-                int(x1 * img_w), int(y1 * img_h),
-                int(x2 * img_w), int(y2 * img_h),
-            ))
+            x1_px = max(0, int(x1 * img_w))
+            y1_px = max(0, int(y1 * img_h))
+            x2_px = min(img_w, int(x2 * img_w))
+            y2_px = min(img_h, int(y2 * img_h))
+            
+            if x2_px <= x1_px or y2_px <= y1_px:
+                continue
 
-            # Classify
+            crop = img.crop((x1_px, y1_px, x2_px, y2_px))
             tensor = transform(crop).unsqueeze(0)
+            
             with torch.no_grad():
                 logit = self.models[verifier_class](tensor)
                 prob = torch.sigmoid(logit).item()
 
-            threshold = self.config.class_thresholds.get(
-                verifier_class, self.config.confidence_threshold
-            )
+            votes.append({
+                'class_id': cid,
+                'bbox': det['bbox'],
+                'conf': prob
+            })
 
-            if prob >= threshold:
-                verified.append(det)
-
-        return verified
+        return votes
 
 
 # =============================================================================
@@ -308,17 +293,7 @@ class CropVerifier:
 # =============================================================================
 
 def train_verifier(config, samples, verifier_class):
-    """
-    Train a single binary verifier for one parent class.
-    Implements the two-phase strategy: frozen backbone → full fine-tune.
-    """
-    import torch
-    import torch.nn as nn
-    from torch.utils.data import DataLoader
-    from PIL import Image
-    import torchvision.transforms as T
-
-    class CropDataset:
+    class CropDataset(Dataset):
         def __init__(self, samples, transform):
             self.samples = samples
             self.transform = transform
@@ -331,12 +306,20 @@ def train_verifier(config, samples, verifier_class):
             img = Image.open(s.image_path).convert('RGB')
             w, h = img.size
             x1, y1, x2, y2 = s.bbox_normalized
-            crop = img.crop((int(x1 * w), int(y1 * h), int(x2 * w), int(y2 * h)))
+            
+            x1_px = max(0, int(x1 * w))
+            y1_px = max(0, int(y1 * h))
+            x2_px = min(w, int(x2 * w))
+            y2_px = min(h, int(y2 * h))
+            
+            if x2_px <= x1_px: x2_px = x1_px + 1
+            if y2_px <= y1_px: y2_px = y1_px + 1
+            
+            crop = img.crop((x1_px, y1_px, x2_px, y2_px))
             tensor = self.transform(crop)
             label = torch.tensor([1.0 if s.is_positive else 0.0])
             return tensor, label
 
-    # Filter samples for this verifier class
     relevant_cids = {verifier_class.value}
     for caption_cid, parent in CAPTION_TO_PARENT.items():
         if parent == verifier_class:
@@ -364,16 +347,13 @@ def train_verifier(config, samples, verifier_class):
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
 
-    # Phase 1: Frozen backbone
     for param in model.parameters():
         param.requires_grad = False
-    # Unfreeze classifier head
     for param in list(model.parameters())[-4:]:
         param.requires_grad = True
 
     for epoch in range(config.epochs):
         if epoch == config.freeze_backbone_epochs:
-            # Phase 2: Unfreeze everything with lower LR
             for param in model.parameters():
                 param.requires_grad = True
             optimizer = torch.optim.Adam(model.parameters(), lr=config.lr / 10)
@@ -398,7 +378,6 @@ def train_verifier(config, samples, verifier_class):
         acc = correct / total if total > 0 else 0
         print(f"  Epoch {epoch+1}/{config.epochs} - Loss: {total_loss/len(loader):.4f}, Acc: {acc:.3f}")
 
-    # Save
     os.makedirs(config.model_dir, exist_ok=True)
     save_path = os.path.join(config.model_dir, f"verifier_{verifier_class.name.lower()}.pt")
     torch.save(model.state_dict(), save_path)

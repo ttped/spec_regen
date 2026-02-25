@@ -14,6 +14,8 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from doclayout_yolo import YOLOv10
 
+from crop_verifier import CropVerifier, VerifierConfig, ensure_models_trained
+
 
 # =============================================================================
 # CONFIGURATION
@@ -309,70 +311,78 @@ def _has_nearby_parent(bbox, all_dets, parent_cid, vertical_expand):
 
 @dataclass
 class EnsembleConfig:
-    model_path: str
-    scales: tuple = (600, 800, 1024, 1280)
+    model_paths: list
+    imgsz: int = 1024
     wbf_iou_thresh: float = 0.55
     apply_heuristics: bool = True
-    # Use the lowest per-class threshold for inference, then filter per-class after
     inference_conf: float = 0.15
     class_conf_thresholds: dict = field(default_factory=lambda: dict(CLASS_CONF_THRESHOLDS))
 
 
 class EnsembleYOLO:
-    """
-    Multi-scale YOLO ensemble using Weighted Box Fusion.
-
-    Runs inference at each scale, normalizes coordinates, then fuses with WBF
-    to get tighter bounding boxes and calibrated confidence scores.
-    """
-
     def __init__(self, config: EnsembleConfig):
-        self.model = YOLOv10(config.model_path)
+        self.models = [YOLOv10(path) for path in config.model_paths]
         self.config = config
 
-    def predict(self, image_path, conf_threshold=None):
+    def predict(self, image_path, conf_threshold=None, verifier=None):
         conf = conf_threshold or self.config.inference_conf
+        per_model_dets = []
+        all_raw_dets = []
 
-        # Collect per-scale detections as separate lists for WBF
-        per_scale_dets = []
-
-        for scale in self.config.scales:
-            results = self.model.predict(
+        for model in self.models:
+            results = model.predict(
                 image_path,
-                imgsz=scale,
+                imgsz=self.config.imgsz,
                 conf=conf,
                 device='cpu',
                 verbose=False,
             )
 
             img_height, img_width = results[0].orig_shape
-            scale_dets = []
+            model_dets = []
 
             for box in results[0].boxes:
                 px1, py1, px2, py2 = box.xyxy[0].tolist()
-                scale_dets.append({
+                det = {
                     'class_id': int(box.cls),
                     'bbox': (px1 / img_width, py1 / img_height,
                              px2 / img_width, py2 / img_height),
                     'conf': float(box.conf),
-                })
+                }
+                model_dets.append(det)
+                all_raw_dets.append(det)
 
-            per_scale_dets.append(scale_dets)
+            per_model_dets.append(model_dets)
 
-        # Fuse across scales
+        if verifier is not None:
+            # Deduplicate boxes so the verifier doesn't score the exact same crop multiple times
+            unique_dets = []
+            seen_boxes = []
+            for det in all_raw_dets:
+                is_dup = False
+                for seen in seen_boxes:
+                    if det['class_id'] == seen['class_id'] and calculate_iou(det['bbox'], seen['bbox']) > 0.8:
+                        is_dup = True
+                        break
+                if not is_dup:
+                    seen_boxes.append(det)
+                    unique_dets.append(det)
+
+            verifier_votes = verifier.generate_votes(image_path, unique_dets)
+            if verifier_votes:
+                per_model_dets.append(verifier_votes)
+
         fused = weighted_box_fusion(
-            per_scale_dets,
+            per_model_dets,
             iou_thresh=self.config.wbf_iou_thresh,
         )
 
-        # Apply per-class confidence thresholds
         thresholds = self.config.class_conf_thresholds
         fused = [
             d for d in fused
             if d['conf'] >= thresholds.get(d['class_id'], DEFAULT_CONF_THRESHOLD)
         ]
 
-        # Geometric heuristics
         if self.config.apply_heuristics:
             fused = apply_geometric_heuristics(fused, TARGET_CLASSES)
 
@@ -384,13 +394,11 @@ class EnsembleYOLO:
 # =============================================================================
 
 class SingleScaleYOLO:
-    """Single-scale inference — use as a baseline to compare against ensemble."""
-
     def __init__(self, model_path, imgsz=1024):
         self.model = YOLOv10(model_path)
         self.imgsz = imgsz
 
-    def predict(self, image_path, conf_threshold=0.25):
+    def predict(self, image_path, conf_threshold=0.25, verifier=None):
         results = self.model.predict(
             image_path,
             imgsz=self.imgsz,
@@ -411,8 +419,12 @@ class SingleScaleYOLO:
                 'conf': float(box.conf),
             })
 
-        return detections
+        if verifier is not None:
+            verifier_votes = verifier.generate_votes(image_path, detections)
+            if verifier_votes:
+                detections = weighted_box_fusion([detections, verifier_votes], iou_thresh=0.55)
 
+        return detections
 
 # =============================================================================
 # GROUND TRUTH & EVALUATION
@@ -439,12 +451,8 @@ def load_ground_truth(txt_path):
 
 
 def get_predictions(model, image_path, conf_threshold=0.25, verifier=None):
-    """Run inference, filter to TARGET_CLASSES, and optionally verify crops."""
-    raw = model.predict(image_path, conf_threshold=conf_threshold)
-    filtered = [d for d in raw if d['class_id'] in TARGET_CLASSES]
-    if verifier is not None:
-        filtered = verifier.verify(image_path, filtered)
-    return filtered
+    raw = model.predict(image_path, conf_threshold=conf_threshold, verifier=verifier)
+    return [d for d in raw if d['class_id'] in TARGET_CLASSES]
 
 
 def evaluate_image(gt_boxes, pred_boxes, iou_threshold=0.5):
@@ -567,46 +575,41 @@ def run_benchmark(model, label="Model", verifier=None):
 
 
 def main():
-    if not os.path.exists(MODEL_PATH):
-        print(f"Model file {MODEL_PATH} not found.")
-        return
+    # Define models to ensemble (Base model + fine-tunes)
+    model_paths = [
+        MODEL_PATH,
+        # "fine_tuned_model_1.pt",
+        # "fine_tuned_model_2.pt"
+    ]
 
-    # --- Baseline: single scale at 1024 ---
-    print(f"Loading model: {MODEL_PATH}")
-    baseline = SingleScaleYOLO(MODEL_PATH, imgsz=1024)
-    run_benchmark(baseline, label="Single-Scale Baseline (1024)")
+    for mp in model_paths:
+        if not os.path.exists(mp):
+            raise FileNotFoundError(f"Model file {mp} not found.")
 
-    # --- Ensemble: multi-scale with WBF ---
+    print(f"Loading base model: {MODEL_PATH}")
+    base_yolo = SingleScaleYOLO(MODEL_PATH, imgsz=1024)
+
+    verifier_config = VerifierConfig()
+    ensure_models_trained(verifier_config, IMAGES_DIR, LABELS_DIR, base_yolo, TARGET_CLASSES)
+    
+    verifier = CropVerifier(verifier_config)
+
+    run_benchmark(base_yolo, label="Single-Scale Baseline (1024)", verifier=None)
+
     config = EnsembleConfig(
-        model_path=MODEL_PATH,
-        scales=(320, 416, 640, 800, 1024, 1280),
+        model_paths=model_paths,
+        imgsz=1024,
         wbf_iou_thresh=0.55,
         apply_heuristics=True,
     )
     ensemble = EnsembleYOLO(config)
-    run_benchmark(ensemble, label="Ensemble WBF (600+800+1024+1280)")
+    run_benchmark(ensemble, label=f"Ensemble WBF ({len(model_paths)} models)", verifier=None)
 
-    # --- Ensemble + CropVerifier (if trained models exist) ---
-    try:
-        from crop_verifier import CropVerifier, VerifierConfig
-
-        verifier_config = VerifierConfig()
-        if os.path.exists(verifier_config.model_dir):
-            verifier = CropVerifier(verifier_config)
-            if verifier.models:
-                run_benchmark(
-                    ensemble,
-                    label="Ensemble WBF + CropVerifier",
-                    verifier=verifier,
-                )
-            else:
-                print("\n[Verifier] No trained models found, skipping verified benchmark.")
-                print("           Run: python crop_verifier.py train")
-        else:
-            print(f"\n[Verifier] Model dir '{verifier_config.model_dir}' not found, skipping.")
-            print("           Run: python crop_verifier.py train")
-    except ImportError:
-        print("\n[Verifier] crop_verifier.py not found, skipping verified benchmark.")
+    run_benchmark(
+        ensemble,
+        label="Ensemble WBF + CropVerifier",
+        verifier=verifier,
+    )
 
 
 if __name__ == "__main__":
