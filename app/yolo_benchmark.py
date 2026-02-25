@@ -579,7 +579,7 @@ def main():
     # --- Ensemble: multi-scale with WBF ---
     config = EnsembleConfig(
         model_path=MODEL_PATH,
-        scales=(600, 800, 1024, 1280),
+        scales=(320, 416, 640, 800, 1024, 1280),
         wbf_iou_thresh=0.55,
         apply_heuristics=True,
     )
