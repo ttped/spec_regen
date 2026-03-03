@@ -43,6 +43,38 @@ def configure_heading_styles(doc):
             style.paragraph_format.space_after = Pt(6)
 
 
+def add_excel_table_to_docx(doc, table_data: dict):
+    """
+    Adds a table to the docx document using data and column widths extracted from Excel.
+    """
+    rows = table_data.get("rows", [])
+    columns = table_data.get("columns", [])
+    
+    if not rows:
+        return
+        
+    num_rows = len(rows)
+    num_cols = len(columns)
+    
+    table = doc.add_table(rows=num_rows, cols=num_cols)
+    table.style = 'Table Grid'
+    
+    # Apply column widths 
+    # (Excel widths are approx characters; roughly width / 12 = docx Inches)
+    for i, col_meta in enumerate(columns):
+        excel_width = col_meta.get("width", 8.43)
+        inches_width = Inches(excel_width / 12.0) 
+        
+        for cell in table.columns[i].cells:
+            cell.width = inches_width
+    
+    # Populate table cells
+    for row_idx, row_data in enumerate(rows):
+        for col_idx, cell_value in enumerate(row_data):
+            cell_text = str(cell_value) if cell_value is not None else ""
+            table.cell(row_idx, col_idx).text = cell_text
+
+
 def add_section_heading(doc, section_number: str, topic: str, level: int = 1):
     """
     Adds a section heading using built-in heading styles for ToC.
