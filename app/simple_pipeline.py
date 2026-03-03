@@ -28,7 +28,7 @@ from typing import List, Dict, Set, Tuple, Optional
 from classify_agent import run_classification_on_file, load_content_start_page, load_classification_result
 from title_agent import extract_title_page_info
 from asset_processor import run_asset_integration
-from table_processor_agent import run_table_processing_on_file
+from table_iris_processor import run_iris_table_processing
 from docx_writer import run_docx_creation
 from section_processor import run_section_processing_on_file
 from section_classifier import train_and_predict
@@ -47,6 +47,7 @@ DEFAULT_RAW_OCR_DIR = os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", 
 DEFAULT_FIGURES_DIR = os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "exports")  # Manual exports
 DEFAULT_IMAGES_DIR = "docs_images"  # Page images for YOLO
 DEFAULT_YOLO_EXPORTS_DIR = "yolo_exports"  # YOLO-extracted assets
+DEFAULT_TABLE_JSONS_DIR = os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "table_jsons")
 DEFAULT_RESULTS_DIR = "results_simple"
 
 ## --- LLM Provider Toggle ---
@@ -200,7 +201,10 @@ class Config:
     
     # ML settings
     ml_threshold = 0.5
-    no_table_ocr = True
+    
+    # IRIS table OCR
+    table_jsons_dir = DEFAULT_TABLE_JSONS_DIR
+    reconstruct_script = "reconstruct_to_df.py"
     
     # YOLO settings
     use_yolo = True           # Use YOLO for asset extraction
@@ -291,16 +295,6 @@ def main():
         print(f"{stem}")
         print(f"{'=' * 60}")
         
-        # Resolve the actual YOLO exports subdirectory for this stem.
-        # Handles space/underscore naming mismatches between OCR filenames and YOLO dir names.
-        from asset_processor import resolve_asset_directory
-        doc_asset_dir = resolve_asset_directory(figures_dir, stem)
-        if doc_asset_dir:
-            # Use the resolved name so downstream modules find the right directory
-            figures_stem = os.path.basename(doc_asset_dir)
-        else:
-            figures_stem = stem
-        
         raw_input = os.path.join(args.raw_ocr_dir, f"{stem}.json")
         classify_out = os.path.join(args.results_dir, f"{stem}_classification.json")
         title_out = os.path.join(args.results_dir, f"{stem}_title.json")
@@ -350,7 +344,7 @@ def main():
                 organized_out, 
                 content_start_page=content_start,
                 yolo_exports_dir=figures_dir,  # Pass YOLO exports for overlap filtering
-                doc_stem=figures_stem
+                doc_stem=stem
             )
             if not os.path.exists(organized_out):
                 print(f"  [FAIL] Structure processing produced no output: {organized_out}")
@@ -390,21 +384,27 @@ def main():
                 print(f"         Expected from step 4 (ml_filter) or step 3 (structure).")
                 print(f"         Skipping remaining steps for {stem}.")
                 continue
-            run_asset_integration(input_file, with_assets_out, figures_dir, figures_stem, positioning_mode="bbox")
+            run_asset_integration(input_file, with_assets_out, figures_dir, stem, positioning_mode="bbox")
             if not os.path.exists(with_assets_out):
                 print(f"  [FAIL] Asset integration produced no output: {with_assets_out}")
                 print(f"         Skipping remaining steps for {stem}.")
                 continue
 
-        # STEP 6: TABLES
+        # STEP 6: TABLES (IRIS table OCR)
         if args.step in ["tables", "all"]:
-            print("[6: Tables]")
+            print("[6: Tables (IRIS)]")
             if not os.path.exists(with_assets_out):
                 print(f"  [FAIL] Tables input not found: {with_assets_out}")
                 print(f"         Step 5 (assets) must complete successfully first.")
                 print(f"         Skipping remaining steps for {stem}.")
                 continue
-            run_table_processing_on_file(with_assets_out, tables_out, figures_dir, figures_stem, LLM_CONFIG, use_llm_ocr=not args.no_table_ocr)
+            run_iris_table_processing(
+                with_assets_out,
+                tables_out,
+                args.table_jsons_dir,
+                figures_stem,
+                reconstruct_script=args.reconstruct_script,
+            )
 
         # STEP 7: WRITE
         if args.step in ["write", "all"]:
@@ -422,7 +422,7 @@ def main():
                 print(f"         Neither {tables_out} nor {with_assets_out} exist.")
                 print(f"         Steps 5-6 must complete successfully first.")
                 continue
-            run_docx_creation(input_file, final_docx, figures_dir, figures_stem, title_out)
+            run_docx_creation(input_file, final_docx, figures_dir, stem, title_out)
 
         # STEP 8: VALIDATE
         if args.step in ["validate", "all"]:
@@ -498,6 +498,10 @@ if __name__ == '__main__':
                        help="YOLO device: cpu, cuda:0, or mps")
     parser.add_argument('--force-yolo', action='store_true',
                        help="Force re-run YOLO even if exports exist")
+    parser.add_argument('--table-jsons-dir', type=str, default=None,
+                       help="Directory containing IRIS table OCR JSONs")
+    parser.add_argument('--reconstruct-script', type=str, default=None,
+                       help="Path to reconstruct_to_df.py")
     
     args = parser.parse_args()
     
@@ -506,5 +510,9 @@ if __name__ == '__main__':
     Config.yolo_confidence = args.yolo_conf
     Config.yolo_device = args.yolo_device
     Config.skip_yolo_if_exists = not args.force_yolo
+    if args.table_jsons_dir:
+        Config.table_jsons_dir = args.table_jsons_dir
+    if args.reconstruct_script:
+        Config.reconstruct_script = args.reconstruct_script
     
     main()

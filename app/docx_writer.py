@@ -78,7 +78,8 @@ def add_excel_table_to_docx(doc, table_data: dict):
 def add_isolated_landscape_table(doc, table_data: dict):
     """
     Isolates a table on a new landscape page, then reverts the document to portrait.
-    Uses standard Excel-based table writing instead of complex schema.
+    Routes through add_docx_table_from_data for consistent rendering via complex_table_schema.
+    Falls back to add_excel_table_to_docx if table_data uses Excel reader format (has 'width' keys).
     """
     landscape_section = doc.add_section(WD_SECTION.NEW_PAGE)
     landscape_section.orientation = WD_ORIENT.LANDSCAPE
@@ -88,8 +89,16 @@ def add_isolated_landscape_table(doc, table_data: dict):
         landscape_section.page_width
     )
     
-    # Call the new excel table renderer directly
-    add_excel_table_to_docx(doc, table_data)
+    # Determine which renderer to use based on the table_data format
+    columns = table_data.get("columns", [])
+    is_excel_format = columns and isinstance(columns[0], dict) and "width" in columns[0]
+    
+    if is_excel_format:
+        add_excel_table_to_docx(doc, table_data)
+    else:
+        # Use landscape-width DXA (11" - 2" margins = 9" = 12960 DXA)
+        from complex_table_schema import add_complex_table
+        add_complex_table(doc, table_data, total_width_dxa=12960)
     
     portrait_section = doc.add_section(WD_SECTION.NEW_PAGE)
     portrait_section.orientation = WD_ORIENT.PORTRAIT
@@ -483,6 +492,7 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
             caption_text = str(element.get('caption_text', ''))
             table_data = element.get("table_data")
             render_as_image = element.get("_render_as_image", False)
+            render_landscape = element.get("_render_landscape", False)
 
             is_valid_text_table = (
                 not render_as_image and
@@ -492,7 +502,10 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
             )
 
             if is_valid_text_table:
-                add_docx_table_from_data(doc, table_data)
+                if render_landscape:
+                    add_isolated_landscape_table(doc, table_data)
+                else:
+                    add_docx_table_from_data(doc, table_data)
                 add_table_caption(doc, caption_text)
             elif image_filename:
                 image_path = os.path.join(figures_image_folder, image_filename)
