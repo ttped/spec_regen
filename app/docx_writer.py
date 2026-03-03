@@ -77,27 +77,10 @@ def add_section_heading(doc, section_number: str, topic: str, level: int = 1):
 def add_docx_table_from_data(doc, table_data: Dict):
     """
     Adds a table to the docx document from structured data.
+    Delegates to the complex table schema renderer.
     """
-    columns = table_data.get('columns', [])
-    rows_data = table_data.get('rows', [])
-    
-    if not columns or not rows_data:
-        return
-
-    table = doc.add_table(rows=1, cols=len(columns))
-    table.style = 'Table Grid'
-
-    header_cells = table.rows[0].cells
-    for i, col_name in enumerate(columns):
-        cell = header_cells[i]
-        cell.text = col_name
-        cell.paragraphs[0].runs[0].font.bold = True
-
-    for row_values in rows_data:
-        row_cells = table.add_row().cells
-        for i, value in enumerate(row_values):
-            if i < len(row_cells):
-                row_cells[i].text = str(value)
+    from complex_table_schema import add_docx_table_from_data as add_complex_table
+    return add_complex_table(doc, table_data)
 
 
 def add_figure_caption(doc, text: str):
@@ -123,10 +106,11 @@ def add_figure_caption(doc, text: str):
     p.add_run(f": {text}")
 
 
-def add_table_caption(doc, text: str):
-    """Adds a true Word caption for a TABLE."""
-    style_name = 'Caption' if 'Caption' in doc.styles else 'Normal'
-    p = doc.add_paragraph(style=style_name)
+def add_table_caption(doc, text: str = ""):
+    """
+    Adds a true Word caption for a TABLE, which can be used for a Table of Tables.
+    """
+    p = doc.add_paragraph(style='Caption')
     p.add_run("Table ")
 
     run = p.add_run()
@@ -143,13 +127,15 @@ def add_table_caption(doc, text: str):
     fldChar_end.set(qn('w:fldCharType'), 'end')
     run._r.append(fldChar_end)
 
-    p.add_run(f": {text}")
+    if text and str(text).strip():
+        p.add_run(f": {text}")
 
 
-def add_equation_caption(doc, text: str):
-    """Adds a true Word caption for an EQUATION."""
-    style_name = 'Caption' if 'Caption' in doc.styles else 'Normal'
-    p = doc.add_paragraph(style=style_name)
+def add_equation_caption(doc, text: str = ""):
+    """
+    Adds a true Word caption for an EQUATION, which can be used for a Table of Equations.
+    """
+    p = doc.add_paragraph(style='Caption')
     p.add_run("Equation ")
 
     run = p.add_run()
@@ -166,7 +152,8 @@ def add_equation_caption(doc, text: str):
     fldChar_end.set(qn('w:fldCharType'), 'end')
     run._r.append(fldChar_end)
 
-    p.add_run(f": {text}")
+    if text and str(text).strip():
+        p.add_run(f": {text}")
 
 
 def add_bordered_paragraph(doc, text: str):
@@ -319,30 +306,29 @@ def add_field(paragraph, field_text: str):
     run._r.append(fldChar_end)
 
 
-def add_caption(doc, text: str):
+def add_figure_caption(doc, text: str = ""):
     """
-    Adds a true Word caption to the document.
-    DEPRECATED: Use add_figure_caption() or add_table_caption() instead.
+    Adds a true Word caption for a FIGURE, which can be used for a Table of Figures.
     """
     p = doc.add_paragraph(style='Caption')
     p.add_run("Figure ")
 
     run = p.add_run()
-    
-    fldChar = OxmlElement('w:fldChar')
-    fldChar.set(qn('w:fldCharType'), 'begin')
-    run._r.append(fldChar)
+    fldChar_begin = OxmlElement('w:fldChar')
+    fldChar_begin.set(qn('w:fldCharType'), 'begin')
+    run._r.append(fldChar_begin)
 
     instrText = OxmlElement('w:instrText')
     instrText.set(qn('xml:space'), 'preserve')
     instrText.text = 'SEQ Figure \\* ARABIC'
     run._r.append(instrText)
 
-    fldChar = OxmlElement('w:fldChar')
-    fldChar.set(qn('w:fldCharType'), 'end')
-    run._r.append(fldChar)
+    fldChar_end = OxmlElement('w:fldChar')
+    fldChar_end.set(qn('w:fldCharType'), 'end')
+    run._r.append(fldChar_end)
 
-    p.add_run(f": {text}")
+    if text and str(text).strip():
+        p.add_run(f": {text}")
 
 
 def create_docx_from_elements(elements: List[Dict], output_filename: str, figures_image_folder: str, part_number: str, title_data: Optional[Dict]):
@@ -394,13 +380,12 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
     footer_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     for element in elements:
-        # Strict normalization of element types
-        element_type = str(element.get("type") or "").strip().lower()
+        element_type = str(element.get("type", "")).strip().lower()
 
         if element_type == "section":
-            section_number = str(element.get("section_number") or "")
-            topic = str(element.get("topic") or "")
-            content = str(element.get("content") or "")
+            section_number = str(element.get("section_number", ""))
+            topic = str(element.get("topic", ""))
+            content = str(element.get("content", ""))
             
             level = len(section_number.split('.')) if section_number else 1
             heading_level = max(1, min(level, 9))
@@ -412,73 +397,80 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
                 doc.add_paragraph(content)
         
         elif element_type == "unassigned_text_block":
-            content = str(element.get("content") or "")
+            content = str(element.get("content", ""))
             if content:
                 doc.add_paragraph(content)
 
         elif element_type == "figure":
             export_data = element.get("export") or {}
             image_filename = export_data.get("image_file")
-            caption_name = str(element.get('caption_text') or element.get('asset_id') or 'Untitled Figure')
+            caption_text = str(element.get('caption_text', ''))
             
             if image_filename:
                 image_path = os.path.join(figures_image_folder, image_filename)
                 if os.path.exists(image_path):
                     doc.add_picture(image_path, width=Inches(6.0))
-                    add_figure_caption(doc, caption_name)
+                    add_figure_caption(doc, caption_text)
                 else:
                     p_error = doc.add_paragraph()
                     p_error.add_run(f"[Figure image not found: {image_filename}]").italic = True
-                    add_figure_caption(doc, caption_name)
+                    add_figure_caption(doc, caption_text)
             else:
                 p_error = doc.add_paragraph()
                 p_error.add_run(f"[Figure has no image file]").italic = True
-                add_figure_caption(doc, caption_name)
+                add_figure_caption(doc, caption_text)
         
         elif element_type == "table":
             export_data = element.get("export") or {}
             image_filename = export_data.get("image_file")
-            caption_name = str(element.get('caption_text') or element.get('asset_id') or 'Untitled Table')
+            caption_text = str(element.get('caption_text', ''))
             table_data = element.get("table_data")
+            render_as_image = element.get("_render_as_image", False)
 
-            # Fallback constraint: only process table_data if it is strictly a dictionary
-            if isinstance(table_data, dict):
+            is_valid_text_table = (
+                not render_as_image and
+                isinstance(table_data, dict) and 
+                len(table_data.get("columns", [])) > 0 and 
+                len(table_data.get("rows", [])) > 0
+            )
+
+            if is_valid_text_table:
                 add_docx_table_from_data(doc, table_data)
-                add_table_caption(doc, caption_name)
+                add_table_caption(doc, caption_text)
             elif image_filename:
                 image_path = os.path.join(figures_image_folder, image_filename)
                 if os.path.exists(image_path):
                     doc.add_picture(image_path, width=Inches(6.0))
-                    add_table_caption(doc, caption_name)
+                    add_table_caption(doc, caption_text)
                 else:
                     p_error = doc.add_paragraph()
                     p_error.add_run(f"[Table image not found: {image_filename}]").italic = True
-                    add_table_caption(doc, caption_name)
+                    add_table_caption(doc, caption_text)
             else:
                 p_placeholder = doc.add_paragraph()
                 p_placeholder.add_run(f"[Table content not available]").italic = True
-                add_table_caption(doc, caption_name)
+                add_table_caption(doc, caption_text)
 
         elif element_type == "equation":
             export_data = element.get("export") or {}
             image_filename = export_data.get("image_file")
-            caption_name = str(element.get('caption_text') or element.get('asset_id') or 'Untitled Equation')
+            caption_text = str(element.get('caption_text', ''))
             
             if image_filename:
                 image_path = os.path.join(figures_image_folder, image_filename)
                 if os.path.exists(image_path):
                     doc.add_picture(image_path, width=Inches(4.0))
-                    add_equation_caption(doc, caption_name)
+                    add_equation_caption(doc, caption_text)
                 else:
                     p_error = doc.add_paragraph()
                     p_error.add_run(f"[Equation image not found: {image_filename}]").italic = True
-                    add_equation_caption(doc, caption_name)
+                    add_equation_caption(doc, caption_text)
             else:
                 p_placeholder = doc.add_paragraph()
                 p_placeholder.add_run(f"[Equation content not available]").italic = True
-                add_equation_caption(doc, caption_name)
+                add_equation_caption(doc, caption_text)
 
-        elif element_type == "table_layout":
+        elif element_type in ("table_layout", "tab_layout"):
             export_data = element.get("export") or {}
             image_filename = export_data.get("image_file")
             
