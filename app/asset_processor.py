@@ -356,7 +356,8 @@ def integrate_assets_with_elements(
         return elements
     
     if not page_metadata:
-        print(f"    [Warning] No page_metadata - asset positioning will use raw fallback estimation.")
+        print(f"    [Warning] No page_metadata - cannot normalize coordinates")
+        print(f"              Asset positioning will fall back to raw coordinates")
         page_metadata = {}
     
     # --- STEP 1: Normalize all element bboxes ---
@@ -366,41 +367,45 @@ def integrate_assets_with_elements(
     # --- STEP 2: Group and sort assets by page and normalized top ---
     assets_by_page: Dict[int, List[Dict]] = {}
     for asset in assets:
-        page = int(asset.get('page_number', 9999))
-        assets_by_page.setdefault(page, []).append(asset)
+        page = asset.get('page_number', 9999)
+        if isinstance(page, str) and page.isdigit():
+            page = int(page)
+        
+        if page not in assets_by_page:
+            assets_by_page[page] = []
+        assets_by_page[page].append(asset)
     
-    # Sort by normalized top (fall back to raw top / 10000 if not normalized)
-    for page, page_assets in assets_by_page.items():
-        def get_asset_sort_key(a):
-            bbox = a.get('bbox') or {}
-            norm_top = bbox.get('norm_top')
-            return norm_top if norm_top is not None else (bbox.get('top', 9999) / 10000)
-            
-        page_assets.sort(key=get_asset_sort_key)
+    # Sort by normalized top (fall back to raw top if not normalized)
+    for page in assets_by_page:
+        assets_by_page[page].sort(
+            key=lambda a: a.get('bbox', {}).get('norm_top') if a.get('bbox', {}).get('norm_top') is not None else (a.get('bbox', {}).get('top', 9999) / 10000)
+        )
     
     # --- STEP 3: Interleave assets with text elements ---
     result = []
     current_page = None
     
     for element in elements:
-        elem_page = int(element.get('page_number', 9999))
+        elem_page = element.get('page_number', 9999)
+        if isinstance(elem_page, str) and elem_page.isdigit():
+            elem_page = int(elem_page)
         
         # Flush remaining assets from previous and skipped pages
         if current_page is not None and elem_page != current_page:
             pages_to_flush = [p for p in list(assets_by_page.keys()) if p <= current_page]
             for p in sorted(pages_to_flush):
-                result.extend(assets_by_page.pop(p, []))
+                result.extend(assets_by_page.pop(p))
         
         current_page = elem_page
         
-        # Get element's normalized top position
-        elem_bbox = element.get('bbox') or {}
+        # Get element's normalized top position (should already be normalized)
+        elem_bbox = element.get('bbox', {})
         elem_norm_top = elem_bbox.get('norm_top')
         
         # Fallback if not normalized
         if elem_norm_top is None:
-            _, page_height = get_page_ocr_dimensions(page_metadata, current_page)
-            if page_height:
+            page_width, page_height = get_page_ocr_dimensions(page_metadata, current_page)
+            if page_height and page_height > 0:
                 elem_norm_top = elem_bbox.get('top', 0) / page_height
             else:
                 elem_norm_top = elem_bbox.get('top', 0) / 10000
@@ -411,11 +416,11 @@ def integrate_assets_with_elements(
             
             while page_assets:
                 asset = page_assets[0]
-                asset_bbox = asset.get('bbox') or {}
-                asset_norm_top = asset_bbox.get('norm_top')
+                asset_norm_top = asset.get('bbox', {}).get('norm_top')
                 
                 if asset_norm_top is None:
-                    asset_norm_top = asset_bbox.get('top', 9999) / 10000
+                    asset_top = asset.get('bbox', {}).get('top', 9999)
+                    asset_norm_top = asset_top / 10000
                 
                 if asset_norm_top < elem_norm_top:
                     result.append(page_assets.pop(0))
