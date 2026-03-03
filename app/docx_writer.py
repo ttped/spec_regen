@@ -16,16 +16,6 @@ def configure_heading_styles(doc):
     
     This preserves ToC functionality since Word's Table of Contents
     is based on these built-in Heading styles.
-    
-    Note: We set bold here but NOT underline - underline is applied
-    selectively to just the title portion (not section number) in
-    add_section_heading().
-    
-    Font sizes by level:
-    - Heading 1: 14pt
-    - Heading 2: 13pt
-    - Heading 3: 12pt
-    - Heading 4+: 11pt
     """
     font_sizes = {
         'Heading 1': Pt(14),
@@ -40,62 +30,44 @@ def configure_heading_styles(doc):
     }
     
     for style_name, font_size in font_sizes.items():
-        try:
+        if style_name in doc.styles:
             style = doc.styles[style_name]
             
-            # Set font properties (bold but NOT underline - that's applied per-run)
             style.font.bold = True
             style.font.underline = False
             style.font.size = font_size
             style.font.name = 'Calibri'
+            style.font.color.rgb = None
             
-            # Set color to black (remove default blue color that some templates use)
-            style.font.color.rgb = None  # Inherit/auto color
-            
-            # Adjust paragraph spacing
             style.paragraph_format.space_before = Pt(12) if style_name == 'Heading 1' else Pt(8)
             style.paragraph_format.space_after = Pt(6)
-            
-        except KeyError:
-            # Style doesn't exist in this document
-            pass
 
 
 def add_section_heading(doc, section_number: str, topic: str, level: int = 1):
     """
-    Adds a section heading with the section number bold (not underlined)
-    and the topic bold + underlined.
-    
-    Uses Word's built-in Heading styles to preserve ToC functionality.
-    
-    Args:
-        doc: The document object
-        section_number: The section number (e.g., "3.1.1") - bold only
-        topic: The section title (e.g., "System Requirements") - bold + underlined
-        level: Heading level 1-9
+    Adds a section heading using built-in heading styles for ToC.
     """
-    # Determine the heading style name
     heading_level = max(1, min(level, 9))
     style_name = f'Heading {heading_level}'
     
-    # Create paragraph with heading style (for ToC compatibility)
+    # Safely fallback to Normal if the template lacks this heading style
+    if style_name not in doc.styles:
+        style_name = 'Normal'
+        
     p = doc.add_paragraph(style=style_name)
     
-    # Add section number run (bold, no underline)
     if section_number:
-        run_number = p.add_run(section_number)
+        run_number = p.add_run(str(section_number))
         run_number.bold = True
         run_number.underline = False
         
-        # Add space between number and topic
         if topic:
             run_space = p.add_run(" ")
             run_space.bold = True
             run_space.underline = False
-    
-    # Add topic run (bold + underlined)
+            
     if topic:
-        run_topic = p.add_run(topic)
+        run_topic = p.add_run(str(topic))
         run_topic.bold = True
         run_topic.underline = True
     
@@ -129,10 +101,9 @@ def add_docx_table_from_data(doc, table_data: Dict):
 
 
 def add_figure_caption(doc, text: str):
-    """
-    Adds a true Word caption for a FIGURE, which can be used for a Table of Figures.
-    """
-    p = doc.add_paragraph(style='Caption')
+    """Adds a true Word caption for a FIGURE."""
+    style_name = 'Caption' if 'Caption' in doc.styles else 'Normal'
+    p = doc.add_paragraph(style=style_name)
     p.add_run("Figure ")
 
     run = p.add_run()
@@ -153,15 +124,9 @@ def add_figure_caption(doc, text: str):
 
 
 def add_table_caption(doc, text: str):
-    """
-    Adds a true Word caption for a TABLE, which can be used for a Table of Tables.
-    
-    This uses the 'Table' SEQ field, which is separate from the 'Figure' SEQ field.
-    Word will track these separately, allowing you to generate both:
-    - Table of Figures (from Figure captions)
-    - Table of Tables (from Table captions)
-    """
-    p = doc.add_paragraph(style='Caption')
+    """Adds a true Word caption for a TABLE."""
+    style_name = 'Caption' if 'Caption' in doc.styles else 'Normal'
+    p = doc.add_paragraph(style=style_name)
     p.add_run("Table ")
 
     run = p.add_run()
@@ -182,12 +147,9 @@ def add_table_caption(doc, text: str):
 
 
 def add_equation_caption(doc, text: str):
-    """
-    Adds a true Word caption for an EQUATION, which can be used for a Table of Equations.
-    
-    Uses the 'Equation' SEQ field, tracked separately from Figure and Table.
-    """
-    p = doc.add_paragraph(style='Caption')
+    """Adds a true Word caption for an EQUATION."""
+    style_name = 'Caption' if 'Caption' in doc.styles else 'Normal'
+    p = doc.add_paragraph(style=style_name)
     p.add_run("Equation ")
 
     run = p.add_run()
@@ -387,23 +349,14 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
     """
     Creates a .docx file from document elements.
     Handles 'section', 'unassigned_text_block', 'figure', 'table', 'equation', and 'table_layout' element types.
-    
-    Tables can be rendered either as:
-    - Structured Word tables (if table_data is present from LLM OCR)
-    - Images with Table captions (if no table_data, allowing Table of Tables)
-    
-    Section headings use Word's built-in Heading styles (for ToC support)
-    but are configured to be bold + underlined.
     """
     doc = docx.Document()
     
-    # Configure base Normal style
     style = doc.styles['Normal']
     font = style.font
     font.name = 'Calibri'
     font.size = Pt(11)
     
-    # Configure Heading styles to be bold + underlined (preserves ToC functionality)
     configure_heading_styles(doc)
 
     if title_data:
@@ -425,7 +378,7 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
 
     info_p = header.add_paragraph()
     info_p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    info_p.add_run(part_number)
+    info_p.add_run(str(part_number))
     info_p.add_run(" | Page ")
     add_field(info_p, "PAGE")
 
@@ -440,20 +393,18 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
     footer_run.bold = True
     footer_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-
     for element in elements:
-        element_type = element.get("type")
+        # Strict normalization of element types
+        element_type = str(element.get("type") or "").strip().lower()
 
         if element_type == "section":
-            section_number = element.get("section_number", "")
-            topic = element.get("topic", "")
-            content = element.get("content", "")
+            section_number = str(element.get("section_number") or "")
+            topic = str(element.get("topic") or "")
+            content = str(element.get("content") or "")
             
-            # Calculate heading level from section number depth
             level = len(section_number.split('.')) if section_number else 1
-            heading_level = max(1, min(level, 9))  # Word supports Heading 1-9
+            heading_level = max(1, min(level, 9))
             
-            # Add heading with section number (bold) and topic (bold + underlined)
             if section_number or topic:
                 add_section_heading(doc, section_number, topic, level=heading_level)
             
@@ -461,13 +412,14 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
                 doc.add_paragraph(content)
         
         elif element_type == "unassigned_text_block":
-            content = element.get("content", "")
+            content = str(element.get("content") or "")
             if content:
                 doc.add_paragraph(content)
 
         elif element_type == "figure":
-            image_filename = element.get("export", {}).get("image_file")
-            caption_name = element.get('caption_text') or element.get('asset_id', 'Untitled Figure')
+            export_data = element.get("export") or {}
+            image_filename = export_data.get("image_file")
+            caption_name = str(element.get('caption_text') or element.get('asset_id') or 'Untitled Figure')
             
             if image_filename:
                 image_path = os.path.join(figures_image_folder, image_filename)
@@ -484,16 +436,16 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
                 add_figure_caption(doc, caption_name)
         
         elif element_type == "table":
-            caption_name = element.get('caption_text') or element.get('asset_id', 'Untitled Table')
+            export_data = element.get("export") or {}
+            image_filename = export_data.get("image_file")
+            caption_name = str(element.get('caption_text') or element.get('asset_id') or 'Untitled Table')
             table_data = element.get("table_data")
-            image_filename = element.get("export", {}).get("image_file")
 
-            if table_data:
-                # Render as structured Word table
+            # Fallback constraint: only process table_data if it is strictly a dictionary
+            if isinstance(table_data, dict):
                 add_docx_table_from_data(doc, table_data)
                 add_table_caption(doc, caption_name)
             elif image_filename:
-                # Render as image with Table caption (for Table of Tables)
                 image_path = os.path.join(figures_image_folder, image_filename)
                 if os.path.exists(image_path):
                     doc.add_picture(image_path, width=Inches(6.0))
@@ -503,14 +455,14 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
                     p_error.add_run(f"[Table image not found: {image_filename}]").italic = True
                     add_table_caption(doc, caption_name)
             else:
-                # No table_data and no image - just add caption as placeholder
                 p_placeholder = doc.add_paragraph()
                 p_placeholder.add_run(f"[Table content not available]").italic = True
                 add_table_caption(doc, caption_name)
 
         elif element_type == "equation":
-            image_filename = element.get("export", {}).get("image_file")
-            caption_name = element.get('caption_text') or element.get('asset_id', 'Untitled Equation')
+            export_data = element.get("export") or {}
+            image_filename = export_data.get("image_file")
+            caption_name = str(element.get('caption_text') or element.get('asset_id') or 'Untitled Equation')
             
             if image_filename:
                 image_path = os.path.join(figures_image_folder, image_filename)
@@ -527,9 +479,8 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
                 add_equation_caption(doc, caption_name)
 
         elif element_type == "table_layout":
-            # Layout tables are uncaptioned - no SEQ field, won't appear in TOC.
-            # Included for spatial context only.
-            image_filename = element.get("export", {}).get("image_file")
+            export_data = element.get("export") or {}
+            image_filename = export_data.get("image_file")
             
             if image_filename:
                 image_path = os.path.join(figures_image_folder, image_filename)
@@ -540,7 +491,6 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
                     p_error.add_run(f"[Layout table image not found: {image_filename}]").italic = True
 
     doc.save(output_filename)
-
 
 def run_docx_creation(input_path: str, output_path: str, figures_base_path: str, doc_stem: str, title_data_path: str):
     """

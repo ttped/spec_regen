@@ -24,6 +24,7 @@ import json
 from typing import List, Dict, Tuple, Optional, Any
 
 
+
 def load_asset_metadata(json_path: str) -> Optional[Dict]:
     """Load and parse a single asset metadata JSON file."""
     try:
