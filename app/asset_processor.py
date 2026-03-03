@@ -204,13 +204,43 @@ def normalize_text_bbox(bbox: Dict, page_width: float, page_height: float) -> Di
     return result
 
 
+def resolve_asset_directory(exports_dir: str, doc_stem: str) -> Optional[str]:
+    """
+    Find the actual asset directory for a doc_stem, handling naming mismatches
+    between OCR stems (may contain spaces) and YOLO export dirs (spaces → underscores).
+    
+    Returns the resolved directory path, or None if no match is found.
+    """
+    # Exact match first
+    exact_path = os.path.join(exports_dir, doc_stem)
+    if os.path.isdir(exact_path):
+        return exact_path
+    
+    if not os.path.isdir(exports_dir):
+        return None
+    
+    # Normalize for comparison: collapse both spaces and underscores
+    def normalize(name: str) -> str:
+        return name.replace(" ", "_").replace("-", "_").lower()
+    
+    target = normalize(doc_stem)
+    
+    for entry in os.listdir(exports_dir):
+        entry_path = os.path.join(exports_dir, entry)
+        if os.path.isdir(entry_path) and normalize(entry) == target:
+            print(f"    [Resolved] Stem '{doc_stem}' matched directory '{entry}'")
+            return entry_path
+    
+    return None
+
+
 def load_all_assets(exports_dir: str, doc_stem: str) -> List[Dict]:
     """Load all figure/table assets for a document."""
     assets = []
-    asset_dir = os.path.join(exports_dir, doc_stem)
+    asset_dir = resolve_asset_directory(exports_dir, doc_stem)
     
-    if not os.path.isdir(asset_dir):
-        print(f"    [Note] Asset directory not found: {asset_dir}")
+    if not asset_dir:
+        print(f"    [Note] Asset directory not found for stem '{doc_stem}' in {exports_dir}")
         return assets
     
     print(f"    Scanning for assets in: {asset_dir}")

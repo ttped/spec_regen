@@ -517,7 +517,11 @@ def run_docx_creation(input_path: str, output_path: str, figures_base_path: str,
     else:
         print(f"  - Warning: Title data file not found at {title_data_path}. Proceeding without a title page.")
 
-    figure_image_folder = os.path.join(figures_base_path, doc_stem)
+    from asset_processor import resolve_asset_directory
+    figure_image_folder = resolve_asset_directory(figures_base_path, doc_stem)
+    if not figure_image_folder:
+        print(f"  - [Warning] No image folder found for '{doc_stem}' in {figures_base_path}")
+        figure_image_folder = os.path.join(figures_base_path, doc_stem)
 
     create_docx_from_elements(elements, output_path, figure_image_folder, doc_stem, title_data)
     print(f"  - DOCX document successfully created at {output_path}")
