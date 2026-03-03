@@ -8,6 +8,7 @@ from docx.shared import Pt, Inches
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.section import WD_SECTION, WD_ORIENT
 
 
 def configure_heading_styles(doc):
@@ -73,6 +74,30 @@ def add_excel_table_to_docx(doc, table_data: dict):
         for col_idx, cell_value in enumerate(row_data):
             cell_text = str(cell_value) if cell_value is not None else ""
             table.cell(row_idx, col_idx).text = cell_text
+
+def add_isolated_landscape_table(doc, table_data: dict):
+    """
+    Isolates a table on a new landscape page, then reverts the document to portrait.
+    Uses standard Excel-based table writing instead of complex schema.
+    """
+    landscape_section = doc.add_section(WD_SECTION.NEW_PAGE)
+    landscape_section.orientation = WD_ORIENT.LANDSCAPE
+    
+    landscape_section.page_width, landscape_section.page_height = (
+        landscape_section.page_height, 
+        landscape_section.page_width
+    )
+    
+    # Call the new excel table renderer directly
+    add_excel_table_to_docx(doc, table_data)
+    
+    portrait_section = doc.add_section(WD_SECTION.NEW_PAGE)
+    portrait_section.orientation = WD_ORIENT.PORTRAIT
+    
+    portrait_section.page_width, portrait_section.page_height = (
+        portrait_section.page_height, 
+        portrait_section.page_width
+    )
 
 
 def add_section_heading(doc, section_number: str, topic: str, level: int = 1):

@@ -1,6 +1,7 @@
 import openpyxl
 import docx
 from docx_writer import add_excel_table_to_docx
+from docx_writer import add_isolated_landscape_table, add_excel_table_to_docx
 
 def read_excel_with_metadata(file_path: str) -> dict:
     """
@@ -11,7 +12,6 @@ def read_excel_with_metadata(file_path: str) -> dict:
 
     table_data = {"columns": [], "rows": []}
 
-    # Extract column widths
     for col in range(1, ws.max_column + 1):
         col_letter = openpyxl.utils.get_column_letter(col)
         width = ws.column_dimensions[col_letter].width
@@ -21,7 +21,6 @@ def read_excel_with_metadata(file_path: str) -> dict:
             
         table_data["columns"].append({"width": width})
 
-    # Extract row values
     for row in ws.iter_rows(values_only=True):
         table_data["rows"].append(list(row))
 
@@ -29,12 +28,20 @@ def read_excel_with_metadata(file_path: str) -> dict:
 
 def export_excel_to_word(excel_path: str, word_output_path: str):
     """
-    Orchestrates reading Excel data and writing it to a new Word document.
+    Reads Excel data and writes it to Word, applying landscape for wide tables.
     """
     table_data = read_excel_with_metadata(excel_path)
     
     doc = docx.Document()
-    add_excel_table_to_docx(doc, table_data)
+    
+    num_columns = len(table_data.get("columns", []))
+    
+    # Route to landscape if the table is exceptionally wide
+    if num_columns > 7:
+        add_isolated_landscape_table(doc, table_data)
+    else:
+        add_excel_table_to_docx(doc, table_data)
+        
     doc.save(word_output_path)
     print(f"Successfully converted {excel_path} to {word_output_path}")
 
