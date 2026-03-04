@@ -19,9 +19,6 @@ Filenames match the YOLO crop image stems.
 import os
 import json
 import re
-import subprocess
-import tempfile
-from pathlib import Path
 from typing import List, Dict, Optional
 
 
@@ -135,145 +132,145 @@ def find_iris_json(image_stem: str, index: Dict[str, str]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# IRIS JSON → Excel conversion (calls reconstruct_to_df as subprocess)
-# ---------------------------------------------------------------------------
-
-def convert_iris_json_to_excel(
-    iris_json_path: str,
-    output_dir: str,
-    reconstruct_script: str = "reconstruct_to_df.py",
-) -> Optional[str]:
-    """
-    Run reconstruct_to_df.py in single-file mode to produce an Excel file.
-
-    Returns the path to the generated .xlsx file, or None on failure.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-
-    stem = Path(iris_json_path).stem
-    # reconstruct_to_df outputs into: output_dir/<doc_name>/excel/<stem>.xlsx
-    # We need to find it after the script runs.
-
-    try:
-        result = subprocess.run(
-            [
-                "python", reconstruct_script,
-                iris_json_path,
-                "--formats", "excel",
-                "--out-dir", output_dir,
-                "--no-meta-sheet",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if result.returncode != 0:
-            print(f"    [Warning] reconstruct_to_df failed for {stem}: {result.stderr[:300]}")
-            return None
-    except FileNotFoundError:
-        print(f"    [Warning] reconstruct_to_df.py not found at: {reconstruct_script}")
-        return None
-    except subprocess.TimeoutExpired:
-        print(f"    [Warning] reconstruct_to_df timed out for {stem}")
-        return None
-
-    # Find the generated Excel file
-    # The script creates: output_dir/<doc_name>/excel/<table_stem>.xlsx
-    # Since we're in single-file mode, search for it
-    for root, _dirs, files in os.walk(output_dir):
-        for f in files:
-            if f.endswith(".xlsx") and _normalize_stem(Path(f).stem) == _normalize_stem(stem):
-                return os.path.join(root, f)
-
-    print(f"    [Warning] Excel output not found after reconstruct_to_df for {stem}")
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Excel → table_data conversion
-# ---------------------------------------------------------------------------
-
-def read_excel_to_table_data(excel_path: str) -> Optional[Dict]:
-    """
-    Read an Excel file and convert it to the table_data format expected by
-    complex_table_schema / docx_writer.
-
-    Returns legacy-compatible format:
-        {"columns": ["Header1", "Header2"], "rows": [["val1", "val2"], ...]}
-
-    The first row of the Excel sheet is treated as the header row.
-    Returns None if the file is empty or unreadable.
-    """
-    import openpyxl
-
-    wb = openpyxl.load_workbook(excel_path, data_only=True)
-    ws = wb.active
-
-    all_rows = []
-    for row in ws.iter_rows(values_only=True):
-        all_rows.append([str(v) if v is not None else "" for v in row])
-
-    if not all_rows:
-        return None
-
-    # First row = headers
-    headers = all_rows[0]
-    data_rows = all_rows[1:]
-
-    if not headers or all(h == "" for h in headers):
-        return None
-
-    # Collect column width metadata for landscape decisions
-    col_widths = []
-    for col in range(1, ws.max_column + 1):
-        col_letter = openpyxl.utils.get_column_letter(col)
-        width = ws.column_dimensions[col_letter].width
-        if width is None:
-            width = 8.43
-        col_widths.append(width)
-
-    return {
-        "columns": headers,
-        "rows": data_rows,
-        "_excel_col_widths": col_widths,
-        "_num_columns": len(headers),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Direct IRIS JSON → table_data (skip Excel round-trip)
+# IRIS JSON → complex_table_schema rich format (direct conversion, no Excel)
 # ---------------------------------------------------------------------------
 
 def read_iris_json_to_table_data(iris_json_path: str) -> Optional[Dict]:
     """
-    Attempt to read an IRIS JSON directly and convert to table_data format,
-    bypassing the Excel round-trip when reconstruct_to_df is unavailable.
+    Convert an IRIS table extraction JSON directly into the rich format
+    expected by complex_table_schema.
 
-    This is a fallback — the Excel path is preferred because reconstruct_to_df
-    handles normalization, outlier cleanup, and header ontology mapping.
+    IRIS JSON structure:
+        {
+            "n_rows": int, "n_cols": int,
+            "header_rows": [0, 1, ...],
+            "column_alignment": {"col_idx": "left"|"right"|"center", ...},
+            "rows": [
+                {
+                    "row_index": int,
+                    "cells": [
+                        {
+                            "row": int, "col": int,
+                            "row_span": int, "col_span": int,
+                            "text": str,
+                            "confidence": float,
+                            "alignment": str
+                        }, ...
+                    ]
+                }, ...
+            ],
+            "table_title": str (optional),
+            "context": {"header_rows": int, ...} (optional)
+        }
+
+    Returns complex_table_schema rich format:
+        {
+            "columns": [{"name": ""}, ...],
+            "header_rows": int,
+            "rows": [
+                {"is_header": bool, "cells": [
+                    {"text": str, "colspan": int, "rowspan": int,
+                     "halign": str, "bold": bool} | null, ...
+                ]}, ...
+            ]
+        }
     """
     with open(iris_json_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
 
-    # IRIS JSON structure varies, but commonly has a grid or cells structure.
-    # This fallback handles the most common case where we can extract
-    # columns and rows directly.
+    n_rows = data.get("n_rows", 0)
+    n_cols = data.get("n_cols", 0)
+    iris_rows = data.get("rows", [])
 
-    # If the JSON already has columns/rows (pre-processed), use directly
-    if isinstance(data, dict) and "columns" in data and "rows" in data:
-        columns = data["columns"]
-        rows = data["rows"]
-        if isinstance(columns, list) and isinstance(rows, list):
-            # Ensure columns are strings
-            if columns and isinstance(columns[0], dict):
-                columns = [c.get("name", "") for c in columns]
-            return {
-                "columns": [str(c) for c in columns],
-                "rows": [[str(v) if v is not None else "" for v in row] for row in rows],
-                "_num_columns": len(columns),
+    if n_rows == 0 or n_cols == 0 or not iris_rows:
+        return None
+
+    # Determine which rows are headers
+    header_row_indices = set(data.get("header_rows", []))
+    # Also check context block
+    context = data.get("context", {})
+    context_header_count = context.get("header_rows", 0)
+
+    # Column alignment defaults
+    col_alignment = data.get("column_alignment", {})
+
+    # Build column definitions (IRIS doesn't provide column names directly,
+    # but complex_table_schema doesn't require them for rendering)
+    columns = [{"name": ""} for _ in range(n_cols)]
+
+    # Build a grid to track which cells are covered by spans
+    covered = [[False] * n_cols for _ in range(n_rows)]
+
+    # Sort IRIS rows by row_index
+    iris_rows_sorted = sorted(iris_rows, key=lambda r: r.get("row_index", 0))
+
+    # Convert each IRIS row to complex_table_schema format
+    output_rows = []
+
+    for iris_row in iris_rows_sorted:
+        row_idx = iris_row.get("row_index", 0)
+        is_header = row_idx in header_row_indices
+
+        # Build cell list for this row — initialize all positions as None (covered)
+        row_cells = [None] * n_cols
+
+        for cell_data in iris_row.get("cells", []):
+            col = cell_data.get("col", 0)
+            row_span = cell_data.get("row_span", 1)
+            col_span = cell_data.get("col_span", 1)
+            text = cell_data.get("text", "")
+            alignment = cell_data.get("alignment", "left")
+            confidence = cell_data.get("confidence", 0)
+
+            # Map IRIS alignment to complex_table_schema halign
+            halign = alignment if alignment in ("left", "center", "right") else "left"
+
+            # Build the cell dict
+            cell = {
+                "text": str(text) if text is not None else "",
+                "halign": halign,
             }
 
-    return None
+            if col_span > 1:
+                cell["colspan"] = col_span
+            if row_span > 1:
+                cell["rowspan"] = row_span
+
+            # Bold headers
+            if is_header:
+                cell["bold"] = True
+
+            # Place in grid
+            if 0 <= col < n_cols:
+                row_cells[col] = cell
+
+            # Mark spanned cells as covered
+            for dr in range(row_span):
+                for dc in range(col_span):
+                    r, c = row_idx + dr, col + dc
+                    if (r, c) != (row_idx, col) and 0 <= r < n_rows and 0 <= c < n_cols:
+                        covered[r][c] = True
+
+        output_row = {"cells": row_cells}
+        if is_header:
+            output_row["is_header"] = True
+
+        output_rows.append(output_row)
+
+    # Determine header_rows count for the schema
+    num_header_rows = max(context_header_count, len(header_row_indices))
+
+    result = {
+        "columns": columns,
+        "rows": output_rows,
+        "header_rows": num_header_rows,
+        "_num_columns": n_cols,
+        "_iris_confidence": data.get("confidence"),
+        "_iris_structure_confidence": data.get("structure_confidence"),
+        "_iris_table_title": data.get("table_title"),
+    }
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -283,8 +280,6 @@ def read_iris_json_to_table_data(iris_json_path: str) -> Optional[Dict]:
 def process_table_element(
     element: Dict,
     stem_index: Dict[str, str],
-    excel_output_dir: str,
-    reconstruct_script: str,
 ) -> Dict:
     """
     Process a single table element: look up IRIS JSON, convert to table_data.
@@ -305,30 +300,21 @@ def process_table_element(
 
     print(f"    [IRIS] Found table JSON for: {image_stem}")
 
-    # Primary path: JSON → Excel → table_data
-    excel_path = convert_iris_json_to_excel(
-        iris_json_path, excel_output_dir, reconstruct_script
-    )
-
-    table_data = None
-    if excel_path:
-        table_data = read_excel_to_table_data(excel_path)
-        if table_data:
-            print(f"    [IRIS] Converted via Excel: {table_data['_num_columns']} columns, {len(table_data['rows'])} rows")
-
-    # Fallback: read IRIS JSON directly
-    if not table_data:
-        print(f"    [IRIS] Excel path failed, attempting direct JSON read")
-        table_data = read_iris_json_to_table_data(iris_json_path)
-        if table_data:
-            print(f"    [IRIS] Direct read: {table_data['_num_columns']} columns, {len(table_data['rows'])} rows")
+    table_data = read_iris_json_to_table_data(iris_json_path)
 
     if table_data:
+        num_cols = table_data.get("_num_columns", 0)
+        num_rows = len(table_data.get("rows", []))
+        confidence = table_data.get("_iris_confidence", "?")
+        title = table_data.get("_iris_table_title", "")
+        print(f"    [IRIS] Converted: {num_cols} columns, {num_rows} rows, confidence={confidence}")
+        if title:
+            print(f"    [IRIS] Table title: {title}")
+
         element["table_data"] = table_data
         element["_table_source"] = "iris"
 
         # Flag wide tables for landscape rendering
-        num_cols = table_data.get("_num_columns", 0)
         if num_cols > 7:
             element["_render_landscape"] = True
     else:
@@ -346,17 +332,19 @@ def run_iris_table_processing(
     output_path: str,
     table_jsons_dir: str,
     doc_stem: str,
-    reconstruct_script: str = "reconstruct_to_df.py",
 ):
     """
     Process all table elements in a document's element stream using IRIS JSONs.
+
+    For each table element, looks up the corresponding IRIS JSON by matching
+    the YOLO crop image stem. If found, converts directly to complex_table_schema
+    rich format. If not found, the element retains its image for fallback rendering.
 
     Args:
         input_path: Path to the _with_assets.json file
         output_path: Path to write the _with_tables.json file
         table_jsons_dir: Flat directory containing IRIS table JSONs
-        doc_stem: Document stem (used for Excel output subdirectory)
-        reconstruct_script: Path to reconstruct_to_df.py
+        doc_stem: Document stem (for logging)
     """
     print(f"  - Reading elements: {input_path}")
 
@@ -380,11 +368,6 @@ def run_iris_table_processing(
     stem_count = len(stem_index.get("_stem", {}))
     print(f"  - IRIS table JSONs indexed: {stem_count} files ({canonical_count} with canonical keys) in {table_jsons_dir}")
 
-    # Excel intermediate output goes alongside results
-    excel_output_dir = os.path.join(
-        os.path.dirname(output_path) or '.', "iris_excel", doc_stem
-    )
-
     # Process each table element
     tables_found = 0
     tables_matched = 0
@@ -396,9 +379,7 @@ def run_iris_table_processing(
         tables_found += 1
         had_data_before = element.get("table_data") is not None
 
-        process_table_element(
-            element, stem_index, excel_output_dir, reconstruct_script
-        )
+        process_table_element(element, stem_index)
 
         if not had_data_before and element.get("table_data") is not None:
             tables_matched += 1

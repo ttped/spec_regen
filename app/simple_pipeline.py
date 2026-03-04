@@ -204,7 +204,6 @@ class Config:
     
     # IRIS table OCR
     table_jsons_dir = DEFAULT_TABLE_JSONS_DIR
-    reconstruct_script = "reconstruct_to_df.py"
     
     # YOLO settings
     use_yolo = True           # Use YOLO for asset extraction
@@ -412,7 +411,6 @@ def main():
                 tables_out,
                 args.table_jsons_dir,
                 figures_stem,
-                reconstruct_script=args.reconstruct_script,
             )
 
         # STEP 7: WRITE
@@ -509,8 +507,6 @@ if __name__ == '__main__':
                        help="Force re-run YOLO even if exports exist")
     parser.add_argument('--table-jsons-dir', type=str, default=None,
                        help="Directory containing IRIS table OCR JSONs")
-    parser.add_argument('--reconstruct-script', type=str, default=None,
-                       help="Path to reconstruct_to_df.py")
     
     args = parser.parse_args()
     
@@ -521,7 +517,5 @@ if __name__ == '__main__':
     Config.skip_yolo_if_exists = not args.force_yolo
     if args.table_jsons_dir:
         Config.table_jsons_dir = args.table_jsons_dir
-    if args.reconstruct_script:
-        Config.reconstruct_script = args.reconstruct_script
     
     main()
