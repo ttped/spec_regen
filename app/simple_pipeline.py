@@ -295,6 +295,15 @@ def main():
         print(f"{stem}")
         print(f"{'=' * 60}")
         
+        # Resolve the actual YOLO exports subdirectory for this stem.
+        # Handles space/underscore naming mismatches between OCR filenames and YOLO dir names.
+        from asset_processor import resolve_asset_directory
+        doc_asset_dir = resolve_asset_directory(figures_dir, stem)
+        if doc_asset_dir:
+            figures_stem = os.path.basename(doc_asset_dir)
+        else:
+            figures_stem = stem
+        
         raw_input = os.path.join(args.raw_ocr_dir, f"{stem}.json")
         classify_out = os.path.join(args.results_dir, f"{stem}_classification.json")
         title_out = os.path.join(args.results_dir, f"{stem}_title.json")
@@ -344,7 +353,7 @@ def main():
                 organized_out, 
                 content_start_page=content_start,
                 yolo_exports_dir=figures_dir,  # Pass YOLO exports for overlap filtering
-                doc_stem=stem
+                doc_stem=figures_stem
             )
             if not os.path.exists(organized_out):
                 print(f"  [FAIL] Structure processing produced no output: {organized_out}")
@@ -384,7 +393,7 @@ def main():
                 print(f"         Expected from step 4 (ml_filter) or step 3 (structure).")
                 print(f"         Skipping remaining steps for {stem}.")
                 continue
-            run_asset_integration(input_file, with_assets_out, figures_dir, stem, positioning_mode="bbox")
+            run_asset_integration(input_file, with_assets_out, figures_dir, figures_stem, positioning_mode="bbox")
             if not os.path.exists(with_assets_out):
                 print(f"  [FAIL] Asset integration produced no output: {with_assets_out}")
                 print(f"         Skipping remaining steps for {stem}.")
@@ -422,7 +431,7 @@ def main():
                 print(f"         Neither {tables_out} nor {with_assets_out} exist.")
                 print(f"         Steps 5-6 must complete successfully first.")
                 continue
-            run_docx_creation(input_file, final_docx, figures_dir, stem, title_out)
+            run_docx_creation(input_file, final_docx, figures_dir, figures_stem, title_out)
 
         # STEP 8: VALIDATE
         if args.step in ["validate", "all"]:
