@@ -19,6 +19,7 @@ Filenames match the YOLO crop image stems.
 import os
 import json
 import re
+from pathlib import Path
 from typing import List, Dict, Optional
 
 
@@ -132,7 +133,101 @@ def find_iris_json(image_stem: str, index: Dict[str, str]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# IRIS JSON → complex_table_schema rich format (direct conversion, no Excel)
+# IRIS JSON → Excel via reconstruct_to_df (primary path)
+#
+# reconstruct_to_df.py lives in app/ alongside this module.
+# We import _process_json directly — no subprocess needed.
+# ---------------------------------------------------------------------------
+
+def convert_iris_json_to_excel(
+    iris_json_path: str,
+    output_dir: str,
+) -> Optional[str]:
+    """
+    Call reconstruct_to_df._process_json to produce an Excel file from an IRIS JSON.
+
+    Returns the path to the generated .xlsx file, or None on failure.
+    """
+    try:
+        from reconstruct_to_df import _process_json
+    except ImportError:
+        print("    [Warning] Could not import reconstruct_to_df — is it in app/?")
+        return None
+
+    os.makedirs(output_dir, exist_ok=True)
+    json_path = Path(iris_json_path)
+    stem = json_path.stem
+
+    try:
+        _process_json(
+            json_path=json_path,
+            out_root=Path(output_dir),
+            write_csv=False,
+            write_excel=True,
+            write_pickle=False,
+            write_meta_json=False,
+            print_meta=False,
+            add_meta_sheet=False,
+            header_ontology=None,
+            show_preview=False,
+            preview_rows=None,
+            preview_cols=None,
+            save_preview=None,
+        )
+    except Exception as e:
+        print(f"    [Warning] reconstruct_to_df failed for {stem}: {e}")
+        return None
+
+    # Find the generated Excel file
+    # _process_json writes to: output_dir/<doc_name>/excel/<stem>.xlsx
+    normalized = _normalize_stem(stem)
+    for root, _dirs, files in os.walk(output_dir):
+        for f in files:
+            if f.endswith(".xlsx") and _normalize_stem(Path(f).stem) == normalized:
+                return os.path.join(root, f)
+
+    print(f"    [Warning] Excel output not found after reconstruct_to_df for {stem}")
+    return None
+
+
+def read_excel_to_table_data(excel_path: str) -> Optional[Dict]:
+    """
+    Read an Excel file produced by reconstruct_to_df and convert to the
+    table_data format expected by complex_table_schema / docx_writer.
+
+    Returns legacy-compatible format:
+        {"columns": ["Header1", "Header2"], "rows": [["val1", "val2"], ...]}
+
+    The first row of the Excel sheet is treated as the header row.
+    """
+    import openpyxl
+
+    wb = openpyxl.load_workbook(excel_path, data_only=True)
+    ws = wb.active
+
+    all_rows = []
+    for row in ws.iter_rows(values_only=True):
+        all_rows.append([str(v) if v is not None else "" for v in row])
+
+    if not all_rows:
+        return None
+
+    # First row = headers
+    headers = all_rows[0]
+    data_rows = all_rows[1:]
+
+    if not headers or all(h == "" for h in headers):
+        return None
+
+    return {
+        "columns": headers,
+        "rows": data_rows,
+        "_num_columns": len(headers),
+    }
+
+
+# ---------------------------------------------------------------------------
+# IRIS JSON → complex_table_schema rich format (fallback if Excel path fails)
 # ---------------------------------------------------------------------------
 
 def read_iris_json_to_table_data(iris_json_path: str) -> Optional[Dict]:
@@ -280,9 +375,13 @@ def read_iris_json_to_table_data(iris_json_path: str) -> Optional[Dict]:
 def process_table_element(
     element: Dict,
     stem_index: Dict[str, str],
+    excel_output_dir: str,
 ) -> Dict:
     """
     Process a single table element: look up IRIS JSON, convert to table_data.
+
+    Primary path: IRIS JSON → reconstruct_to_df → Excel → table_data
+    Fallback: IRIS JSON → direct conversion to complex_table_schema format
 
     Modifies the element in place and returns it.
     """
@@ -300,21 +399,30 @@ def process_table_element(
 
     print(f"    [IRIS] Found table JSON for: {image_stem}")
 
-    table_data = read_iris_json_to_table_data(iris_json_path)
+    # Primary path: JSON → Excel → table_data
+    table_data = None
+    excel_path = convert_iris_json_to_excel(iris_json_path, excel_output_dir)
+
+    if excel_path:
+        table_data = read_excel_to_table_data(excel_path)
+        if table_data:
+            print(f"    [IRIS] Converted via Excel: {table_data['_num_columns']} columns, {len(table_data['rows'])} rows")
+
+    # Fallback: direct JSON conversion
+    if not table_data:
+        print(f"    [IRIS] Excel path failed, attempting direct JSON conversion")
+        table_data = read_iris_json_to_table_data(iris_json_path)
+        if table_data:
+            num_cols = table_data.get("_num_columns", 0)
+            num_rows = len(table_data.get("rows", []))
+            print(f"    [IRIS] Direct conversion: {num_cols} columns, {num_rows} rows")
 
     if table_data:
-        num_cols = table_data.get("_num_columns", 0)
-        num_rows = len(table_data.get("rows", []))
-        confidence = table_data.get("_iris_confidence", "?")
-        title = table_data.get("_iris_table_title", "")
-        print(f"    [IRIS] Converted: {num_cols} columns, {num_rows} rows, confidence={confidence}")
-        if title:
-            print(f"    [IRIS] Table title: {title}")
-
         element["table_data"] = table_data
         element["_table_source"] = "iris"
 
         # Flag wide tables for landscape rendering
+        num_cols = table_data.get("_num_columns", 0)
         if num_cols > 7:
             element["_render_landscape"] = True
     else:
@@ -368,6 +476,11 @@ def run_iris_table_processing(
     stem_count = len(stem_index.get("_stem", {}))
     print(f"  - IRIS table JSONs indexed: {stem_count} files ({canonical_count} with canonical keys) in {table_jsons_dir}")
 
+    # Excel intermediate output goes alongside results
+    excel_output_dir = os.path.join(
+        os.path.dirname(output_path) or '.', "iris_excel", doc_stem
+    )
+
     # Process each table element
     tables_found = 0
     tables_matched = 0
@@ -379,7 +492,7 @@ def run_iris_table_processing(
         tables_found += 1
         had_data_before = element.get("table_data") is not None
 
-        process_table_element(element, stem_index)
+        process_table_element(element, stem_index, excel_output_dir)
 
         if not had_data_before and element.get("table_data") is not None:
             tables_matched += 1
