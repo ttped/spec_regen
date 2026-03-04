@@ -18,6 +18,7 @@ Filenames match the YOLO crop image stems.
 
 import os
 import json
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -25,39 +26,110 @@ from typing import List, Dict, Optional
 
 
 # ---------------------------------------------------------------------------
-# IRIS JSON lookup (with fuzzy stem matching for space/underscore mismatches)
+# IRIS JSON lookup — bridges two different naming conventions:
+#   YOLO crops:  {doc}_tab_p{page}_{id}.jpg     e.g. file_name_tab_p045_003.jpg
+#   IRIS JSONs:  {doc}_page_{page}tab_{id}.json  e.g. file_name_page_045tab_003.json
+#
+# Both are decomposed into a canonical key (doc, page, table_id) for matching.
+# Also handles exact stem matches and space/underscore normalization.
 # ---------------------------------------------------------------------------
+
+# Pattern for YOLO crop names: {doc}_tab_p{page}_{id}
+_YOLO_PATTERN = re.compile(
+    r'^(.+?)_tab_p(\d+)_(\d+)$',
+    re.IGNORECASE,
+)
+
+# Pattern for IRIS JSON names: {doc}_page{page}_tab_{id}
+_IRIS_PATTERN = re.compile(
+    r'^(.+?)_page_?(\d+)_?tab_(\d+)$',
+    re.IGNORECASE,
+)
+
 
 def _normalize_stem(name: str) -> str:
     """Collapse spaces, underscores, hyphens and case for fuzzy matching."""
     return name.replace(" ", "_").replace("-", "_").lower()
 
 
+def _extract_canonical_key(stem: str) -> Optional[tuple]:
+    """
+    Extract (normalized_doc, page_int, table_id_int) from either naming convention.
+    Returns None if the stem doesn't match any known pattern.
+    """
+    normalized = _normalize_stem(stem)
+
+    # Try YOLO pattern: {doc}_tab_p{page}_{id}
+    m = _YOLO_PATTERN.match(normalized)
+    if m:
+        doc = m.group(1)
+        page = int(m.group(2))
+        table_id = int(m.group(3))
+        return (doc, page, table_id)
+
+    # Try IRIS pattern: {doc}_page_{page}tab_{id}
+    m = _IRIS_PATTERN.match(normalized)
+    if m:
+        doc = m.group(1)
+        page = int(m.group(2))
+        table_id = int(m.group(3))
+        return (doc, page, table_id)
+
+    return None
+
+
 def _build_stem_index(table_jsons_dir: str) -> Dict[str, str]:
     """
-    Scan the flat table_jsons directory once and build a normalized-stem → filepath map.
-    This avoids repeated os.listdir calls per table element.
+    Scan the flat table_jsons directory and build lookup maps.
+
+    Builds two indexes for maximum matching coverage:
+      1. canonical key (doc, page, table_id) → filepath
+      2. normalized stem → filepath  (fallback for exact-ish matches)
     """
-    index = {}
+    canonical_index = {}
+    stem_index = {}
+
     if not os.path.isdir(table_jsons_dir):
-        return index
+        return {}
 
     for filename in os.listdir(table_jsons_dir):
         if not filename.endswith(".json"):
             continue
+
+        filepath = os.path.join(table_jsons_dir, filename)
         stem = os.path.splitext(filename)[0]
-        normalized = _normalize_stem(stem)
-        index[normalized] = os.path.join(table_jsons_dir, filename)
 
-    return index
+        # Canonical key index
+        key = _extract_canonical_key(stem)
+        if key:
+            canonical_index[key] = filepath
+
+        # Normalized stem index (fallback)
+        stem_index[_normalize_stem(stem)] = filepath
+
+    # Store both indexes in a single dict with a sentinel key
+    return {
+        "_canonical": canonical_index,
+        "_stem": stem_index,
+    }
 
 
-def find_iris_json(image_stem: str, stem_index: Dict[str, str]) -> Optional[str]:
+def find_iris_json(image_stem: str, index: Dict[str, str]) -> Optional[str]:
     """
     Look up an IRIS JSON path for a given YOLO crop image stem.
 
-    Tries exact normalized match. Returns the file path or None.
+    Tries canonical key match first (handles different naming conventions),
+    then falls back to normalized stem match.
     """
+    canonical_index = index.get("_canonical", {})
+    stem_index = index.get("_stem", {})
+
+    # Try canonical key match (bridges YOLO ↔ IRIS naming)
+    key = _extract_canonical_key(image_stem)
+    if key and key in canonical_index:
+        return canonical_index[key]
+
+    # Fallback: direct normalized stem match
     normalized = _normalize_stem(image_stem)
     return stem_index.get(normalized)
 
@@ -304,7 +376,9 @@ def run_iris_table_processing(
 
     # Build the IRIS JSON lookup index once
     stem_index = _build_stem_index(table_jsons_dir)
-    print(f"  - IRIS table JSONs indexed: {len(stem_index)} files in {table_jsons_dir}")
+    canonical_count = len(stem_index.get("_canonical", {}))
+    stem_count = len(stem_index.get("_stem", {}))
+    print(f"  - IRIS table JSONs indexed: {stem_count} files ({canonical_count} with canonical keys) in {table_jsons_dir}")
 
     # Excel intermediate output goes alongside results
     excel_output_dir = os.path.join(
