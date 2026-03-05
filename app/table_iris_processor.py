@@ -270,6 +270,43 @@ def read_iris_json_to_table_data(iris_json_path: str) -> Optional[Dict]:
     }
 
 
+def _extract_caption_from_iris_json(json_path: str) -> str:
+    """
+    Extract a table caption/title from an IRIS metadata JSON.
+    
+    Checks (in priority order):
+        1. "table_title" field
+        2. "context" -> "title" -> "title" field
+        3. "context" -> "caption" field
+    
+    Returns empty string if no caption found.
+    """
+    with open(json_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    # Direct table_title
+    title = data.get("table_title", "")
+    if title and str(title).strip():
+        return str(title).strip()
+
+    # Context block
+    context = data.get("context", {})
+    if context:
+        # context.title.title
+        title_block = context.get("title", {})
+        if isinstance(title_block, dict):
+            title = title_block.get("title", "")
+            if title and str(title).strip():
+                return str(title).strip()
+
+        # context.caption
+        caption = context.get("caption", "")
+        if caption and str(caption).strip():
+            return str(caption).strip()
+
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Per-element processing
 # ---------------------------------------------------------------------------
@@ -281,6 +318,7 @@ def process_table_element(
 ) -> Dict:
     """
     Process a single table element: find pre-built Excel or fall back to JSON.
+    Also extracts caption from IRIS metadata if available.
 
     Modifies the element in place and returns it.
     """
@@ -291,6 +329,14 @@ def process_table_element(
         return element
 
     image_stem = os.path.splitext(image_file)[0]
+
+    # Try to extract caption from IRIS JSON metadata (regardless of Excel/JSON path)
+    json_path = _lookup(image_stem, json_index)
+    if json_path and not element.get("caption_text"):
+        caption = _extract_caption_from_iris_json(json_path)
+        if caption:
+            element["caption_text"] = caption
+            print(f"    [IRIS] Caption extracted: {caption}")
 
     # Primary: look for pre-built Excel
     excel_path = _lookup(image_stem, excel_index)
@@ -309,7 +355,6 @@ def process_table_element(
             return element
 
     # Fallback: IRIS metadata JSON → complex_table_schema
-    json_path = _lookup(image_stem, json_index)
     if json_path:
         print(f"    [IRIS] No Excel, trying JSON for: {image_stem}")
         table_data = read_iris_json_to_table_data(json_path)
