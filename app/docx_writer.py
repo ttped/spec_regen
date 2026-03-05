@@ -601,8 +601,31 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
         elif element_type in ("table_layout", "tab_layout"):
             export_data = element.get("export") or {}
             image_filename = export_data.get("image_file")
-            
-            if image_filename:
+            table_data = element.get("table_data")
+            render_as_image = element.get("_render_as_image", False)
+            render_landscape = element.get("_render_landscape", False)
+
+            is_valid_text_table = (
+                not render_as_image and
+                isinstance(table_data, dict) and 
+                len(table_data.get("columns", [])) > 0 and 
+                len(table_data.get("rows", [])) > 0
+            )
+
+            if is_valid_text_table:
+                columns = table_data.get("columns", [])
+                is_excel_format = columns and isinstance(columns[0], dict) and "width" in columns[0]
+
+                if render_landscape:
+                    # Pass caption_text=None to explicitly suppress captions for layout tables
+                    add_isolated_landscape_table(doc, table_data, caption_text=None)
+                else:
+                    if is_excel_format:
+                        add_excel_table_to_docx(doc, table_data)
+                    else:
+                        add_docx_table_from_data(doc, table_data)
+                    # Notice we deliberately skip calling add_table_caption() here
+            elif image_filename:
                 image_path = os.path.join(figures_image_folder, image_filename)
                 if os.path.exists(image_path):
                     doc.add_picture(image_path, width=Inches(6.0))
