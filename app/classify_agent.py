@@ -664,7 +664,9 @@ def find_content_start_page(
     llm_config: Dict, 
     max_workers: int = 4,
     initial_pages_to_check: int = 20,
-    max_pages_to_check: int = 100
+    max_pages_to_check: int = 100,
+    max_pages_pct: float = 0.15,
+    consecutive_content_to_stop: int = 3
 ) -> Dict[str, Any]:
     """
     Analyzes pages to find where main content begins.
@@ -673,9 +675,12 @@ def find_content_start_page(
     1. Fast-path regex classification for obvious TOC/Title pages
     2. LLM classification for uncertain pages
     
-    ADAPTIVE BEHAVIOR: If we're still seeing TOC pages at the end of our
-    initial batch, we keep classifying more pages until we find content.
-    This handles documents with very long TOCs (30+ pages).
+    OPTIMIZATION: The search window is capped at the larger of initial_pages_to_check
+    or max_pages_pct of total pages (default 15%). This prevents over-classifying
+    on large documents where TOC is typically only 10-15% of pages.
+    
+    EARLY EXIT: Stops as soon as consecutive_content_to_stop (default 3) consecutive
+    CONTENT_BODY pages are found, since content doesn't revert to TOC.
     
     Returns a dict with:
         - content_start_page: int
@@ -786,23 +791,31 @@ def find_content_start_page(
         }
     
     # ==========================================================================
-    # Multi-page document: ADAPTIVE classification
-    # Start with initial batch, then continue if still seeing TOC pages
+    # Multi-page document: ADAPTIVE classification with proportional cap
+    # Start with initial batch, then continue if still seeing TOC pages.
+    # Cap total pages checked at max(initial_pages_to_check, 15% of doc).
+    # Stop early after 3 consecutive CONTENT_BODY pages.
     # ==========================================================================
+    
+    # Proportional cap: don't check more than ~15% of the document
+    proportional_limit = max(initial_pages_to_check, int(total_pages * max_pages_pct))
+    effective_max = min(proportional_limit, max_pages_to_check, total_pages)
+    print(f"  - Classification window: up to {effective_max} pages (doc has {total_pages})")
     
     page_classifications = []
     pages_classified_idx = 0
     found_content = False
+    consecutive_content_count = 0
     
-    while pages_classified_idx < min(len(pages), max_pages_to_check) and not found_content:
+    while pages_classified_idx < effective_max and not found_content:
         # Determine batch size
         if pages_classified_idx == 0:
             # First batch
-            batch_end = min(initial_pages_to_check, len(pages))
+            batch_end = min(initial_pages_to_check, effective_max)
             print(f"  - Classifying pages 1-{batch_end} (fast-path + LLM fallback)...")
         else:
             # Extension batch - classify 10 more pages at a time
-            batch_end = min(pages_classified_idx + 10, len(pages), max_pages_to_check)
+            batch_end = min(pages_classified_idx + 10, effective_max)
             print(f"  - Still in TOC, extending to page {batch_end}...")
         
         batch_pages = pages[pages_classified_idx:batch_end]
@@ -853,18 +866,23 @@ def find_content_start_page(
         pages_classified_idx = batch_end
         
         # ======================================================================
-        # Check if we found content - sort first to check in order
+        # Check for early exit: 3 consecutive CONTENT_BODY pages
         # ======================================================================
         page_classifications.sort(key=lambda x: x['page'])
         
-        # Check if we've found CONTENT_BODY
+        consecutive_content_count = 0
         for classification in page_classifications:
             if classification['type'] == 'CONTENT_BODY':
-                found_content = True
-                break
+                consecutive_content_count += 1
+                if consecutive_content_count >= consecutive_content_to_stop:
+                    found_content = True
+                    print(f"  - Found {consecutive_content_to_stop} consecutive content pages, stopping classification")
+                    break
+            else:
+                consecutive_content_count = 0
         
         # Also stop if we've hit the end of available pages
-        if batch_end >= len(pages):
+        if batch_end >= effective_max:
             break
     
     # Sort final results by page number
