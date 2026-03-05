@@ -44,10 +44,30 @@ def configure_heading_styles(doc):
             style.paragraph_format.space_after = Pt(6)
 
 
+def _estimate_column_widths_from_content(rows: list, num_cols: int) -> List[float]:
+    """
+    Estimate relative column widths based on the max content length in each column.
+    Used when Excel column width metadata is unavailable (all defaults).
+    
+    Returns a list of relative widths (not inches — caller scales to page width).
+    """
+    max_lengths = [1] * num_cols  # minimum 1 to avoid zero-width
+    
+    for row_data in rows:
+        for col_idx in range(min(len(row_data), num_cols)):
+            cell_text = str(row_data[col_idx]) if row_data[col_idx] is not None else ""
+            max_lengths[col_idx] = max(max_lengths[col_idx], len(cell_text))
+    
+    return max_lengths
+
+
 def add_excel_table_to_docx(doc, table_data: dict, total_width_inches: float = 6.5):
     """
     Adds a table to the docx document using data and column widths extracted from Excel.
     Scales column widths proportionally to fill the full content area.
+    
+    If Excel column widths are all default (8.43), falls back to content-based
+    width estimation so columns vary based on their content length.
     
     Args:
         doc: python-docx Document instance
@@ -70,10 +90,18 @@ def add_excel_table_to_docx(doc, table_data: dict, total_width_inches: float = 6
     table.style = 'Table Grid'
     table.autofit = False
     
-    # Collect raw Excel widths and scale proportionally to fill page
+    # Collect raw Excel widths
     raw_widths = [col_meta.get("width", 8.43) for col_meta in columns]
-    total_raw = sum(raw_widths)
     
+    # Check if all widths are the default (no real width metadata)
+    all_default = all(abs(w - 8.43) < 0.01 for w in raw_widths)
+    
+    if all_default:
+        # No useful width metadata — estimate from content length
+        raw_widths = _estimate_column_widths_from_content(rows, num_cols)
+    
+    # Scale proportionally to fill page
+    total_raw = sum(raw_widths)
     if total_raw > 0:
         scaled_widths = [Inches(total_width_inches * w / total_raw) for w in raw_widths]
     else:
