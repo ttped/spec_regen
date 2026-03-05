@@ -502,8 +502,15 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
             )
 
             if is_valid_text_table:
+                # Detect format: Excel-format has columns as [{"width": ...}],
+                # complex_table_schema format has columns as [{"name": ...}] or ["str", ...]
+                columns = table_data.get("columns", [])
+                is_excel_format = columns and isinstance(columns[0], dict) and "width" in columns[0]
+
                 if render_landscape:
                     add_isolated_landscape_table(doc, table_data)
+                elif is_excel_format:
+                    add_excel_table_to_docx(doc, table_data)
                 else:
                     add_docx_table_from_data(doc, table_data)
                 add_table_caption(doc, caption_text)

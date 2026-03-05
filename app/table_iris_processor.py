@@ -19,6 +19,7 @@ Filenames match the YOLO crop image stems.
 import os
 import json
 import re
+import sys
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -135,47 +136,67 @@ def find_iris_json(image_stem: str, index: Dict[str, str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # IRIS JSON → Excel via reconstruct_to_df (primary path)
 #
-# reconstruct_to_df.py lives in app/ alongside this module.
-# We import _process_json directly — no subprocess needed.
+# reconstruct_to_df.py lives in app/ and has internal dependencies that
+# prevent clean import. We call it as a subprocess instead.
+# The pipeline runs from the project root, so the script path is app/reconstruct_to_df.py.
 # ---------------------------------------------------------------------------
+
+def _find_reconstruct_script() -> Optional[str]:
+    """
+    Locate reconstruct_to_df.py by checking common locations relative to
+    the current working directory and relative to this file's directory.
+    """
+    candidates = [
+        os.path.join("app", "reconstruct_to_df.py"),                    # from project root
+        os.path.join(os.path.dirname(__file__), "reconstruct_to_df.py"), # same dir as this file
+        "reconstruct_to_df.py",                                          # current dir
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
 
 def convert_iris_json_to_excel(
     iris_json_path: str,
     output_dir: str,
 ) -> Optional[str]:
     """
-    Call reconstruct_to_df._process_json to produce an Excel file from an IRIS JSON.
+    Run reconstruct_to_df.py as a subprocess to produce an Excel file.
 
     Returns the path to the generated .xlsx file, or None on failure.
     """
-    try:
-        from reconstruct_to_df import _process_json
-    except ImportError:
-        print("    [Warning] Could not import reconstruct_to_df — is it in app/?")
+    import subprocess
+
+    script = _find_reconstruct_script()
+    if not script:
+        print("    [Warning] reconstruct_to_df.py not found in app/ or current directory")
         return None
 
     os.makedirs(output_dir, exist_ok=True)
-    json_path = Path(iris_json_path)
-    stem = json_path.stem
+    stem = Path(iris_json_path).stem
 
     try:
-        _process_json(
-            json_path=json_path,
-            out_root=Path(output_dir),
-            write_csv=False,
-            write_excel=True,
-            write_pickle=False,
-            write_meta_json=False,
-            print_meta=False,
-            add_meta_sheet=False,
-            header_ontology=None,
-            show_preview=False,
-            preview_rows=None,
-            preview_cols=None,
-            save_preview=None,
+        result = subprocess.run(
+            [
+                sys.executable,  # use the same Python interpreter
+                script,
+                iris_json_path,
+                "--formats", "excel",
+                "--out-dir", output_dir,
+                "--no-meta-sheet",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
         )
-    except Exception as e:
-        print(f"    [Warning] reconstruct_to_df failed for {stem}: {e}")
+        if result.returncode != 0:
+            stderr_snippet = result.stderr[:500] if result.stderr else "(no stderr)"
+            print(f"    [Warning] reconstruct_to_df failed for {stem}:")
+            print(f"              {stderr_snippet}")
+            return None
+    except subprocess.TimeoutExpired:
+        print(f"    [Warning] reconstruct_to_df timed out for {stem}")
         return None
 
     # Find the generated Excel file
@@ -184,7 +205,9 @@ def convert_iris_json_to_excel(
     for root, _dirs, files in os.walk(output_dir):
         for f in files:
             if f.endswith(".xlsx") and _normalize_stem(Path(f).stem) == normalized:
-                return os.path.join(root, f)
+                found_path = os.path.join(root, f)
+                print(f"    [IRIS] Excel generated: {found_path}")
+                return found_path
 
     print(f"    [Warning] Excel output not found after reconstruct_to_df for {stem}")
     return None
@@ -193,37 +216,37 @@ def convert_iris_json_to_excel(
 def read_excel_to_table_data(excel_path: str) -> Optional[Dict]:
     """
     Read an Excel file produced by reconstruct_to_df and convert to the
-    table_data format expected by complex_table_schema / docx_writer.
+    table_data format used by add_excel_table_to_docx / add_isolated_landscape_table.
 
-    Returns legacy-compatible format:
-        {"columns": ["Header1", "Header2"], "rows": [["val1", "val2"], ...]}
+    Returns the same format as excel_reader.read_excel_with_metadata:
+        {"columns": [{"width": 8.43}, ...], "rows": [[val1, val2, ...], ...]}
 
-    The first row of the Excel sheet is treated as the header row.
+    This format preserves Excel column widths for accurate rendering and routes
+    through add_excel_table_to_docx rather than complex_table_schema.
     """
     import openpyxl
 
     wb = openpyxl.load_workbook(excel_path, data_only=True)
     ws = wb.active
 
-    all_rows = []
+    table_data = {"columns": [], "rows": []}
+
+    for col in range(1, ws.max_column + 1):
+        col_letter = openpyxl.utils.get_column_letter(col)
+        width = ws.column_dimensions[col_letter].width
+        if width is None:
+            width = 8.43
+        table_data["columns"].append({"width": width})
+
     for row in ws.iter_rows(values_only=True):
-        all_rows.append([str(v) if v is not None else "" for v in row])
+        table_data["rows"].append(list(row))
 
-    if not all_rows:
+    if not table_data["rows"]:
         return None
 
-    # First row = headers
-    headers = all_rows[0]
-    data_rows = all_rows[1:]
+    table_data["_num_columns"] = len(table_data["columns"])
 
-    if not headers or all(h == "" for h in headers):
-        return None
-
-    return {
-        "columns": headers,
-        "rows": data_rows,
-        "_num_columns": len(headers),
-    }
+    return table_data
 
 
 # ---------------------------------------------------------------------------
