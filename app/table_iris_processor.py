@@ -84,15 +84,37 @@ def _build_excel_index(table_jsons_dir: str) -> Dict[str, dict]:
     Current:  table_jsons_dir/{stem}/excel/{stem}.xlsx
     Future:   table_jsons_dir/{doc_name}/excel/*.xlsx
     
+    Builds three indexes:
+      1. canonical (doc, page, id) → filepath  (exact match)
+      2. page-based (doc, page) → [filepaths]  (for when IDs don't align)
+      3. normalized stem → filepath             (direct name match)
+    
     Falls back to recursive walk if structured scan finds nothing.
     """
     canonical_index = {}
+    page_index = {}  # (doc, page) → list of filepaths, sorted by ID
     stem_index = {}
     file_count = 0
 
     if not os.path.isdir(table_jsons_dir):
         print(f"    [Warning] table_jsons_dir not found: {table_jsons_dir}")
-        return {"_canonical": {}, "_stem": {}}
+        return {"_canonical": {}, "_page": {}, "_stem": {}}
+
+    def _index_file(filepath, stem):
+        nonlocal file_count
+        file_count += 1
+
+        key = _extract_canonical_key(stem)
+        if key:
+            canonical_index[key] = filepath
+            # Also index by (doc, page) for positional matching
+            doc, page, table_id = key
+            page_key = (doc, page)
+            if page_key not in page_index:
+                page_index[page_key] = []
+            page_index[page_key].append((table_id, filepath))
+
+        stem_index[_normalize_stem(stem)] = filepath
 
     # Structured scan: */excel/*.xlsx
     for entry in os.listdir(table_jsons_dir):
@@ -103,16 +125,7 @@ def _build_excel_index(table_jsons_dir: str) -> Dict[str, dict]:
         for filename in os.listdir(excel_dir):
             if not filename.endswith(".xlsx"):
                 continue
-
-            filepath = os.path.join(excel_dir, filename)
-            stem = os.path.splitext(filename)[0]
-            file_count += 1
-
-            key = _extract_canonical_key(stem)
-            if key:
-                canonical_index[key] = filepath
-
-            stem_index[_normalize_stem(stem)] = filepath
+            _index_file(os.path.join(excel_dir, filename), os.path.splitext(filename)[0])
 
     # Fallback: recursive walk for any .xlsx if structured scan found nothing
     if file_count == 0:
@@ -120,23 +133,18 @@ def _build_excel_index(table_jsons_dir: str) -> Dict[str, dict]:
             for filename in files:
                 if not filename.endswith(".xlsx"):
                     continue
-
-                filepath = os.path.join(root, filename)
-                stem = os.path.splitext(filename)[0]
-                file_count += 1
-
-                key = _extract_canonical_key(stem)
-                if key:
-                    canonical_index[key] = filepath
-
-                stem_index[_normalize_stem(stem)] = filepath
+                _index_file(os.path.join(root, filename), os.path.splitext(filename)[0])
 
         if file_count > 0:
             print(f"  - (Used recursive scan to find Excel files)")
 
+    # Sort page_index entries by table_id for positional matching
+    for page_key in page_index:
+        page_index[page_key].sort(key=lambda x: x[0])
+
     print(f"  - Scanned Excel files: {file_count} in {table_jsons_dir}")
 
-    return {"_canonical": canonical_index, "_stem": stem_index}
+    return {"_canonical": canonical_index, "_page": page_index, "_stem": stem_index}
 
 
 def _build_json_index(table_jsons_dir: str) -> Dict[str, dict]:
@@ -149,11 +157,27 @@ def _build_json_index(table_jsons_dir: str) -> Dict[str, dict]:
     Falls back to recursive walk if structured scan finds nothing.
     """
     canonical_index = {}
+    page_index = {}
     stem_index = {}
     file_count = 0
 
     if not os.path.isdir(table_jsons_dir):
-        return {"_canonical": {}, "_stem": {}}
+        return {"_canonical": {}, "_page": {}, "_stem": {}}
+
+    def _index_file(filepath, stem):
+        nonlocal file_count
+        file_count += 1
+
+        key = _extract_canonical_key(stem)
+        if key:
+            canonical_index[key] = filepath
+            doc, page, table_id = key
+            page_key = (doc, page)
+            if page_key not in page_index:
+                page_index[page_key] = []
+            page_index[page_key].append((table_id, filepath))
+
+        stem_index[_normalize_stem(stem)] = filepath
 
     # Structured scan: */table_jsons/*.json
     for entry in os.listdir(table_jsons_dir):
@@ -164,16 +188,7 @@ def _build_json_index(table_jsons_dir: str) -> Dict[str, dict]:
         for filename in os.listdir(json_dir):
             if not filename.endswith(".json"):
                 continue
-
-            filepath = os.path.join(json_dir, filename)
-            stem = os.path.splitext(filename)[0]
-            file_count += 1
-
-            key = _extract_canonical_key(stem)
-            if key:
-                canonical_index[key] = filepath
-
-            stem_index[_normalize_stem(stem)] = filepath
+            _index_file(os.path.join(json_dir, filename), os.path.splitext(filename)[0])
 
     # Fallback: recursive walk for any .json
     if file_count == 0:
@@ -181,29 +196,55 @@ def _build_json_index(table_jsons_dir: str) -> Dict[str, dict]:
             for filename in files:
                 if not filename.endswith(".json"):
                     continue
+                _index_file(os.path.join(root, filename), os.path.splitext(filename)[0])
 
-                filepath = os.path.join(root, filename)
-                stem = os.path.splitext(filename)[0]
-                file_count += 1
+    # Sort page_index entries by table_id
+    for page_key in page_index:
+        page_index[page_key].sort(key=lambda x: x[0])
 
-                key = _extract_canonical_key(stem)
-                if key:
-                    canonical_index[key] = filepath
-
-                stem_index[_normalize_stem(stem)] = filepath
-
-    return {"_canonical": canonical_index, "_stem": stem_index}
+    return {"_canonical": canonical_index, "_page": page_index, "_stem": stem_index}
 
 
-def _lookup(stem: str, index: dict) -> Optional[str]:
-    """Look up a file path by canonical key first, then normalized stem."""
+def _lookup(stem: str, index: dict, position_on_page: int = 0) -> Optional[str]:
+    """
+    Look up a file path for a YOLO crop stem.
+    
+    Matching priority:
+    1. Exact canonical key (doc, page, id) — works when YOLO and IRIS use same IDs
+    2. Page-based positional match (doc, page) + nth table on that page — handles
+       different ID numbering between YOLO (per-page) and IRIS (sequential)
+    3. Normalized stem — direct name match fallback
+    
+    Args:
+        stem: The YOLO crop image stem
+        index: The index dict from _build_excel_index or _build_json_index
+        position_on_page: 0-based position of this table among tables on the same page
+    """
     canonical_index = index.get("_canonical", {})
+    page_index = index.get("_page", {})
     stem_index = index.get("_stem", {})
 
     key = _extract_canonical_key(stem)
+    
+    # Try exact canonical key match
     if key and key in canonical_index:
         return canonical_index[key]
 
+    # Try page-based positional match
+    if key:
+        doc, page, _yolo_id = key
+        page_key = (doc, page)
+        if page_key in page_index:
+            entries = page_index[page_key]  # sorted by IRIS table_id
+            if position_on_page < len(entries):
+                _, filepath = entries[position_on_page]
+                return filepath
+            elif len(entries) == 1:
+                # Only one IRIS table on this page — must be the match
+                _, filepath = entries[0]
+                return filepath
+
+    # Fallback: direct normalized stem match
     normalized = _normalize_stem(stem)
     return stem_index.get(normalized)
 
@@ -366,11 +407,16 @@ def process_table_element(
     element: Dict,
     excel_index: Dict,
     json_index: Dict,
+    position_on_page: int = 0,
 ) -> Dict:
     """
     Process a single table element: find pre-built Excel or fall back to JSON.
     Also extracts caption from IRIS metadata if available.
 
+    Args:
+        position_on_page: 0-based index of this table among tables on the same page.
+            Used for positional matching when YOLO and IRIS use different table IDs.
+    
     Modifies the element in place and returns it.
     """
     export_data = element.get("export") or {}
@@ -382,7 +428,7 @@ def process_table_element(
     image_stem = os.path.splitext(image_file)[0]
 
     # Try to extract caption from IRIS JSON metadata (regardless of Excel/JSON path)
-    json_path = _lookup(image_stem, json_index)
+    json_path = _lookup(image_stem, json_index, position_on_page)
     if json_path and not element.get("caption_text"):
         caption = _extract_caption_from_iris_json(json_path)
         if caption:
@@ -390,7 +436,7 @@ def process_table_element(
             print(f"    [IRIS] Caption extracted: {caption}")
 
     # Primary: look for pre-built Excel
-    excel_path = _lookup(image_stem, excel_index)
+    excel_path = _lookup(image_stem, excel_index, position_on_page)
     if excel_path:
         print(f"    [IRIS] Found Excel for: {image_stem}")
         table_data = read_excel_to_table_data(excel_path)
@@ -466,9 +512,10 @@ def run_iris_table_processing(
     json_count = len(json_index.get("_canonical", {}))
     print(f"  - IRIS index: {excel_count} Excel files, {json_count} JSON files")
 
-    # Process each table element
+    # Process each table element, tracking position per page for positional matching
     tables_found = 0
     tables_matched = 0
+    page_table_counts = {}  # page_number → count of tables seen so far on that page
 
     for element in elements:
         if element.get("type") not in ("table", "table_layout"):
@@ -477,7 +524,12 @@ def run_iris_table_processing(
         tables_found += 1
         had_data_before = element.get("table_data") is not None
 
-        process_table_element(element, excel_index, json_index)
+        # Track position of this table on its page
+        page_num = element.get("page_number", 0)
+        position_on_page = page_table_counts.get(page_num, 0)
+        page_table_counts[page_num] = position_on_page + 1
+
+        process_table_element(element, excel_index, json_index, position_on_page)
 
         if not had_data_before and element.get("table_data") is not None:
             tables_matched += 1
