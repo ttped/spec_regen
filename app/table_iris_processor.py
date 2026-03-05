@@ -79,7 +79,12 @@ def _extract_canonical_key(stem: str) -> Optional[tuple]:
 
 def _build_excel_index(table_jsons_dir: str) -> Dict[str, dict]:
     """
-    Scan table_jsons_dir/*/excel/*.xlsx and build lookup indexes.
+    Scan table_jsons_dir for Excel files. Handles multiple layouts:
+    
+    Current:  table_jsons_dir/{stem}/excel/{stem}.xlsx
+    Future:   table_jsons_dir/{doc_name}/excel/*.xlsx
+    
+    Falls back to recursive walk if structured scan finds nothing.
     """
     canonical_index = {}
     stem_index = {}
@@ -89,8 +94,9 @@ def _build_excel_index(table_jsons_dir: str) -> Dict[str, dict]:
         print(f"    [Warning] table_jsons_dir not found: {table_jsons_dir}")
         return {"_canonical": {}, "_stem": {}}
 
-    for doc_folder in os.listdir(table_jsons_dir):
-        excel_dir = os.path.join(table_jsons_dir, doc_folder, "excel")
+    # Structured scan: */excel/*.xlsx
+    for entry in os.listdir(table_jsons_dir):
+        excel_dir = os.path.join(table_jsons_dir, entry, "excel")
         if not os.path.isdir(excel_dir):
             continue
 
@@ -108,6 +114,26 @@ def _build_excel_index(table_jsons_dir: str) -> Dict[str, dict]:
 
             stem_index[_normalize_stem(stem)] = filepath
 
+    # Fallback: recursive walk for any .xlsx if structured scan found nothing
+    if file_count == 0:
+        for root, _dirs, files in os.walk(table_jsons_dir):
+            for filename in files:
+                if not filename.endswith(".xlsx"):
+                    continue
+
+                filepath = os.path.join(root, filename)
+                stem = os.path.splitext(filename)[0]
+                file_count += 1
+
+                key = _extract_canonical_key(stem)
+                if key:
+                    canonical_index[key] = filepath
+
+                stem_index[_normalize_stem(stem)] = filepath
+
+        if file_count > 0:
+            print(f"  - (Used recursive scan to find Excel files)")
+
     print(f"  - Scanned Excel files: {file_count} in {table_jsons_dir}")
 
     return {"_canonical": canonical_index, "_stem": stem_index}
@@ -115,16 +141,23 @@ def _build_excel_index(table_jsons_dir: str) -> Dict[str, dict]:
 
 def _build_json_index(table_jsons_dir: str) -> Dict[str, dict]:
     """
-    Scan table_jsons_dir/*/table_jsons/*.json and build lookup indexes (fallback).
+    Scan table_jsons_dir for IRIS metadata JSON files (fallback). Handles:
+    
+    Current:  table_jsons_dir/{stem}/table_jsons/{stem}.json
+    Future:   table_jsons_dir/{doc_name}/table_jsons/*.json
+    
+    Falls back to recursive walk if structured scan finds nothing.
     """
     canonical_index = {}
     stem_index = {}
+    file_count = 0
 
     if not os.path.isdir(table_jsons_dir):
         return {"_canonical": {}, "_stem": {}}
 
-    for doc_folder in os.listdir(table_jsons_dir):
-        json_dir = os.path.join(table_jsons_dir, doc_folder, "table_jsons")
+    # Structured scan: */table_jsons/*.json
+    for entry in os.listdir(table_jsons_dir):
+        json_dir = os.path.join(table_jsons_dir, entry, "table_jsons")
         if not os.path.isdir(json_dir):
             continue
 
@@ -134,12 +167,30 @@ def _build_json_index(table_jsons_dir: str) -> Dict[str, dict]:
 
             filepath = os.path.join(json_dir, filename)
             stem = os.path.splitext(filename)[0]
+            file_count += 1
 
             key = _extract_canonical_key(stem)
             if key:
                 canonical_index[key] = filepath
 
             stem_index[_normalize_stem(stem)] = filepath
+
+    # Fallback: recursive walk for any .json
+    if file_count == 0:
+        for root, _dirs, files in os.walk(table_jsons_dir):
+            for filename in files:
+                if not filename.endswith(".json"):
+                    continue
+
+                filepath = os.path.join(root, filename)
+                stem = os.path.splitext(filename)[0]
+                file_count += 1
+
+                key = _extract_canonical_key(stem)
+                if key:
+                    canonical_index[key] = filepath
+
+                stem_index[_normalize_stem(stem)] = filepath
 
     return {"_canonical": canonical_index, "_stem": stem_index}
 
