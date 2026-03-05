@@ -340,6 +340,11 @@ def read_iris_json_to_table_data(iris_json_path: str) -> Optional[Dict]:
     output_rows = []
     for iris_row in iris_rows_sorted:
         row_idx = iris_row.get("row_index", 0)
+        
+        # Safeguard against out-of-bounds rows
+        if row_idx >= n_rows or row_idx < 0:
+            continue
+            
         is_header = row_idx in header_row_indices
         row_cells = [None] * n_cols
 
@@ -347,27 +352,54 @@ def read_iris_json_to_table_data(iris_json_path: str) -> Optional[Dict]:
             col = cell_data.get("col", 0)
             row_span = cell_data.get("row_span", 1)
             col_span = cell_data.get("col_span", 1)
+            
+            # Safeguard against out-of-bounds columns
+            if col < 0 or col >= n_cols:
+                continue
+                
             text = cell_data.get("text", "")
             alignment = cell_data.get("alignment", "left")
 
             halign = alignment if alignment in ("left", "center", "right") else "left"
             cell = {"text": str(text) if text is not None else "", "halign": halign}
 
-            if col_span > 1:
-                cell["colspan"] = col_span
-            if row_span > 1:
-                cell["rowspan"] = row_span
             if is_header:
                 cell["bold"] = True
 
-            if 0 <= col < n_cols:
-                row_cells[col] = cell
+            # Calculate safe spans (don't exceed table boundaries)
+            safe_row_span = min(row_span, n_rows - row_idx)
+            safe_col_span = min(col_span, n_cols - col)
+            
+            # Verify no overlaps in the target merged area
+            can_merge = True
+            for dr in range(safe_row_span):
+                for dc in range(safe_col_span):
+                    if covered[row_idx + dr][col + dc]:
+                        can_merge = False
+                        break
+                if not can_merge:
+                    break
+                    
+            if can_merge:
+                if safe_col_span > 1:
+                    cell["colspan"] = safe_col_span
+                if safe_row_span > 1:
+                    cell["rowspan"] = safe_row_span
+                    
+                # Mark area as covered
+                for dr in range(safe_row_span):
+                    for dc in range(safe_col_span):
+                        covered[row_idx + dr][col + dc] = True
+            else:
+                # Fallback to 1x1 if overlapping to prevent docx merge crashes
+                covered[row_idx][col] = True
 
-            for dr in range(row_span):
-                for dc in range(col_span):
-                    r, c = row_idx + dr, col + dc
-                    if (r, c) != (row_idx, col) and 0 <= r < n_rows and 0 <= c < n_cols:
-                        covered[r][c] = True
+            row_cells[col] = cell
+
+        # Fill any missing cells in the row with empty strings to guarantee a perfect grid
+        for c in range(n_cols):
+            if row_cells[c] is None:
+                row_cells[c] = {"text": "", "halign": "left"}
 
         output_row = {"cells": row_cells}
         if is_header:
