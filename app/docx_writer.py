@@ -75,11 +75,10 @@ def add_excel_table_to_docx(doc, table_data: dict):
             cell_text = str(cell_value) if cell_value is not None else ""
             table.cell(row_idx, col_idx).text = cell_text
 
-def add_isolated_landscape_table(doc, table_data: dict):
+def add_isolated_landscape_table(doc, table_data: dict, caption_text: str = ""):
     """
     Isolates a table on a new landscape page, then reverts the document to portrait.
-    Routes through add_docx_table_from_data for consistent rendering via complex_table_schema.
-    Falls back to add_excel_table_to_docx if table_data uses Excel reader format (has 'width' keys).
+    Caption is rendered on the landscape page before the section break.
     """
     landscape_section = doc.add_section(WD_SECTION.NEW_PAGE)
     landscape_section.orientation = WD_ORIENT.LANDSCAPE
@@ -99,6 +98,10 @@ def add_isolated_landscape_table(doc, table_data: dict):
         # Use landscape-width DXA (11" - 2" margins = 9" = 12960 DXA)
         from complex_table_schema import add_complex_table
         add_complex_table(doc, table_data, total_width_dxa=12960)
+    
+    # Caption goes here — on the landscape page, before reverting to portrait
+    if caption_text is not None:
+        add_table_caption(doc, caption_text)
     
     portrait_section = doc.add_section(WD_SECTION.NEW_PAGE)
     portrait_section.orientation = WD_ORIENT.PORTRAIT
@@ -508,12 +511,14 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
                 is_excel_format = columns and isinstance(columns[0], dict) and "width" in columns[0]
 
                 if render_landscape:
-                    add_isolated_landscape_table(doc, table_data)
-                elif is_excel_format:
-                    add_excel_table_to_docx(doc, table_data)
+                    # Caption is rendered inside the landscape section
+                    add_isolated_landscape_table(doc, table_data, caption_text=caption_text)
                 else:
-                    add_docx_table_from_data(doc, table_data)
-                add_table_caption(doc, caption_text)
+                    if is_excel_format:
+                        add_excel_table_to_docx(doc, table_data)
+                    else:
+                        add_docx_table_from_data(doc, table_data)
+                    add_table_caption(doc, caption_text)
             elif image_filename:
                 image_path = os.path.join(figures_image_folder, image_filename)
                 if os.path.exists(image_path):
