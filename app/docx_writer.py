@@ -44,10 +44,19 @@ def configure_heading_styles(doc):
             style.paragraph_format.space_after = Pt(6)
 
 
-def add_excel_table_to_docx(doc, table_data: dict):
+def add_excel_table_to_docx(doc, table_data: dict, total_width_inches: float = 6.5):
     """
     Adds a table to the docx document using data and column widths extracted from Excel.
+    Scales column widths proportionally to fill the full content area.
+    
+    Args:
+        doc: python-docx Document instance
+        table_data: {"columns": [{"width": float}, ...], "rows": [[val, ...], ...]}
+        total_width_inches: Total table width (default 6.5" = US Letter with 1" margins)
     """
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
     rows = table_data.get("rows", [])
     columns = table_data.get("columns", [])
     
@@ -59,25 +68,46 @@ def add_excel_table_to_docx(doc, table_data: dict):
     
     table = doc.add_table(rows=num_rows, cols=num_cols)
     table.style = 'Table Grid'
+    table.autofit = False
     
-    # Apply column widths 
-    # (Excel widths are approx characters; roughly width / 12 = docx Inches)
-    for i, col_meta in enumerate(columns):
-        excel_width = col_meta.get("width", 8.43)
-        inches_width = Inches(excel_width / 12.0) 
-        
+    # Collect raw Excel widths and scale proportionally to fill page
+    raw_widths = [col_meta.get("width", 8.43) for col_meta in columns]
+    total_raw = sum(raw_widths)
+    
+    if total_raw > 0:
+        scaled_widths = [Inches(total_width_inches * w / total_raw) for w in raw_widths]
+    else:
+        per_col = Inches(total_width_inches / num_cols)
+        scaled_widths = [per_col] * num_cols
+    
+    # Set table width via XML to enforce full width
+    total_width_dxa = int(total_width_inches * 1440)  # 1440 DXA per inch
+    tbl = table._tbl
+    tblPr = tbl.tblPr if tbl.tblPr is not None else OxmlElement("w:tblPr")
+    tblW = OxmlElement("w:tblW")
+    tblW.set(qn("w:w"), str(total_width_dxa))
+    tblW.set(qn("w:type"), "dxa")
+    for existing in tblPr.findall(qn("w:tblW")):
+        tblPr.remove(existing)
+    tblPr.append(tblW)
+    
+    # Apply scaled column widths
+    for i, width in enumerate(scaled_widths):
         for cell in table.columns[i].cells:
-            cell.width = inches_width
+            cell.width = width
     
     # Populate table cells
     for row_idx, row_data in enumerate(rows):
         for col_idx, cell_value in enumerate(row_data):
+            if col_idx >= num_cols:
+                break
             cell_text = str(cell_value) if cell_value is not None else ""
             table.cell(row_idx, col_idx).text = cell_text
 
 def add_isolated_landscape_table(doc, table_data: dict, caption_text: str = ""):
     """
     Isolates a table on a new landscape page, then reverts the document to portrait.
+    Uses narrow margins (0.5") to maximize table space.
     Caption is rendered on the landscape page before the section break.
     """
     landscape_section = doc.add_section(WD_SECTION.NEW_PAGE)
@@ -88,21 +118,31 @@ def add_isolated_landscape_table(doc, table_data: dict, caption_text: str = ""):
         landscape_section.page_width
     )
     
+    # Narrow margins for landscape tables: 0.5" all around
+    landscape_section.left_margin = Inches(0.5)
+    landscape_section.right_margin = Inches(0.5)
+    landscape_section.top_margin = Inches(0.5)
+    landscape_section.bottom_margin = Inches(0.5)
+    
+    # Content width: 11" page - 1" total margins = 10"
+    landscape_content_width = 10.0
+    
     # Determine which renderer to use based on the table_data format
     columns = table_data.get("columns", [])
     is_excel_format = columns and isinstance(columns[0], dict) and "width" in columns[0]
     
     if is_excel_format:
-        add_excel_table_to_docx(doc, table_data)
+        add_excel_table_to_docx(doc, table_data, total_width_inches=landscape_content_width)
     else:
-        # Use landscape-width DXA (11" - 2" margins = 9" = 12960 DXA)
+        landscape_dxa = int(landscape_content_width * 1440)
         from complex_table_schema import add_complex_table
-        add_complex_table(doc, table_data, total_width_dxa=12960)
+        add_complex_table(doc, table_data, total_width_dxa=landscape_dxa)
     
     # Caption goes here — on the landscape page, before reverting to portrait
     if caption_text is not None:
         add_table_caption(doc, caption_text)
     
+    # Revert to portrait with original margins
     portrait_section = doc.add_section(WD_SECTION.NEW_PAGE)
     portrait_section.orientation = WD_ORIENT.PORTRAIT
     
@@ -110,6 +150,10 @@ def add_isolated_landscape_table(doc, table_data: dict, caption_text: str = ""):
         portrait_section.page_height, 
         portrait_section.page_width
     )
+    portrait_section.left_margin = Inches(1.0)
+    portrait_section.right_margin = Inches(1.0)
+    portrait_section.top_margin = Inches(1.0)
+    portrait_section.bottom_margin = Inches(1.0)
 
 
 def add_section_heading(doc, section_number: str, topic: str, level: int = 1):
