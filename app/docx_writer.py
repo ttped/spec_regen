@@ -63,11 +63,9 @@ def _estimate_column_widths_from_content(rows: list, num_cols: int) -> List[floa
 
 def add_excel_table_to_docx(doc, table_data: dict, total_width_inches: float = 6.5):
     """
-    Adds a table to the docx document using data and column widths extracted from Excel.
-    Scales column widths proportionally to fill the full content area.
-    
-    If Excel column widths are all default (8.43), falls back to content-based
-    width estimation so columns vary based on their content length.
+    Adds a table to the docx document using data extracted from Excel.
+    Sets total table width to fill the page, but lets Word auto-fit individual
+    column widths based on content.
     
     Args:
         doc: python-docx Document instance
@@ -88,28 +86,9 @@ def add_excel_table_to_docx(doc, table_data: dict, total_width_inches: float = 6
     
     table = doc.add_table(rows=num_rows, cols=num_cols)
     table.style = 'Table Grid'
-    table.autofit = False
     
-    # Collect raw Excel widths
-    raw_widths = [col_meta.get("width", 8.43) for col_meta in columns]
-    
-    # Check if all widths are the default (no real width metadata)
-    all_default = all(abs(w - 8.43) < 0.01 for w in raw_widths)
-    
-    if all_default:
-        # No useful width metadata — estimate from content length
-        raw_widths = _estimate_column_widths_from_content(rows, num_cols)
-    
-    # Scale proportionally to fill page
-    total_raw = sum(raw_widths)
-    if total_raw > 0:
-        scaled_widths = [Inches(total_width_inches * w / total_raw) for w in raw_widths]
-    else:
-        per_col = Inches(total_width_inches / num_cols)
-        scaled_widths = [per_col] * num_cols
-    
-    # Set table width via XML to enforce full width
-    total_width_dxa = int(total_width_inches * 1440)  # 1440 DXA per inch
+    # Set total table width to fill the page, but allow Word to auto-fit columns
+    total_width_dxa = int(total_width_inches * 1440)
     tbl = table._tbl
     tblPr = tbl.tblPr if tbl.tblPr is not None else OxmlElement("w:tblPr")
     tblW = OxmlElement("w:tblW")
@@ -119,12 +98,7 @@ def add_excel_table_to_docx(doc, table_data: dict, total_width_inches: float = 6
         tblPr.remove(existing)
     tblPr.append(tblW)
     
-    # Apply scaled column widths
-    for i, width in enumerate(scaled_widths):
-        for cell in table.columns[i].cells:
-            cell.width = width
-    
-    # Populate table cells
+    # Populate table cells — Word will auto-fit column widths to content
     for row_idx, row_data in enumerate(rows):
         for col_idx, cell_value in enumerate(row_data):
             if col_idx >= num_cols:
