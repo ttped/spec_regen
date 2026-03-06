@@ -61,20 +61,144 @@ def _estimate_column_widths_from_content(rows: list, num_cols: int) -> List[floa
     return max_lengths
 
 
+# ---------------------------------------------------------------------------
+# Shared table styling — single source of truth for all table formatting
+# ---------------------------------------------------------------------------
+
+TABLE_FONT_SIZE = Pt(8)
+TABLE_FONT_NAME = 'Calibri'
+HEADER_SHADING_COLOR = "D9E2F3"  # light blue-gray
+
+
+def _set_cell_border(cell, **kwargs):
+    """
+    Set individual borders on a table cell.
+    
+    Usage: _set_cell_border(cell, top={"sz": 4, "val": "single", "color": "CCCCCC"})
+    Pass val="none" to hide a border edge.
+    """
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+
+    # Remove existing borders element if present
+    for existing in tcPr.findall(qn('w:tcBorders')):
+        tcPr.remove(existing)
+
+    tcBorders = OxmlElement('w:tcBorders')
+    for edge_name, attrs in kwargs.items():
+        edge = OxmlElement(f'w:{edge_name}')
+        for attr_key, attr_val in attrs.items():
+            edge.set(qn(f'w:{attr_key}'), str(attr_val))
+        tcBorders.append(edge)
+    tcPr.append(tcBorders)
+
+
+def _apply_clean_borders(table, num_rows: int, num_cols: int):
+    """
+    Apply a clean borderless look: only thin horizontal rules between rows,
+    with a slightly heavier rule under the header row.
+    No vertical dividers, no outer box.
+    """
+    NONE = {"val": "none", "sz": "0", "color": "auto"}
+    THIN = {"val": "single", "sz": "4", "color": "BFBFBF"}
+    HEADER_BOTTOM = {"val": "single", "sz": "8", "color": "808080"}
+
+    for row_idx in range(num_rows):
+        for col_idx in range(num_cols):
+            cell = table.cell(row_idx, col_idx)
+
+            top = NONE
+            if row_idx == 0:
+                top = THIN  # light top edge on first row
+
+            bottom = THIN
+            if row_idx == 0:
+                bottom = HEADER_BOTTOM  # heavier rule under header
+            elif row_idx == num_rows - 1:
+                bottom = THIN  # close off bottom
+
+            _set_cell_border(
+                cell,
+                top=top,
+                bottom=bottom,
+                left=NONE,
+                right=NONE,
+            )
+
+
+def _style_table_cell(cell, font_size: Pt = TABLE_FONT_SIZE, bold: bool = False):
+    """
+    Style a single cell's paragraph: set font, size, and remove extra spacing
+    so rows stay compact and text doesn't word-wrap as aggressively.
+    """
+    for paragraph in cell.paragraphs:
+        paragraph.paragraph_format.space_before = Pt(1)
+        paragraph.paragraph_format.space_after = Pt(1)
+        for run in paragraph.runs:
+            run.font.size = font_size
+            run.font.name = TABLE_FONT_NAME
+            if bold:
+                run.font.bold = True
+
+
+def _shade_cell(cell, color: str):
+    """Apply background shading to a cell."""
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    shading = OxmlElement('w:shd')
+    shading.set(qn('w:val'), 'clear')
+    shading.set(qn('w:color'), 'auto')
+    shading.set(qn('w:fill'), color)
+    tcPr.append(shading)
+
+
+def _set_table_width(table, total_width_inches: float):
+    """Set the total table width in DXA, enable autofit layout, and clear table-level borders."""
+    total_width_dxa = int(total_width_inches * 1440)
+    tbl = table._tbl
+    tblPr = tbl.tblPr if tbl.tblPr is not None else OxmlElement("w:tblPr")
+
+    # Set total width
+    for existing in tblPr.findall(qn("w:tblW")):
+        tblPr.remove(existing)
+    tblW = OxmlElement("w:tblW")
+    tblW.set(qn("w:w"), str(total_width_dxa))
+    tblW.set(qn("w:type"), "dxa")
+    tblPr.append(tblW)
+
+    # Enable autofit so Word can shrink columns to fit
+    for existing in tblPr.findall(qn("w:tblLayout")):
+        tblPr.remove(existing)
+    layout = OxmlElement("w:tblLayout")
+    layout.set(qn("w:type"), "autofit")
+    tblPr.append(layout)
+
+    # Clear table-level borders (cell-level borders take precedence)
+    for existing in tblPr.findall(qn("w:tblBorders")):
+        tblPr.remove(existing)
+    tblBorders = OxmlElement("w:tblBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        el = OxmlElement(f"w:{edge}")
+        el.set(qn("w:val"), "none")
+        el.set(qn("w:sz"), "0")
+        el.set(qn("w:space"), "0")
+        el.set(qn("w:color"), "auto")
+        tblBorders.append(el)
+    tblPr.append(tblBorders)
+
+
 def add_excel_table_to_docx(doc, table_data: dict, total_width_inches: float = 6.5):
     """
     Adds a table to the docx document using data extracted from Excel.
-    Sets total table width to fill the page, but lets Word auto-fit individual
-    column widths based on content.
+    
+    Formatting: compact 8pt text, no vertical grid lines, light horizontal rules,
+    shaded header row. Total table width fills the page; Word auto-fits columns.
     
     Args:
         doc: python-docx Document instance
         table_data: {"columns": [{"width": float}, ...], "rows": [[val, ...], ...]}
         total_width_inches: Total table width (default 6.5" = US Letter with 1" margins)
     """
-    from docx.oxml.ns import qn
-    from docx.oxml import OxmlElement
-
     rows = table_data.get("rows", [])
     columns = table_data.get("columns", [])
     
@@ -84,27 +208,25 @@ def add_excel_table_to_docx(doc, table_data: dict, total_width_inches: float = 6
     num_rows = len(rows)
     num_cols = len(columns)
     
+    # Default table style has no borders; we apply our own via _apply_clean_borders.
     table = doc.add_table(rows=num_rows, cols=num_cols)
-    table.style = 'Table Grid'
+
+    _set_table_width(table, total_width_inches)
     
-    # Set total table width to fill the page, but allow Word to auto-fit columns
-    total_width_dxa = int(total_width_inches * 1440)
-    tbl = table._tbl
-    tblPr = tbl.tblPr if tbl.tblPr is not None else OxmlElement("w:tblPr")
-    tblW = OxmlElement("w:tblW")
-    tblW.set(qn("w:w"), str(total_width_dxa))
-    tblW.set(qn("w:type"), "dxa")
-    for existing in tblPr.findall(qn("w:tblW")):
-        tblPr.remove(existing)
-    tblPr.append(tblW)
-    
-    # Populate table cells — Word will auto-fit column widths to content
+    # Populate cells with compact styled text
     for row_idx, row_data in enumerate(rows):
+        is_header = (row_idx == 0)
         for col_idx, cell_value in enumerate(row_data):
             if col_idx >= num_cols:
                 break
             cell_text = str(cell_value) if cell_value is not None else ""
-            table.cell(row_idx, col_idx).text = cell_text
+            cell = table.cell(row_idx, col_idx)
+            cell.text = cell_text
+            _style_table_cell(cell, bold=is_header)
+            if is_header:
+                _shade_cell(cell, HEADER_SHADING_COLOR)
+
+    _apply_clean_borders(table, num_rows, num_cols)
 
 def add_isolated_landscape_table(doc, table_data: dict, caption_text: str = ""):
     """
@@ -141,7 +263,7 @@ def add_isolated_landscape_table(doc, table_data: dict, caption_text: str = ""):
         add_complex_table(doc, table_data, total_width_dxa=landscape_dxa)
     
     # Caption goes here — on the landscape page, before reverting to portrait
-    if caption_text is not None:
+    if caption_text is not None and str(caption_text).strip():
         add_table_caption(doc, caption_text)
     
     # Revert to portrait with original margins
