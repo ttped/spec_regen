@@ -187,6 +187,89 @@ def _set_table_width(table, total_width_inches: float):
     tblPr.append(tblBorders)
 
 
+# ---------------------------------------------------------------------------
+# Portrait vs. landscape decision — content-aware
+# ---------------------------------------------------------------------------
+
+# Approximate width of one character at 8pt Calibri, in inches
+_CHAR_WIDTH_INCHES = 0.055
+# Left + right cell padding per column, in inches
+_CELL_PADDING_INCHES = 0.15
+
+PORTRAIT_WIDTH = 6.5   # US Letter, 1" margins
+LANDSCAPE_WIDTH = 10.0  # US Letter landscape, 0.5" margins
+
+
+def _extract_cell_texts(table_data: dict) -> List[List[str]]:
+    """
+    Pull cell text out of table_data regardless of format.
+    Returns a list of rows, each row a list of string values.
+    Handles Excel format (flat lists) and complex schema (dicts with 'cells').
+    """
+    raw_rows = table_data.get("rows", [])
+    result = []
+
+    for row in raw_rows:
+        if isinstance(row, list):
+            # Excel format: [[val, val, ...], ...]
+            result.append([str(v) if v is not None else "" for v in row])
+        elif isinstance(row, dict):
+            # Complex schema: {"cells": [{"text": "..."}, ...]}
+            cells = row.get("cells", [])
+            texts = []
+            for cell in cells:
+                if isinstance(cell, dict):
+                    texts.append(str(cell.get("text", "")))
+                else:
+                    texts.append(str(cell) if cell is not None else "")
+            result.append(texts)
+
+    return result
+
+
+def _longest_word_length(text: str) -> int:
+    """Length of the longest whitespace-delimited token in text."""
+    if not text:
+        return 0
+    return max(len(token) for token in text.split())
+
+
+def _needs_landscape(table_data: dict, portrait_width: float = PORTRAIT_WIDTH) -> bool:
+    """
+    Estimate whether a table's content requires landscape orientation.
+
+    Calculates the minimum feasible width for each column based on the
+    longest unbreakable token (word) in that column, then checks whether
+    the total exceeds the available portrait width.
+
+    Returns False for tables that comfortably fit portrait, True only
+    when landscape is genuinely needed to avoid severe wrapping.
+    """
+    columns = table_data.get("columns", [])
+    num_cols = len(columns)
+
+    # Very few columns always fit portrait
+    if num_cols <= 4:
+        return False
+
+    rows_text = _extract_cell_texts(table_data)
+    if not rows_text:
+        return False
+
+    # Minimum width per column: longest word × char width + padding
+    min_col_widths = [_CELL_PADDING_INCHES] * num_cols
+
+    for row in rows_text:
+        for col_idx in range(min(len(row), num_cols)):
+            word_len = _longest_word_length(row[col_idx])
+            needed = word_len * _CHAR_WIDTH_INCHES + _CELL_PADDING_INCHES
+            if needed > min_col_widths[col_idx]:
+                min_col_widths[col_idx] = needed
+
+    total_min_width = sum(min_col_widths)
+    return total_min_width > portrait_width
+
+
 def add_excel_table_to_docx(doc, table_data: dict, total_width_inches: float = 6.5):
     """
     Adds a table to the docx document using data extracted from Excel.
@@ -702,7 +785,6 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
             caption_text = str(element.get('caption_text', ''))
             table_data = element.get("table_data")
             render_as_image = element.get("_render_as_image", False)
-            render_landscape = element.get("_render_landscape", False)
 
             is_valid_text_table = (
                 not render_as_image and
@@ -716,6 +798,7 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
                 # complex_table_schema format has columns as [{"name": ...}] or ["str", ...]
                 columns = table_data.get("columns", [])
                 is_excel_format = columns and isinstance(columns[0], dict) and "width" in columns[0]
+                render_landscape = _needs_landscape(table_data)
 
                 if render_landscape:
                     # Caption is rendered inside the landscape section
@@ -764,7 +847,6 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
             image_filename = export_data.get("image_file")
             table_data = element.get("table_data")
             render_as_image = element.get("_render_as_image", False)
-            render_landscape = element.get("_render_landscape", False)
 
             is_valid_text_table = (
                 not render_as_image and
@@ -776,6 +858,7 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
             if is_valid_text_table:
                 columns = table_data.get("columns", [])
                 is_excel_format = columns and isinstance(columns[0], dict) and "width" in columns[0]
+                render_landscape = _needs_landscape(table_data)
 
                 if render_landscape:
                     # Pass caption_text=None to explicitly suppress captions for layout tables

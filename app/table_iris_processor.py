@@ -504,8 +504,6 @@ def process_table_element(
 
             element["table_data"] = table_data
             element["_table_source"] = "iris_excel"
-            if num_cols > 7:
-                element["_render_landscape"] = True
             return element
 
     # Fallback: IRIS metadata JSON → complex_table_schema
@@ -519,8 +517,6 @@ def process_table_element(
 
             element["table_data"] = table_data
             element["_table_source"] = "iris_json"
-            if num_cols > 7:
-                element["_render_landscape"] = True
             return element
 
     return element
