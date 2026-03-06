@@ -191,8 +191,8 @@ def add_excel_table_to_docx(doc, table_data: dict, total_width_inches: float = 6
     """
     Adds a table to the docx document using data extracted from Excel.
     
-    Formatting: compact 8pt text, no vertical grid lines, light horizontal rules,
-    shaded header row. Total table width fills the page; Word auto-fits columns.
+    Formatting: compact 8pt text, no vertical grid lines, light horizontal rules.
+    Total table width fills the page; Word auto-fits columns.
     
     Args:
         doc: python-docx Document instance
@@ -223,8 +223,6 @@ def add_excel_table_to_docx(doc, table_data: dict, total_width_inches: float = 6
             cell = table.cell(row_idx, col_idx)
             cell.text = cell_text
             _style_table_cell(cell, bold=is_header)
-            if is_header:
-                _shade_cell(cell, HEADER_SHADING_COLOR)
 
     _apply_clean_borders(table, num_rows, num_cols)
 
@@ -261,6 +259,9 @@ def add_isolated_landscape_table(doc, table_data: dict, caption_text: str = ""):
         landscape_dxa = int(landscape_content_width * 1440)
         from complex_table_schema import add_complex_table
         add_complex_table(doc, table_data, total_width_dxa=landscape_dxa)
+        # Apply shared clean styling to the complex-schema table
+        if doc.tables:
+            _restyle_existing_table(doc.tables[-1])
     
     # Caption goes here — on the landscape page, before reverting to portrait
     if caption_text is not None and str(caption_text).strip():
@@ -311,13 +312,51 @@ def add_section_heading(doc, section_number: str, topic: str, level: int = 1):
     return p
 
 
+def _restyle_existing_table(table):
+    """
+    Post-process a table that was rendered by complex_table_schema (or any other
+    renderer) to match the shared clean style: compact 8pt text, horizontal-only
+    rules, no grid lines.
+    """
+    num_rows = len(table.rows)
+    num_cols = len(table.columns)
+
+    # Clear table-level borders
+    tbl = table._tbl
+    tblPr = tbl.tblPr if tbl.tblPr is not None else OxmlElement("w:tblPr")
+    for existing in tblPr.findall(qn("w:tblBorders")):
+        tblPr.remove(existing)
+    tblBorders = OxmlElement("w:tblBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        el = OxmlElement(f"w:{edge}")
+        el.set(qn("w:val"), "none")
+        el.set(qn("w:sz"), "0")
+        el.set(qn("w:space"), "0")
+        el.set(qn("w:color"), "auto")
+        tblBorders.append(el)
+    tblPr.append(tblBorders)
+
+    # Restyle every cell: compact font + clean borders
+    for row_idx, row in enumerate(table.rows):
+        is_header = (row_idx == 0)
+        for col_idx, cell in enumerate(row.cells):
+            _style_table_cell(cell, bold=is_header)
+
+    _apply_clean_borders(table, num_rows, num_cols)
+
+
 def add_docx_table_from_data(doc, table_data: Dict):
     """
     Adds a table to the docx document from structured data.
-    Delegates to the complex table schema renderer.
+    Delegates to the complex table schema renderer, then applies the shared
+    clean styling so all tables look consistent regardless of source format.
     """
     from complex_table_schema import add_docx_table_from_data as add_complex_table
-    return add_complex_table(doc, table_data)
+    add_complex_table(doc, table_data)
+
+    # Post-process: the table just added is the last one in the document
+    if doc.tables:
+        _restyle_existing_table(doc.tables[-1])
 
 
 def add_figure_caption(doc, text: str):
