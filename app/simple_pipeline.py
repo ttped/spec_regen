@@ -45,7 +45,7 @@ from yolo_asset_extractor import run_yolo_extraction, get_yolo_exports_dir
 
 DEFAULT_RAW_OCR_DIR = os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "raw_data_advanced")
 DEFAULT_FIGURES_DIR = os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "exports")  # Manual exports
-DEFAULT_IMAGES_DIR = "docs_images"  # Page images for YOLO
+DEFAULT_IMAGES_DIR = os.path.join("docs", "ci_repo")  # Page images for YOLO
 DEFAULT_YOLO_EXPORTS_DIR = "yolo_exports"  # YOLO-extracted assets
 DEFAULT_TABLE_JSONS_DIR = os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "table_jsons")
 DEFAULT_RESULTS_DIR = "results_simple"

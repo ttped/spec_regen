@@ -93,7 +93,7 @@ def get_paths():
     project_root = script_dir.parent if script_dir.name != "docs" else script_dir
     
     return {
-        'images_dir': project_root / "docs_images",
+        'images_dir': project_root / "docs" / "ci_repo",
         'exports_dir': project_root / "yolo_exports",  # Output directory for extracted assets
         'raw_ocr_dir': project_root / "iris_ocr" / "CM_Spec_OCR_and_figtab_output" / "raw_data_advanced",
     }
