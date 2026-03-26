@@ -24,6 +24,22 @@ import numpy as np
 from pathlib import Path
 from typing import List, Dict, Set, Tuple, Optional
 
+
+def _load_env(env_path: Path) -> None:
+    """Load key=value pairs from a .env file into os.environ (no-op if missing)."""
+    if not env_path.exists():
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, _, value = line.partition('=')
+            os.environ.setdefault(key.strip(), value.strip())
+
+_load_env(Path(__file__).resolve().parent.parent / ".env")
+
+
 # Direct imports (existing)
 from classify_agent import run_classification_on_file, load_content_start_page, load_classification_result
 from title_agent import extract_title_page_info
@@ -40,34 +56,22 @@ from yolo_asset_extractor import run_yolo_extraction, get_yolo_exports_dir
 
 
 # =============================================================================
-# CONFIG
+# CONFIG  (values come from .env at project root, with fallbacks)
 # =============================================================================
 
-DEFAULT_RAW_OCR_DIR = os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "raw_data_advanced")
-DEFAULT_FIGURES_DIR = os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "exports")  # Manual exports
-DEFAULT_IMAGES_DIR = os.path.join("docs", "ci_repo")  # Page images for YOLO
-DEFAULT_YOLO_EXPORTS_DIR = "yolo_exports"  # YOLO-extracted assets
-DEFAULT_TABLE_JSONS_DIR = os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "table_jsons")
-DEFAULT_RESULTS_DIR = "results_simple"
+DEFAULT_RAW_OCR_DIR    = os.environ.get("RAW_OCR_DIR",      os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "raw_data_advanced"))
+DEFAULT_FIGURES_DIR    = os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "exports")  # Manual exports (unused)
+DEFAULT_IMAGES_DIR     = os.environ.get("IMAGES_DIR",       os.path.join("docs", "ci_repo"))
+DEFAULT_YOLO_EXPORTS_DIR = os.environ.get("YOLO_EXPORTS_DIR", "yolo_exports")
+DEFAULT_TABLE_JSONS_DIR  = os.environ.get("TABLE_JSONS_DIR",  os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "table_jsons"))
+DEFAULT_RESULTS_DIR    = os.environ.get("RESULTS_DIR",      "results_simple")
 
-## --- LLM Provider Toggle ---
-## Uncomment ONE of the following configs:
-
-# Option A: Ollama (local)
 LLM_CONFIG = {
-    "provider": "ollama",
-    "model_name": "gemma3:27b",
-    "base_url": "http://localhost:11434",
-    "api_key": None
+    "provider":   os.environ.get("LLM_PROVIDER", "ollama"),
+    "model_name": os.environ.get("LLM_MODEL",    "gemma3:27b"),
+    "base_url":   os.environ.get("LLM_BASE_URL", "http://localhost:11434"),
+    "api_key":    os.environ.get("LLM_API_KEY")  or None,
 }
-
-# Option B: Mission Assist (remote)
-# LLM_CONFIG = {
-#     "provider": "mission_assist",
-#     "model_name": "gemma3", 
-#     "base_url": "http://devmissionassist.api.us.baesystems.com",
-#     "api_key": "aTOIT9hJM3DBYMQbEY"
-# }
 
 
 def get_document_stems(input_dir: str) -> List[str]:

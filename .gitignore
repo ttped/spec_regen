@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+results_simple/
+yolo_exports/
+docs_images/
