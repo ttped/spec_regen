@@ -4,14 +4,28 @@ from pathlib import Path
 from pdf2image import convert_from_path
 from tqdm import tqdm
 
+def _load_env(env_path: Path) -> None:
+    if not env_path.exists():
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, _, value = line.partition('=')
+            os.environ.setdefault(key.strip(), value.strip())
+
+_load_env(Path(__file__).resolve().parent.parent / ".env")
+
+
 def get_paths():
     """
     Calculates paths relative to this script file.
+    Source PDFs and output images both live in IMAGES_DIR (default: docs/ci_repo).
     """
-    script_dir = Path(__file__).resolve().parent
-    source_dir = script_dir.parent / "docs"
-    output_dir = script_dir.parent / "docs_images"
-    return source_dir, output_dir
+    project_root = Path(__file__).resolve().parent.parent
+    images_dir = project_root / os.environ.get("IMAGES_DIR", os.path.join("docs", "ci_repo"))
+    return images_dir, images_dir
 
 # Configuration
 SOURCE_DIR, OUTPUT_DIR = get_paths()
