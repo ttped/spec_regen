@@ -1,5 +1,4 @@
 import os
-import shutil
 from pathlib import Path
 from pdf2image import convert_from_path
 from tqdm import tqdm
@@ -55,27 +54,24 @@ def process_pdfs():
     print(f"Found {len(pdf_files)} PDF files to process.")
 
     for pdf_path in tqdm(pdf_files, desc="Converting PDFs"):
-        try:
-            # Just get the filename without extension (e.g. 'report' from 'report.pdf')
-            # and sanitize it just in case it has spaces or weird chars
-            stem = sanitize_filename(pdf_path.stem)
+        # Just get the filename without extension (e.g. 'report' from 'report.pdf')
+        # and sanitize it just in case it has spaces or weird chars
+        stem = sanitize_filename(pdf_path.stem)
 
-            # Convert to images
-            images = convert_from_path(str(pdf_path), dpi=DPI, fmt=FORMAT)
+        # Convert to images
+        images = convert_from_path(str(pdf_path), dpi=DPI, fmt=FORMAT)
 
-            for i, image in enumerate(images):
-                # Format: filename_page001.jpg
-                page_num = f"{i + 1:03d}" 
-                out_filename = f"{stem}_page{page_num}.jpg" 
-                out_path = OUTPUT_DIR / out_filename
+        for i, image in enumerate(images):
+            # Format: filename_page001.jpg
+            page_num = f"{i + 1:03d}" 
+            out_filename = f"{stem}_page{page_num}.jpg" 
+            out_path = OUTPUT_DIR / out_filename
 
-                # Save explicitly as JPEG to fix the previous error
-                image.save(out_path, "JPEG")
-
-        except Exception as e:
-            print(f"\n[Error] Failed to process {pdf_path.name}: {e}")
+            # Save explicitly as JPEG to fix the previous error
+            image.save(out_path, "JPEG")
 
     print(f"\nDone! Images saved to {OUTPUT_DIR}")
 
 if __name__ == "__main__":
     process_pdfs()
+
