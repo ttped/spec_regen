@@ -21,10 +21,13 @@ _load_env(Path(__file__).resolve().parent.parent / ".env")
 def get_paths():
     """
     Calculates paths relative to this script file.
-    Source PDFs and output images both live in IMAGES_DIR (default: docs/ci_repo).
+    Source PDFs and output images both live in IMAGES_DIR from .env.
     """
     project_root = Path(__file__).resolve().parent.parent
-    images_dir = project_root / os.environ.get("IMAGES_DIR", os.path.join("docs", "ci_repo"))
+    images_dir_env = os.environ.get("IMAGES_DIR")
+    if images_dir_env is None:
+        raise RuntimeError("Missing required environment variable: IMAGES_DIR  (check your .env file)")
+    images_dir = project_root / images_dir_env
     return images_dir, images_dir
 
 # Configuration
