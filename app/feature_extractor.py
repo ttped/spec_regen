@@ -49,11 +49,26 @@ _nlp = spacy.load("en_core_web_sm")
 #_nlp = spacy.load(os.path.join(os.path.dirname(__file__), "model_en"))
 
 # =============================================================================
-# DEFAULT PATHS (same as simple_pipeline.py)
+# DEFAULT PATHS (from .env, with fallbacks matching simple_pipeline.py)
 # =============================================================================
 
-DEFAULT_RAW_OCR_DIR = os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "raw_data_advanced")
-DEFAULT_RESULTS_DIR = "results_simple"
+from pathlib import Path as _Path
+
+def _load_env(env_path: _Path) -> None:
+    if not env_path.exists():
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, _, value = line.partition('=')
+            os.environ.setdefault(key.strip(), value.strip())
+
+_load_env(_Path(__file__).resolve().parent.parent / ".env")
+
+DEFAULT_RAW_OCR_DIR = os.environ.get("RAW_OCR_DIR", os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "raw_data_advanced"))
+DEFAULT_RESULTS_DIR = os.environ.get("RESULTS_DIR", "results_simple")
 
 
 # =============================================================================

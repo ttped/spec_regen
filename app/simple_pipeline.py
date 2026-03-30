@@ -211,16 +211,37 @@ class Config:
     
     # YOLO settings
     use_yolo = True           # Use YOLO for asset extraction
-    yolo_confidence = 0.25    # Confidence threshold
-    yolo_device = 'cpu'       # 'cpu', 'cuda:0', or 'mps'
+    yolo_confidence = float(os.environ.get("YOLO_CONFIDENCE", "0.25"))
+    yolo_device = os.environ.get("YOLO_DEVICE", "cpu")
     skip_yolo_if_exists = True  # Skip YOLO if exports already exist
 
 
 def main():
     args = Config()
-    
+
+    # --- Startup diagnostics ---
+    print("=" * 60)
+    print("PIPELINE CONFIGURATION")
+    print("=" * 60)
+    _dirs = {
+        "raw_ocr_dir":      args.raw_ocr_dir,
+        "images_dir":       args.images_dir,
+        "yolo_exports_dir": args.yolo_exports_dir,
+        "results_dir":      args.results_dir,
+        "table_jsons_dir":  args.table_jsons_dir,
+    }
+    for name, path in _dirs.items():
+        resolved = os.path.abspath(path)
+        exists = os.path.isdir(resolved)
+        status = "OK" if exists else "MISSING"
+        print(f"  {name:20s} = {path}")
+        print(f"  {'':20s}   -> {resolved}  [{status}]")
+    print(f"  {'yolo_confidence':20s} = {args.yolo_confidence}")
+    print(f"  {'yolo_device':20s} = {args.yolo_device}")
+    print()
+
     os.makedirs(args.results_dir, exist_ok=True)
-    
+
     # Determine which figures directory to use (Always YOLO)
     figures_dir = args.yolo_exports_dir
     print(f"[Mode] Using YOLO-extracted assets from: {figures_dir}")
