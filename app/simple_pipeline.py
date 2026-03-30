@@ -218,9 +218,18 @@ class Config:
 
 def main():
     args = Config()
-    
+
     os.makedirs(args.results_dir, exist_ok=True)
-    
+
+    print("=" * 60)
+    print("RESOLVED CONFIG")
+    print("=" * 60)
+    print(f"  RAW_OCR_DIR:      {args.raw_ocr_dir}  (exists: {os.path.exists(args.raw_ocr_dir)})")
+    print(f"  IMAGES_DIR:       {args.images_dir}  (exists: {os.path.exists(args.images_dir)})")
+    print(f"  YOLO_EXPORTS_DIR: {args.yolo_exports_dir}")
+    print(f"  RESULTS_DIR:      {args.results_dir}")
+    print()
+
     # Determine which figures directory to use (Always YOLO)
     figures_dir = args.yolo_exports_dir
     print(f"[Mode] Using YOLO-extracted assets from: {figures_dir}")
