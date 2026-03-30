@@ -56,21 +56,28 @@ from yolo_asset_extractor import run_yolo_extraction, get_yolo_exports_dir
 
 
 # =============================================================================
-# CONFIG  (values come from .env at project root, with fallbacks)
+# CONFIG  (values come from .env at project root — no fallbacks)
 # =============================================================================
 
-DEFAULT_RAW_OCR_DIR    = os.environ.get("RAW_OCR_DIR",      os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "raw_data_advanced"))
-DEFAULT_FIGURES_DIR    = os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "exports")  # Manual exports (unused)
-DEFAULT_IMAGES_DIR     = os.environ.get("IMAGES_DIR",       os.path.join("docs", "ci_repo"))
-DEFAULT_YOLO_EXPORTS_DIR = os.environ.get("YOLO_EXPORTS_DIR", "yolo_exports")
-DEFAULT_TABLE_JSONS_DIR  = os.environ.get("TABLE_JSONS_DIR",  os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "table_jsons"))
-DEFAULT_RESULTS_DIR    = os.environ.get("RESULTS_DIR",      "results_simple")
+def _require_env(key: str) -> str:
+    """Return an environment variable or raise with a clear message."""
+    val = os.environ.get(key)
+    if val is None:
+        raise RuntimeError(f"Missing required environment variable: {key}  (check your .env file)")
+    return val
+
+DEFAULT_RAW_OCR_DIR      = _require_env("RAW_OCR_DIR")
+DEFAULT_FIGURES_DIR      = os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "exports")  # Manual exports (unused)
+DEFAULT_IMAGES_DIR       = _require_env("IMAGES_DIR")
+DEFAULT_YOLO_EXPORTS_DIR = _require_env("YOLO_EXPORTS_DIR")
+DEFAULT_TABLE_JSONS_DIR  = _require_env("TABLE_JSONS_DIR")
+DEFAULT_RESULTS_DIR      = _require_env("RESULTS_DIR")
 
 LLM_CONFIG = {
-    "provider":   os.environ.get("LLM_PROVIDER", "ollama"),
-    "model_name": os.environ.get("LLM_MODEL",    "gemma3:27b"),
-    "base_url":   os.environ.get("LLM_BASE_URL", "http://localhost:11434"),
-    "api_key":    os.environ.get("LLM_API_KEY")  or None,
+    "provider":   _require_env("LLM_PROVIDER"),
+    "model_name": _require_env("LLM_MODEL"),
+    "base_url":   _require_env("LLM_BASE_URL"),
+    "api_key":    os.environ.get("LLM_API_KEY") or None,
 }
 
 
@@ -211,12 +218,38 @@ class Config:
     
     # YOLO settings
     use_yolo = True           # Use YOLO for asset extraction
-    yolo_confidence = float(os.environ.get("YOLO_CONFIDENCE", "0.25"))
-    yolo_device = os.environ.get("YOLO_DEVICE", "cpu")
+    yolo_confidence = float(_require_env("YOLO_CONFIDENCE"))
+    yolo_device = _require_env("YOLO_DEVICE")
     skip_yolo_if_exists = True  # Skip YOLO if exports already exist
 
 
-def main():
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Document processing pipeline with YOLO integration")
+    parser.add_argument('--step', type=str, default='all',
+                       help="Step to run: classify, title, structure, ml_filter, yolo, assets, tables, write, validate, all")
+    parser.add_argument('--yolo-conf', type=float, default=None,
+                       help="YOLO confidence threshold (overrides .env)")
+    parser.add_argument('--yolo-device', type=str, default=None,
+                       help="YOLO device: cpu, cuda:0, or mps (overrides .env)")
+    parser.add_argument('--force-yolo', action='store_true',
+                       help="Force re-run YOLO even if exports exist")
+    parser.add_argument('--table-jsons-dir', type=str, default=None,
+                       help="Directory containing IRIS table OCR JSONs (overrides .env)")
+
+    cli_args = parser.parse_args()
+
+    # Apply CLI overrides to Config
+    Config.step = cli_args.step
+    if cli_args.yolo_conf is not None:
+        Config.yolo_confidence = cli_args.yolo_conf
+    if cli_args.yolo_device is not None:
+        Config.yolo_device = cli_args.yolo_device
+    Config.skip_yolo_if_exists = not cli_args.force_yolo
+    if cli_args.table_jsons_dir:
+        Config.table_jsons_dir = cli_args.table_jsons_dir
+
     args = Config()
 
     # --- Startup diagnostics ---
@@ -254,10 +287,10 @@ def main():
         print("=" * 60)
         print("YOLO ASSET EXTRACTION")
         print("=" * 60)
-        
+
         # Check if we should skip
         if args.skip_yolo_if_exists and os.path.exists(args.yolo_exports_dir):
-            existing_docs = [d for d in os.listdir(args.yolo_exports_dir) 
+            existing_docs = [d for d in os.listdir(args.yolo_exports_dir)
                           if os.path.isdir(os.path.join(args.yolo_exports_dir, d))]
             if existing_docs:
                 print(f"  [Skip] YOLO exports already exist for {len(existing_docs)} documents")
@@ -292,20 +325,20 @@ def main():
     # ==========================================================================
     sections_to_keep_by_doc = {}
     ml_metrics = None
-    
+
     if args.step in ["ml_filter", "all"]:
         print("=" * 60)
         print("ML TRAINING & PREDICTION")
         print("=" * 60)
-        
+
         features_path = os.path.join(args.results_dir, "training_features.csv")
-        
+
         if not os.path.exists(features_path):
             raise FileNotFoundError(
                 f"training_features.csv not found at {features_path}\n"
                 f"Run: python feature_extractor.py --results_dir {args.results_dir}"
             )
-        
+
         sections_to_keep_by_doc, ml_metrics = train_and_predict(features_path, args.ml_threshold)
         print()
 
@@ -318,7 +351,7 @@ def main():
         print(f"{'=' * 60}")
         print(f"{stem}")
         print(f"{'=' * 60}")
-        
+
         # Resolve the actual YOLO exports subdirectory for this stem.
         # Handles space/underscore naming mismatches between OCR filenames and YOLO dir names.
         from asset_processor import resolve_asset_directory
@@ -327,7 +360,7 @@ def main():
             figures_stem = os.path.basename(doc_asset_dir)
         else:
             figures_stem = stem
-        
+
         raw_input = os.path.join(args.raw_ocr_dir, f"{stem}.json")
         classify_out = os.path.join(args.results_dir, f"{stem}_classification.json")
         title_out = os.path.join(args.results_dir, f"{stem}_title.json")
@@ -345,7 +378,7 @@ def main():
             if result and result.get('is_stub'):
                 print("  [Info] Document is a stub, skipping remaining steps.")
                 continue
-                
+
         # STEP 2: TITLE
         if args.step in ["title", "all"]:
             print("[2: Title]")
@@ -354,10 +387,10 @@ def main():
                 print(f"         Step 1 (classify) must complete successfully first.")
                 print(f"         Skipping remaining steps for {stem}.")
                 continue
-            
+
             result = load_classification_result(classify_out)
             doc_type = result.get('document_type', 'unknown') if result else 'unknown'
-            
+
             if doc_type == 'no_title':
                 with open(title_out, 'w') as f: json.dump([], f)
             else:
@@ -373,8 +406,8 @@ def main():
                 continue
             content_start = load_content_start_page(classify_out, default=1)
             run_section_processing_on_file(
-                raw_input, 
-                organized_out, 
+                raw_input,
+                organized_out,
                 content_start_page=content_start,
                 yolo_exports_dir=figures_dir,  # Pass YOLO exports for overlap filtering
                 doc_stem=figures_stem
@@ -392,19 +425,19 @@ def main():
                 print(f"         Step 3 (structure) must complete successfully first.")
                 print(f"         Skipping remaining steps for {stem}.")
                 continue
-            
+
             if stem not in sections_to_keep_by_doc:
                 shutil.copy(organized_out, ml_filtered_out)
             else:
                 sections_to_keep = sections_to_keep_by_doc[stem]
                 with open(organized_out, 'r') as f: data = json.load(f)
-                
+
                 elements = data.get('elements', []) if isinstance(data, dict) else data
                 page_metadata = data.get('page_metadata', {}) if isinstance(data, dict) else {}
-                
+
                 reclassified_elements, kept, converted = reclassify_elements(elements, sections_to_keep)
                 print(f"  Sections kept: {kept}, converted to text blocks: {converted}")
-                
+
                 with open(ml_filtered_out, 'w') as f:
                     json.dump({'page_metadata': page_metadata, 'elements': reclassified_elements}, f, indent=4)
 
@@ -478,7 +511,7 @@ def main():
     # ==========================================================================
     # FINAL SUMMARY
     # ==========================================================================
-    
+
     if validation_results:
         print("=" * 60)
         print("TOC VALIDATION SUMMARY")
@@ -494,17 +527,17 @@ def main():
     if ml_metrics:
         val = ml_metrics.get('val', {})
         train = ml_metrics.get('train', {})
-        
+
         print("\n" + "=" * 60)
         print("ML MODEL PERFORMANCE")
         print("=" * 60)
-        
+
         print("1. VALIDATION (80/20 SPLIT)")
         print(f"   Accuracy:  {val.get('accuracy', 0):.1%}")
         print(f"   Precision: {val.get('precision', 0):.3f}")
         print(f"   Recall:    {val.get('recall', 0):.3f}")
         print(f"   F1 Score:  {val.get('f1', 0):.3f}")
-        
+
         if 'confusion' in val:
             tn, fp, fn, tp = val['confusion'].ravel()
             print(f"   Confusion: TP={tp}, FP={fp}, TN={tn}, FN={fn}")
@@ -514,33 +547,5 @@ def main():
         print(f"   Precision: {train.get('precision', 0):.3f}")
         print(f"   Recall:    {train.get('recall', 0):.3f}")
         print(f"   F1 Score:  {train.get('f1', 0):.3f}")
-        
+
     print("\nDone!")
-
-
-if __name__ == '__main__':
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Document processing pipeline with YOLO integration")
-    parser.add_argument('--step', type=str, default='all',
-                       help="Step to run: classify, title, structure, ml_filter, yolo, assets, tables, write, validate, all")
-    parser.add_argument('--yolo-conf', type=float, default=0.25,
-                       help="YOLO confidence threshold")
-    parser.add_argument('--yolo-device', type=str, default='cpu',
-                       help="YOLO device: cpu, cuda:0, or mps")
-    parser.add_argument('--force-yolo', action='store_true',
-                       help="Force re-run YOLO even if exports exist")
-    parser.add_argument('--table-jsons-dir', type=str, default=None,
-                       help="Directory containing IRIS table OCR JSONs")
-    
-    args = parser.parse_args()
-    
-    # Apply CLI args to config
-    Config.step = args.step
-    Config.yolo_confidence = args.yolo_conf
-    Config.yolo_device = args.yolo_device
-    Config.skip_yolo_if_exists = not args.force_yolo
-    if args.table_jsons_dir:
-        Config.table_jsons_dir = args.table_jsons_dir
-    
-    main()

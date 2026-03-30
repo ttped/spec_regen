@@ -67,8 +67,14 @@ def _load_env(env_path: _Path) -> None:
 
 _load_env(_Path(__file__).resolve().parent.parent / ".env")
 
-DEFAULT_RAW_OCR_DIR = os.environ.get("RAW_OCR_DIR", os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "raw_data_advanced"))
-DEFAULT_RESULTS_DIR = os.environ.get("RESULTS_DIR", "results_simple")
+def _require_env(key: str) -> str:
+    val = os.environ.get(key)
+    if val is None:
+        raise RuntimeError(f"Missing required environment variable: {key}  (check your .env file)")
+    return val
+
+DEFAULT_RAW_OCR_DIR = _require_env("RAW_OCR_DIR")
+DEFAULT_RESULTS_DIR = _require_env("RESULTS_DIR")
 
 
 # =============================================================================

@@ -102,14 +102,22 @@ def _load_env(env_path: Path) -> None:
 _load_env(Path(__file__).resolve().parent.parent / ".env")
 
 
+def _require_env(key: str) -> str:
+    """Return an environment variable or raise with a clear message."""
+    val = os.environ.get(key)
+    if val is None:
+        raise RuntimeError(f"Missing required environment variable: {key}  (check your .env file)")
+    return val
+
+
 def get_paths():
-    """Calculate paths from .env (with fallbacks relative to project root)."""
+    """Calculate paths from .env (no fallbacks)."""
     project_root = Path(__file__).resolve().parent.parent
 
     return {
-        'images_dir': project_root / os.environ.get("IMAGES_DIR", os.path.join("docs", "ci_repo")),
-        'exports_dir': project_root / os.environ.get("YOLO_EXPORTS_DIR", "yolo_exports"),
-        'raw_ocr_dir': project_root / os.environ.get("RAW_OCR_DIR", os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "raw_data_advanced")),
+        'images_dir': project_root / _require_env("IMAGES_DIR"),
+        'exports_dir': project_root / _require_env("YOLO_EXPORTS_DIR"),
+        'raw_ocr_dir': project_root / _require_env("RAW_OCR_DIR"),
     }
 
 
