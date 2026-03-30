@@ -87,15 +87,29 @@ class DetectedAsset:
     validated_by: str = "none"       # "caption", "ocr_keyword", "standalone", "layout_only", or "none"
 
 
+def _load_env(env_path: Path) -> None:
+    """Load key=value pairs from a .env file into os.environ (no-op if missing)."""
+    if not env_path.exists():
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, _, value = line.partition('=')
+            os.environ.setdefault(key.strip(), value.strip())
+
+_load_env(Path(__file__).resolve().parent.parent / ".env")
+
+
 def get_paths():
-    """Calculate paths relative to this script file."""
-    script_dir = Path(__file__).resolve().parent
-    project_root = script_dir.parent if script_dir.name != "docs" else script_dir
-    
+    """Calculate paths from .env (with fallbacks relative to project root)."""
+    project_root = Path(__file__).resolve().parent.parent
+
     return {
-        'images_dir': project_root / "docs" / "ci_repo",
-        'exports_dir': project_root / "yolo_exports",  # Output directory for extracted assets
-        'raw_ocr_dir': project_root / "iris_ocr" / "CM_Spec_OCR_and_figtab_output" / "raw_data_advanced",
+        'images_dir': project_root / os.environ.get("IMAGES_DIR", os.path.join("docs", "ci_repo")),
+        'exports_dir': project_root / os.environ.get("YOLO_EXPORTS_DIR", "yolo_exports"),
+        'raw_ocr_dir': project_root / os.environ.get("RAW_OCR_DIR", os.path.join("iris_ocr", "CM_Spec_OCR_and_figtab_output", "raw_data_advanced")),
     }
 
 
