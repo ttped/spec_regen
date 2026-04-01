@@ -81,6 +81,43 @@ LLM_CONFIG = {
 }
 
 
+def has_table_crops(yolo_exports_dir: str, doc_stem: str) -> bool:
+    """Check if YOLO exported any table crops for this document."""
+    from asset_processor import resolve_asset_directory
+    doc_dir = resolve_asset_directory(yolo_exports_dir, doc_stem)
+    if not doc_dir or not os.path.isdir(doc_dir):
+        return False
+    for fname in os.listdir(doc_dir):
+        if not fname.endswith('.json'):
+            continue
+        meta_path = os.path.join(doc_dir, fname)
+        with open(meta_path) as f:
+            meta = json.load(f)
+        if meta.get('asset_type') in ('table', 'tab', 'table_layout', 'tab_layout'):
+            return True
+    return False
+
+
+def iris_ready_for_doc(table_jsons_dir: str, doc_stem: str) -> bool:
+    """Check if IRIS table OCR deliverable exists for this document."""
+    import re
+    if not os.path.isdir(table_jsons_dir):
+        return False
+    doc_norm = re.sub(r'[\s_-]+', '', doc_stem.lower())
+    for entry in os.listdir(table_jsons_dir):
+        entry_path = os.path.join(table_jsons_dir, entry)
+        if not os.path.isdir(entry_path):
+            continue
+        entry_norm = re.sub(r'[\s_-]+', '', entry.lower())
+        if entry_norm == doc_norm:
+            excel_dir = os.path.join(entry_path, 'excel')
+            json_dir = os.path.join(entry_path, 'table_jsons')
+            has_excel = os.path.isdir(excel_dir) and any(f.endswith('.xlsx') for f in os.listdir(excel_dir))
+            has_json = os.path.isdir(json_dir) and any(f.endswith('.json') for f in os.listdir(json_dir))
+            return has_excel or has_json
+    return False
+
+
 def get_document_stems(input_dir: str) -> List[str]:
     stems = set()
     try:
@@ -373,7 +410,10 @@ if __name__ == '__main__':
         # STEP 1: CLASSIFY
         if args.step in ["classify", "all"]:
             print("[1: Classify]")
-            run_classification_on_file(raw_input, classify_out, LLM_CONFIG, max_workers=4)
+            if args.step == "all" and os.path.exists(classify_out):
+                print(f"  [Skip] Already done")
+            else:
+                run_classification_on_file(raw_input, classify_out, LLM_CONFIG, max_workers=4)
             result = load_classification_result(classify_out)
             if result and result.get('is_stub'):
                 print("  [Info] Document is a stub, skipping remaining steps.")
@@ -382,112 +422,138 @@ if __name__ == '__main__':
         # STEP 2: TITLE
         if args.step in ["title", "all"]:
             print("[2: Title]")
-            if not os.path.exists(classify_out):
-                print(f"  [FAIL] Classification output not found: {classify_out}")
-                print(f"         Step 1 (classify) must complete successfully first.")
-                print(f"         Skipping remaining steps for {stem}.")
-                continue
-
-            result = load_classification_result(classify_out)
-            doc_type = result.get('document_type', 'unknown') if result else 'unknown'
-
-            if doc_type == 'no_title':
-                with open(title_out, 'w') as f: json.dump([], f)
+            if args.step == "all" and os.path.exists(title_out):
+                print(f"  [Skip] Already done")
             else:
-                extract_title_from_first_page(raw_input, title_out)
+                if not os.path.exists(classify_out):
+                    print(f"  [FAIL] Classification output not found: {classify_out}")
+                    print(f"         Step 1 (classify) must complete successfully first.")
+                    print(f"         Skipping remaining steps for {stem}.")
+                    continue
+
+                result = load_classification_result(classify_out)
+                doc_type = result.get('document_type', 'unknown') if result else 'unknown'
+
+                if doc_type == 'no_title':
+                    with open(title_out, 'w') as f: json.dump([], f)
+                else:
+                    extract_title_from_first_page(raw_input, title_out)
 
         # STEP 3: STRUCTURE
         if args.step in ["structure", "all"]:
             print("[3: Structure]")
-            if not os.path.exists(classify_out):
-                print(f"  [FAIL] Classification output not found: {classify_out}")
-                print(f"         Step 1 (classify) must complete successfully first.")
-                print(f"         Skipping remaining steps for {stem}.")
-                continue
-            content_start = load_content_start_page(classify_out, default=1)
-            run_section_processing_on_file(
-                raw_input,
-                organized_out,
-                content_start_page=content_start,
-                yolo_exports_dir=figures_dir,  # Pass YOLO exports for overlap filtering
-                doc_stem=figures_stem
-            )
-            if not os.path.exists(organized_out):
-                print(f"  [FAIL] Structure processing produced no output: {organized_out}")
-                print(f"         Skipping remaining steps for {stem}.")
-                continue
+            if args.step == "all" and os.path.exists(organized_out):
+                print(f"  [Skip] Already done")
+            else:
+                if not os.path.exists(classify_out):
+                    print(f"  [FAIL] Classification output not found: {classify_out}")
+                    print(f"         Step 1 (classify) must complete successfully first.")
+                    print(f"         Skipping remaining steps for {stem}.")
+                    continue
+                content_start = load_content_start_page(classify_out, default=1)
+                run_section_processing_on_file(
+                    raw_input,
+                    organized_out,
+                    content_start_page=content_start,
+                    yolo_exports_dir=figures_dir,  # Pass YOLO exports for overlap filtering
+                    doc_stem=figures_stem
+                )
+                if not os.path.exists(organized_out):
+                    print(f"  [FAIL] Structure processing produced no output: {organized_out}")
+                    print(f"         Skipping remaining steps for {stem}.")
+                    continue
 
         # STEP 4: ML FILTER
         if args.step in ["ml_filter", "all"]:
             print("[4: ML Reclassify]")
-            if not os.path.exists(organized_out):
-                print(f"  [FAIL] Organized output not found: {organized_out}")
-                print(f"         Step 3 (structure) must complete successfully first.")
-                print(f"         Skipping remaining steps for {stem}.")
-                continue
-
-            if stem not in sections_to_keep_by_doc:
-                shutil.copy(organized_out, ml_filtered_out)
+            if args.step == "all" and os.path.exists(ml_filtered_out):
+                print(f"  [Skip] Already done")
             else:
-                sections_to_keep = sections_to_keep_by_doc[stem]
-                with open(organized_out, 'r') as f: data = json.load(f)
+                if not os.path.exists(organized_out):
+                    print(f"  [FAIL] Organized output not found: {organized_out}")
+                    print(f"         Step 3 (structure) must complete successfully first.")
+                    print(f"         Skipping remaining steps for {stem}.")
+                    continue
 
-                elements = data.get('elements', []) if isinstance(data, dict) else data
-                page_metadata = data.get('page_metadata', {}) if isinstance(data, dict) else {}
+                if stem not in sections_to_keep_by_doc:
+                    shutil.copy(organized_out, ml_filtered_out)
+                else:
+                    sections_to_keep = sections_to_keep_by_doc[stem]
+                    with open(organized_out, 'r') as f: data = json.load(f)
 
-                reclassified_elements, kept, converted = reclassify_elements(elements, sections_to_keep)
-                print(f"  Sections kept: {kept}, converted to text blocks: {converted}")
+                    elements = data.get('elements', []) if isinstance(data, dict) else data
+                    page_metadata = data.get('page_metadata', {}) if isinstance(data, dict) else {}
 
-                with open(ml_filtered_out, 'w') as f:
-                    json.dump({'page_metadata': page_metadata, 'elements': reclassified_elements}, f, indent=4)
+                    reclassified_elements, kept, converted = reclassify_elements(elements, sections_to_keep)
+                    print(f"  Sections kept: {kept}, converted to text blocks: {converted}")
+
+                    with open(ml_filtered_out, 'w') as f:
+                        json.dump({'page_metadata': page_metadata, 'elements': reclassified_elements}, f, indent=4)
 
         # STEP 5: ASSETS (using YOLO exports or manual exports)
         if args.step in ["assets", "all"]:
             print("[5: Assets]")
-            input_file = ml_filtered_out if os.path.exists(ml_filtered_out) else organized_out
-            if not os.path.exists(input_file):
-                print(f"  [FAIL] Asset input not found: {input_file}")
-                print(f"         Expected from step 4 (ml_filter) or step 3 (structure).")
-                print(f"         Skipping remaining steps for {stem}.")
-                continue
-            run_asset_integration(input_file, with_assets_out, figures_dir, figures_stem, positioning_mode="bbox")
-            if not os.path.exists(with_assets_out):
-                print(f"  [FAIL] Asset integration produced no output: {with_assets_out}")
-                print(f"         Skipping remaining steps for {stem}.")
-                continue
+            if args.step == "all" and os.path.exists(with_assets_out):
+                print(f"  [Skip] Already done")
+            else:
+                input_file = ml_filtered_out if os.path.exists(ml_filtered_out) else organized_out
+                if not os.path.exists(input_file):
+                    print(f"  [FAIL] Asset input not found: {input_file}")
+                    print(f"         Expected from step 4 (ml_filter) or step 3 (structure).")
+                    print(f"         Skipping remaining steps for {stem}.")
+                    continue
+                run_asset_integration(input_file, with_assets_out, figures_dir, figures_stem, positioning_mode="bbox")
+                if not os.path.exists(with_assets_out):
+                    print(f"  [FAIL] Asset integration produced no output: {with_assets_out}")
+                    print(f"         Skipping remaining steps for {stem}.")
+                    continue
 
         # STEP 6: TABLES (IRIS table OCR)
         if args.step in ["tables", "all"]:
             print("[6: Tables (IRIS)]")
-            if not os.path.exists(with_assets_out):
-                print(f"  [FAIL] Tables input not found: {with_assets_out}")
-                print(f"         Step 5 (assets) must complete successfully first.")
-                print(f"         Skipping remaining steps for {stem}.")
-                continue
-            run_iris_table_processing(
-                with_assets_out,
-                tables_out,
-                args.table_jsons_dir,
-                figures_stem,
-            )
+            if args.step == "all" and os.path.exists(tables_out):
+                print(f"  [Skip] Already done")
+            else:
+                if not os.path.exists(with_assets_out):
+                    print(f"  [FAIL] Tables input not found: {with_assets_out}")
+                    print(f"         Step 5 (assets) must complete successfully first.")
+                    print(f"         Skipping remaining steps for {stem}.")
+                    continue
+                # Gate: if doc has table crops, IRIS table OCR must be present
+                if has_table_crops(figures_dir, figures_stem):
+                    if not iris_ready_for_doc(args.table_jsons_dir, figures_stem):
+                        print(f"  [WAIT] Document has table crops but IRIS table OCR not yet received.")
+                        print(f"         Deferring tables/write/validate for {stem}.")
+                        continue
+                run_iris_table_processing(
+                    with_assets_out,
+                    tables_out,
+                    args.table_jsons_dir,
+                    figures_stem,
+                )
 
         # STEP 7: WRITE
         if args.step in ["write", "all"]:
             print("[7: Write]")
-            # Prefer tables_out (has both assets + tables), fall back to with_assets_out
-            # (has assets but no table processing). Never silently skip assets.
-            if os.path.exists(tables_out):
-                input_file = tables_out
-            elif os.path.exists(with_assets_out):
-                print(f"  [WARNING] Tables output not found, writing from asset output instead.")
-                print(f"            Table processing may have failed for {stem}.")
-                input_file = with_assets_out
+            if args.step == "all" and os.path.exists(final_docx):
+                print(f"  [Skip] Already done")
             else:
-                print(f"  [FAIL] No input available for write step.")
-                print(f"         Neither {tables_out} nor {with_assets_out} exist.")
-                print(f"         Steps 5-6 must complete successfully first.")
-                continue
-            run_docx_creation(input_file, final_docx, figures_dir, figures_stem, title_out)
+                if os.path.exists(tables_out):
+                    input_file = tables_out
+                elif has_table_crops(figures_dir, figures_stem):
+                    # Doc has tables but tables_out is missing — don't write a broken docx
+                    print(f"  [WAIT] Tables output not found and document has table crops.")
+                    print(f"         Deferring write for {stem} until table processing completes.")
+                    continue
+                elif os.path.exists(with_assets_out):
+                    # No table crops — safe to write directly from assets
+                    input_file = with_assets_out
+                else:
+                    print(f"  [FAIL] No input available for write step.")
+                    print(f"         Neither {tables_out} nor {with_assets_out} exist.")
+                    print(f"         Steps 5-6 must complete successfully first.")
+                    continue
+                run_docx_creation(input_file, final_docx, figures_dir, figures_stem, title_out)
 
         # STEP 8: VALIDATE
         if args.step in ["validate", "all"]:
