@@ -55,7 +55,7 @@ _IRIS_LEGACY_PATTERN = re.compile(
 
 def _normalize_stem(name: str) -> str:
     """Collapse spaces, underscores, hyphens and case for fuzzy matching."""
-    return name.replace(" ", "_").replace("-", "_").lower()
+    return re.sub(r'[\s\-_]+', '_', name.lower()).strip('_')
 
 
 def _extract_canonical_key(stem: str) -> Optional[tuple]:
@@ -93,17 +93,16 @@ def _extract_canonical_key(stem: str) -> Optional[tuple]:
 def _build_excel_index(table_jsons_dir: str) -> Dict[str, dict]:
     """
     Scan table_jsons_dir for Excel files. Handles multiple layouts.
-    Builds canonical, page-based, doc-agnostic page-based, and stem indexes.
+    Builds canonical, page-based, and stem indexes.
     """
     canonical_index = {}
     page_index = {}
-    agnostic_page_index = {}
     stem_index = {}
     file_count = 0
 
     if not os.path.isdir(table_jsons_dir):
         print(f"    [Warning] table_jsons_dir not found: {table_jsons_dir}")
-        return {"_canonical": {}, "_page": {}, "_agnostic_page": {}, "_stem": {}}
+        return {"_canonical": {}, "_page": {}, "_stem": {}}
 
     def _index_file(filepath, stem):
         nonlocal file_count
@@ -113,15 +112,11 @@ def _build_excel_index(table_jsons_dir: str) -> Dict[str, dict]:
         if key:
             canonical_index[key] = filepath
             doc, page, table_id = key
-            
+
             page_key = (doc, page)
             if page_key not in page_index:
                 page_index[page_key] = []
             page_index[page_key].append((table_id, filepath))
-            
-            if page not in agnostic_page_index:
-                agnostic_page_index[page] = []
-            agnostic_page_index[page].append((table_id, filepath))
 
         stem_index[_normalize_stem(stem)] = filepath
 
@@ -144,35 +139,27 @@ def _build_excel_index(table_jsons_dir: str) -> Dict[str, dict]:
                     continue
                 _index_file(os.path.join(root, filename), os.path.splitext(filename)[0])
 
-    # Sort page_index and agnostic_page_index entries by table_id for positional matching
+    # Sort page_index entries by table_id for positional matching
     for page_key in page_index:
         page_index[page_key].sort(key=lambda x: x[0])
-    for page_num in agnostic_page_index:
-        agnostic_page_index[page_num].sort(key=lambda x: x[0])
 
     print(f"  - Scanned Excel files: {file_count} in {table_jsons_dir}")
 
-    return {
-        "_canonical": canonical_index, 
-        "_page": page_index, 
-        "_agnostic_page": agnostic_page_index,
-        "_stem": stem_index
-    }
+    return {"_canonical": canonical_index, "_page": page_index, "_stem": stem_index}
 
 
 def _build_json_index(table_jsons_dir: str) -> Dict[str, dict]:
     """
     Scan table_jsons_dir for IRIS metadata JSON files (fallback).
-    Builds canonical, page-based, doc-agnostic page-based, and stem indexes.
+    Builds canonical, page-based, and stem indexes.
     """
     canonical_index = {}
     page_index = {}
-    agnostic_page_index = {}
     stem_index = {}
     file_count = 0
 
     if not os.path.isdir(table_jsons_dir):
-        return {"_canonical": {}, "_page": {}, "_agnostic_page": {}, "_stem": {}}
+        return {"_canonical": {}, "_page": {}, "_stem": {}}
 
     def _index_file(filepath, stem):
         nonlocal file_count
@@ -182,15 +169,11 @@ def _build_json_index(table_jsons_dir: str) -> Dict[str, dict]:
         if key:
             canonical_index[key] = filepath
             doc, page, table_id = key
-            
+
             page_key = (doc, page)
             if page_key not in page_index:
                 page_index[page_key] = []
             page_index[page_key].append((table_id, filepath))
-            
-            if page not in agnostic_page_index:
-                agnostic_page_index[page] = []
-            agnostic_page_index[page].append((table_id, filepath))
 
         stem_index[_normalize_stem(stem)] = filepath
 
@@ -213,38 +196,33 @@ def _build_json_index(table_jsons_dir: str) -> Dict[str, dict]:
                     continue
                 _index_file(os.path.join(root, filename), os.path.splitext(filename)[0])
 
-    # Sort page_index and agnostic_page_index entries by table_id
+    # Sort page_index entries by table_id
     for page_key in page_index:
         page_index[page_key].sort(key=lambda x: x[0])
-    for page_num in agnostic_page_index:
-        agnostic_page_index[page_num].sort(key=lambda x: x[0])
 
-    return {
-        "_canonical": canonical_index, 
-        "_page": page_index, 
-        "_agnostic_page": agnostic_page_index,
-        "_stem": stem_index
-    }
+    return {"_canonical": canonical_index, "_page": page_index, "_stem": stem_index}
 
 
 
 def _lookup(stem: str, index: dict, position_on_page: int = 0) -> Optional[str]:
     """
     Look up a file path for a YOLO crop stem.
-    
+
     Matching priority:
     1. Exact canonical key (doc, page, id)
     2. Page-based positional match (doc, page) + nth table on that page
-    3. Doc-agnostic page-based positional match (page) + nth table
-    4. Normalized stem — direct name match fallback
+    3. Normalized stem — direct name match fallback
+
+    NOTE: A doc-agnostic page fallback was intentionally removed. It mixed
+    tables from all documents into a single index keyed only by page number,
+    which reliably matched the wrong document's tables at scale.
     """
     canonical_index = index.get("_canonical", {})
     page_index = index.get("_page", {})
-    agnostic_page_index = index.get("_agnostic_page", {})
     stem_index = index.get("_stem", {})
 
     key = _extract_canonical_key(stem)
-    
+
     if key:
         doc, page, _yolo_id = key
 
@@ -261,15 +239,7 @@ def _lookup(stem: str, index: dict, position_on_page: int = 0) -> Optional[str]:
             elif len(entries) == 1:
                 return entries[0][1]
 
-        # 3. Doc-agnostic page-based match (fixes cases where YOLO doc != IRIS doc)
-        if page in agnostic_page_index:
-            entries = agnostic_page_index[page]
-            if position_on_page < len(entries):
-                return entries[position_on_page][1]
-            elif len(entries) == 1:
-                return entries[0][1]
-
-    # 4. Fallback: direct normalized stem match
+    # 3. Fallback: direct normalized stem match
     normalized = _normalize_stem(stem)
     return stem_index.get(normalized)
 
