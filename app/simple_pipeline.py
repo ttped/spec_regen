@@ -384,9 +384,11 @@ if __name__ == '__main__':
     # ==========================================================================
     validation_results = []
 
-    for stem in doc_stems:
+    total_docs = len(doc_stems)
+    for doc_idx, stem in enumerate(doc_stems, 1):
+        pct = doc_idx / total_docs * 100
         print(f"{'=' * 60}")
-        print(f"{stem}")
+        print(f"[{doc_idx}/{total_docs} ({pct:.0f}%)] {stem}")
         print(f"{'=' * 60}")
 
         # Resolve the actual YOLO exports subdirectory for this stem.
