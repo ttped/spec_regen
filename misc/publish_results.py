@@ -37,12 +37,12 @@ _load_env(_PROJECT_ROOT / ".env")
 # CONFIG — edit here or set in .env
 # =============================================================================
 
-RESULTS_DIR  = os.environ.get("RESULTS_DIR",  str(_PROJECT_ROOT / "results_simple"))
-PDF_DIR      = os.environ.get("PDF_DIR",       str(_PROJECT_ROOT / "docs" / "ci_repo"))
-OUTPUT_DRIVE = os.environ.get("OUTPUT_DRIVE",  r"P:\Output\Specs")
+RESULTS_DIR  = str(_PROJECT_ROOT / "results_simple")
+PDF_DIR      = str(_PROJECT_ROOT / "docs" / "ci_repo")
+OUTPUT_DRIVE = r"Z:\\Public\\Mazer_Joel\\Spec_Regen_Files\\output"
 
-DRY_RUN = False   # Set True to preview without copying
-WORKERS = 16      # Parallel copy threads — increase for fast network drives
+DRY_RUN = True   # Set True to preview without copying
+WORKERS = 8      # Parallel copy threads — increase for fast network drives
 
 # =============================================================================
 
@@ -87,10 +87,15 @@ def _copy_pair(stem: str, docx: Path, pdf: Path, dest_root: Path):
     shutil.copy2(pdf,  folder / pdf.name)
 
 
-def publish() -> None:
+
+    
+
+
+if __name__ == "__main__":
     results_path = Path(RESULTS_DIR)
     pdf_path     = Path(PDF_DIR)
     dest_path    = Path(OUTPUT_DRIVE)
+
 
     for label, path in [("RESULTS_DIR", results_path), ("PDF_DIR", pdf_path)]:
         if not path.is_dir():
@@ -99,9 +104,7 @@ def publish() -> None:
 
     paired, missing = _find_pairs(results_path, pdf_path)
 
-    if not paired:
-        print("No matched docx/pdf pairs found.")
-        return
+
 
     print(f"{'[DRY RUN] ' if DRY_RUN else ''}Destination : {dest_path}")
     print(f"Pairs found : {len(paired)}")
@@ -117,7 +120,7 @@ def publish() -> None:
             print(f"    {docx.name}")
             print(f"    {pdf.name}")
         print(f"\nWould copy {len(paired)} pairs. Set DRY_RUN = False to apply.")
-        return
+        
 
     dest_path.mkdir(parents=True, exist_ok=True)
 
@@ -142,7 +145,3 @@ def publish() -> None:
     print(f"\nCopied {completed}/{len(paired)} pairs to {dest_path}")
     if errors:
         print(f"{len(errors)} errors — check output above.")
-
-
-if __name__ == "__main__":
-    publish()
