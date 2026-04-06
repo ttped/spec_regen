@@ -15,9 +15,12 @@ def flatten_adv_jsons(source_folder: Path, target_folder: Path):
     Finds nested adv_*.json files in source_folder, removes the 'adv_' prefix, 
     and copies them to the flat target_folder.
     """
-    # Create the target directory if it doesn't exist yet
+    # Wipe and recreate the target directory to prevent duplicates on re-runs
+    if target_folder.exists():
+        shutil.rmtree(target_folder)
+        print(f"Cleared existing target: {target_folder.resolve()}")
     target_folder.mkdir(parents=True, exist_ok=True)
-    
+
     print(f"Searching for 'adv_*.json' in {source_folder.resolve()}...")
     
     copied_count = 0
@@ -27,14 +30,7 @@ def flatten_adv_jsons(source_folder: Path, target_folder: Path):
         # Strip the 'adv_' prefix for the destination filename
         new_name = json_path.name.replace('adv_', '', 1)
         destination_path = target_folder / new_name
-        
-        # Safeguard: Prevent overwriting files with the same name from different folders
-        counter = 1
-        original_stem = destination_path.stem
-        while destination_path.exists():
-            destination_path = target_folder / f"{original_stem}_{counter}{destination_path.suffix}"
-            counter += 1
-            
+
         # Copy the file to the flat destination directory
         shutil.copy2(json_path, destination_path)
         print(f"Copied: {json_path.name} -> {destination_path.name}")
