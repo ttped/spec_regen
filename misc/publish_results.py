@@ -48,8 +48,9 @@ WORKERS = 8      # Parallel copy threads — increase for fast network drives
 
 
 def _norm(name: str) -> str:
-    """Collapse separators and lowercase for fuzzy matching."""
-    return re.sub(r'[\s\-_]+', '_', name.lower()).strip('_')
+    """Collapse separators and lowercase for fuzzy matching. Strips trailing _1 or _2."""
+    base = re.sub(r'[\s\-_]+', '_', name.lower()).strip('_')
+    return re.sub(r'_[12]$', '', base)
 
 
 def _build_pdf_index(pdf_dir: Path) -> tuple:
@@ -92,15 +93,12 @@ if __name__ == "__main__":
     pdf_path     = Path(PDF_DIR)
     dest_path    = Path(OUTPUT_DRIVE)
 
-
     for label, path in [("RESULTS_DIR", results_path), ("PDF_DIR", pdf_path)]:
         if not path.is_dir():
             print(f"[Error] {label} not found: {path}")
             sys.exit(1)
 
     paired, missing = _find_pairs(results_path, pdf_path)
-
-
 
     print(f"{'[DRY RUN] ' if DRY_RUN else ''}Destination : {dest_path}")
     print(f"Pairs found : {len(paired)}")
@@ -117,27 +115,20 @@ if __name__ == "__main__":
             print(f"    {pdf.name}")
         print(f"\nWould copy {len(paired)} pairs. Set DRY_RUN = False to apply.")
         
+    if not DRY_RUN:
+        dest_path.mkdir(parents=True, exist_ok=True)
+        completed = 0
 
-    dest_path.mkdir(parents=True, exist_ok=True)
-
-    completed = 0
-    errors = []
-
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        futures = {
-            pool.submit(_copy_pair, stem, docx, pdf, dest_path): stem
-            for stem, docx, pdf in paired
-        }
-        for future in as_completed(futures):
-            stem = futures[future]
-            try:
+        with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+            futures = {
+                pool.submit(_copy_pair, stem, docx, pdf, dest_path): stem
+                for stem, docx, pdf in paired
+            }
+            for future in as_completed(futures):
+                stem = futures[future]
                 future.result()
                 completed += 1
                 print(f"  [{completed}/{len(paired)}] {stem}")
-            except Exception as e:
-                errors.append((stem, e))
-                print(f"  [ERROR] {stem}: {e}")
 
-    print(f"\nCopied {completed}/{len(paired)} pairs to {dest_path}")
-    if errors:
-        print(f"{len(errors)} errors — check output above.")
+        print(f"\nCopied {completed}/{len(paired)} pairs to {dest_path}")
+
