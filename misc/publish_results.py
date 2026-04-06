@@ -2,25 +2,18 @@
 publish_results.py - Copy completed docx + source PDF pairs to an output drive.
 
 For each generated .docx in results_dir, finds the matching source PDF in
-docs/ci_repo and copies both into a paired folder on the destination drive:
+pdf_dir and copies both into a paired folder on the destination drive:
 
-    {dest}/{stem}/
+    {OUTPUT_DRIVE}/{stem}/
         {stem}.docx
         {stem}.pdf
 
-Matching is done by stem name, with space/underscore/hyphen normalization as
-fallback for minor naming differences between the OCR pipeline and the source PDFs.
-
-Usage (from project root):
-    python misc/publish_results.py P:\\Output\\Specs
-    python misc/publish_results.py P:\\Output\\Specs --dry-run
-    python misc/publish_results.py P:\\Output\\Specs --workers 32
+Configure via .env at project root. Edit the variables below to override.
 """
 
 import os
 import re
 import sys
-import argparse
 import shutil
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -37,7 +30,21 @@ def _load_env(env_path: Path) -> None:
             key, _, value = line.partition('=')
             os.environ.setdefault(key.strip(), value.strip())
 
-_load_env(Path(__file__).resolve().parent.parent / ".env")
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_load_env(_PROJECT_ROOT / ".env")
+
+# =============================================================================
+# CONFIG — edit here or set in .env
+# =============================================================================
+
+RESULTS_DIR  = os.environ.get("RESULTS_DIR",  str(_PROJECT_ROOT / "results_simple"))
+PDF_DIR      = os.environ.get("PDF_DIR",       str(_PROJECT_ROOT / "docs" / "ci_repo"))
+OUTPUT_DRIVE = os.environ.get("OUTPUT_DRIVE",  r"P:\Output\Specs")
+
+DRY_RUN = False   # Set True to preview without copying
+WORKERS = 16      # Parallel copy threads — increase for fast network drives
+
+# =============================================================================
 
 
 def _norm(name: str) -> str:
@@ -45,13 +52,7 @@ def _norm(name: str) -> str:
     return re.sub(r'[\s\-_]+', '_', name.lower()).strip('_')
 
 
-def _build_pdf_index(pdf_dir: Path) -> dict:
-    """
-    Scan pdf_dir for .pdf files.
-    Returns two maps:
-        exact:  stem → Path   (original casing)
-        fuzzy:  normalized_stem → Path
-    """
+def _build_pdf_index(pdf_dir: Path) -> tuple:
     exact = {}
     fuzzy = {}
     for entry in pdf_dir.iterdir():
@@ -61,15 +62,8 @@ def _build_pdf_index(pdf_dir: Path) -> dict:
     return exact, fuzzy
 
 
-def _find_pairs(results_dir: Path, pdf_dir: Path):
-    """
-    Match every .docx in results_dir to a .pdf in pdf_dir.
-    Returns:
-        paired:   list of (stem, docx_path, pdf_path)
-        missing:  list of stem (docx exists, no PDF found)
-    """
+def _find_pairs(results_dir: Path, pdf_dir: Path) -> tuple:
     exact, fuzzy = _build_pdf_index(pdf_dir)
-
     paired = []
     missing = []
 
@@ -77,14 +71,7 @@ def _find_pairs(results_dir: Path, pdf_dir: Path):
         if entry.suffix != '.docx' or not entry.is_file():
             continue
         stem = entry.stem
-
-        # 1. Exact stem match
-        pdf = exact.get(stem)
-
-        # 2. Normalized fallback
-        if pdf is None:
-            pdf = fuzzy.get(_norm(stem))
-
+        pdf = exact.get(stem) or fuzzy.get(_norm(stem))
         if pdf:
             paired.append((stem, entry, pdf))
         else:
@@ -93,22 +80,19 @@ def _find_pairs(results_dir: Path, pdf_dir: Path):
     return paired, missing
 
 
-def _copy_pair(stem: str, docx: Path, pdf: Path, dest_root: Path, dry_run: bool):
-    """Copy docx + pdf into dest_root/{stem}/."""
+def _copy_pair(stem: str, docx: Path, pdf: Path, dest_root: Path):
     folder = dest_root / stem
-    if not dry_run:
-        folder.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(docx, folder / docx.name)
-        shutil.copy2(pdf,  folder / pdf.name)
-    return stem
+    folder.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(docx, folder / docx.name)
+    shutil.copy2(pdf,  folder / pdf.name)
 
 
-def publish(results_dir: str, pdf_dir: str, dest: str, dry_run: bool, workers: int) -> None:
-    results_path = Path(results_dir)
-    pdf_path     = Path(pdf_dir)
-    dest_path    = Path(dest)
+def publish() -> None:
+    results_path = Path(RESULTS_DIR)
+    pdf_path     = Path(PDF_DIR)
+    dest_path    = Path(OUTPUT_DRIVE)
 
-    for label, path in [("results_dir", results_path), ("pdf_dir", pdf_path)]:
+    for label, path in [("RESULTS_DIR", results_path), ("PDF_DIR", pdf_path)]:
         if not path.is_dir():
             print(f"[Error] {label} not found: {path}")
             sys.exit(1)
@@ -119,20 +103,20 @@ def publish(results_dir: str, pdf_dir: str, dest: str, dry_run: bool, workers: i
         print("No matched docx/pdf pairs found.")
         return
 
-    print(f"{'[DRY RUN] ' if dry_run else ''}Destination: {dest_path}")
-    print(f"Pairs to copy : {len(paired)}")
+    print(f"{'[DRY RUN] ' if DRY_RUN else ''}Destination : {dest_path}")
+    print(f"Pairs found : {len(paired)}")
     if missing:
-        print(f"No PDF found  : {len(missing)}")
+        print(f"Missing PDF : {len(missing)}")
         for stem in missing:
-            print(f"  [MISSING PDF] {stem}")
+            print(f"  [NO PDF] {stem}")
     print()
 
-    if dry_run:
+    if DRY_RUN:
         for stem, docx, pdf in paired:
             print(f"  {stem}/")
             print(f"    {docx.name}")
             print(f"    {pdf.name}")
-        print(f"\nWould copy {len(paired)} pairs. Run without --dry-run to apply.")
+        print(f"\nWould copy {len(paired)} pairs. Set DRY_RUN = False to apply.")
         return
 
     dest_path.mkdir(parents=True, exist_ok=True)
@@ -140,9 +124,9 @@ def publish(results_dir: str, pdf_dir: str, dest: str, dry_run: bool, workers: i
     completed = 0
     errors = []
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         futures = {
-            pool.submit(_copy_pair, stem, docx, pdf, dest_path, dry_run): stem
+            pool.submit(_copy_pair, stem, docx, pdf, dest_path): stem
             for stem, docx, pdf in paired
         }
         for future in as_completed(futures):
@@ -161,31 +145,4 @@ def publish(results_dir: str, pdf_dir: str, dest: str, dry_run: bool, workers: i
 
 
 if __name__ == "__main__":
-    project_root = Path(__file__).resolve().parent.parent
-
-    parser = argparse.ArgumentParser(description="Publish docx + PDF pairs to output drive")
-    parser.add_argument("dest", help="Destination root directory (e.g. P:\\Output\\Specs)")
-    parser.add_argument(
-        "--results-dir",
-        default=os.environ.get("RESULTS_DIR", str(project_root / "results_simple")),
-        help="Directory containing .docx files (default: $RESULTS_DIR)",
-    )
-    parser.add_argument(
-        "--pdf-dir",
-        default=str(project_root / "docs" / "ci_repo"),
-        help="Directory containing source PDFs (default: docs/ci_repo)",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Preview what would be copied without copying",
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=16,
-        help="Parallel copy threads (default: 16, increase for fast network drives)",
-    )
-    args = parser.parse_args()
-
-    publish(args.results_dir, args.pdf_dir, args.dest, args.dry_run, args.workers)
+    publish()
