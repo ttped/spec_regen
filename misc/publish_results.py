@@ -8,8 +8,9 @@ docs/ci_repo and copies both into a paired folder on the destination drive:
         {stem}.docx
         {stem}.pdf
 
-Matching is done by stem name, with space/underscore/hyphen normalization as
-fallback for minor naming differences between the OCR pipeline and the source PDFs.
+Matching is done by stem name, with space/underscore/hyphen normalization and
+trailing conflict-suffix stripping (_1, _2, …) as fallback for minor naming
+differences between the OCR pipeline and the source PDFs.
 
 Usage (from project root):
     python misc/publish_results.py P:\\Output\\Specs
@@ -41,11 +42,13 @@ _load_env(Path(__file__).resolve().parent.parent / ".env")
 
 
 def _norm(name: str) -> str:
-    """Collapse separators and lowercase for fuzzy matching."""
-    return re.sub(r'[\s\-_]+', '_', name.lower()).strip('_')
+    """Collapse separators, strip trailing conflict suffixes (_1, _2, …), lowercase."""
+    name = re.sub(r'[\s\-_]+', '_', name.lower()).strip('_')
+    name = re.sub(r'_\d+$', '', name)
+    return name
 
 
-def _build_pdf_index(pdf_dir: Path) -> dict:
+def _build_pdf_index(pdf_dir: Path) -> tuple[dict, dict]:
     """
     Scan pdf_dir for .pdf files.
     Returns two maps:
@@ -81,9 +84,12 @@ def _find_pairs(results_dir: Path, pdf_dir: Path):
         # 1. Exact stem match
         pdf = exact.get(stem)
 
-        # 2. Normalized fallback
+        # 2. Normalized fallback (handles separators + trailing _1/_2)
         if pdf is None:
-            pdf = fuzzy.get(_norm(stem))
+            norm_stem = _norm(stem)
+            pdf = fuzzy.get(norm_stem)
+            if pdf:
+                print(f"  [FUZZY] {stem!r} → {pdf.stem!r}")
 
         if pdf:
             paired.append((stem, entry, pdf))
