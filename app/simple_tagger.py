@@ -33,6 +33,8 @@ from tkinter import ttk, messagebox, filedialog
 from PIL import Image, ImageTk, ImageDraw
 import os
 import glob
+import re
+import json
 from pathlib import Path
 from datetime import datetime
 
@@ -84,9 +86,45 @@ CLASSES = {
 # Reverse lookup: key -> class_id
 KEY_TO_CLASS = {v[2]: k for k, v in CLASSES.items()}
 
-MODEL_PATH = None  
-MODEL_CONFIDENCE = 0.25  
-MODEL_IMAGE_SIZE = 1024  
+MODEL_PATH = None
+MODEL_CONFIDENCE = 0.25
+MODEL_IMAGE_SIZE = 1024
+
+# Load .env for YOLO_EXPORTS_DIR
+def _load_env(env_path: Path) -> None:
+    """Load key=value pairs from a .env file into os.environ (no-op if missing)."""
+    if not env_path.exists():
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, _, value = line.partition('=')
+            os.environ.setdefault(key.strip(), value.strip())
+
+_load_env(Path(__file__).resolve().parent.parent / ".env")
+
+DEFAULT_YOLO_EXPORTS_DIR = Path(__file__).resolve().parent.parent / os.environ.get("YOLO_EXPORTS_DIR", "yolo_exports")
+
+# Asset classes the pipeline cares about (class_id -> short type code)
+PIPELINE_ASSET_CLASSES = {3: "fig", 5: "tab", 8: "eq"}
+# Caption classes that pair with assets
+PIPELINE_CAPTION_CLASSES = {4: "figure_caption", 6: "table_caption", 9: "formula_caption"}
+# Which caption class belongs to which asset class
+CAPTION_TO_ASSET_CLASS = {4: 3, 6: 5, 9: 8}
+
+def parse_page_image_filename(filename: str):
+    """
+    Parse a page image filename to extract document stem and page number.
+    Expected format: {doc_stem}_page{NNN}.ext
+    Returns (doc_stem, page_number) or None.
+    """
+    match = re.match(r'^(.+)_page(\d+)\.[a-zA-Z]+$', filename)
+    if match:
+        return (match.group(1), int(match.group(2)))
+    return None
+
 # =================================================
 
 
@@ -353,6 +391,10 @@ class DocLayoutTagger:
         btn_row.pack(fill=tk.X)
         ttk.Button(btn_row, text="💾 Save (S)", command=self.save_labels, width=12).pack(side=tk.LEFT, padx=1)
         ttk.Button(btn_row, text="🔄 Reload (R)", command=self.reload_image, width=12).pack(side=tk.LEFT, padx=1)
+
+        export_row = ttk.Frame(action_frame)
+        export_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(export_row, text="📤 Export to Pipeline (E)", command=self.export_to_pipeline, style='Action.TButton').pack(fill=tk.X)
         
         stats_frame = ttk.LabelFrame(right_frame, text="Stats", padding=8)
         stats_frame.pack(fill=tk.X, pady=(0, 8))
@@ -363,7 +405,7 @@ class DocLayoutTagger:
         instr_frame = ttk.LabelFrame(right_frame, text="Keys", padding=8)
         instr_frame.pack(fill=tk.X)
         
-        instructions = "←/→:Nav | Space:Skip | A:AutoLabel\n1-0:Class | S:Save | Del:Remove"
+        instructions = "←/→:Nav | Space:Skip | A:AutoLabel\n1-0:Class | S:Save | Del:Remove\nE:Export to Pipeline"
         ttk.Label(instr_frame, text=instructions, font=('Consolas', 8), justify=tk.LEFT).pack(anchor='w')
     
     def _bind_keys(self):
@@ -377,6 +419,8 @@ class DocLayoutTagger:
         self.root.bind("<S>", lambda e: self.save_labels())
         self.root.bind("<r>", lambda e: self.reload_image())
         self.root.bind("<R>", lambda e: self.reload_image())
+        self.root.bind("<e>", lambda e: self.export_to_pipeline())
+        self.root.bind("<E>", lambda e: self.export_to_pipeline())
         self.root.bind("<a>", lambda e: self.auto_label())
         self.root.bind("<A>", lambda e: self.auto_label())
         
@@ -1098,6 +1142,191 @@ class DocLayoutTagger:
         
         messagebox.showinfo("Done", f"Auto-labeled {len(unlabeled)} images!")
         self._update_stats()
+
+    # ========== PIPELINE EXPORT ==========
+
+    def export_to_pipeline(self):
+        """
+        Export all labeled images to yolo_exports/ in the format expected by
+        asset_processor.py. This overwrites existing YOLO crops for any
+        documents that have manual labels.
+        """
+        self.save_labels()
+
+        exports_dir = DEFAULT_YOLO_EXPORTS_DIR
+        lbl_dir = Path(self.lbl_dir)
+        img_dir = Path(self.img_dir)
+
+        label_files = sorted(lbl_dir.glob("*.txt"))
+        if not label_files:
+            messagebox.showwarning("No Labels", "No label files found to export.")
+            return
+
+        # Group label files by document stem
+        doc_pages = {}  # {doc_stem: [(label_path, image_path, page_number), ...]}
+        skipped = []
+        for lbl_path in label_files:
+            img_stem = lbl_path.stem
+            parsed = parse_page_image_filename(img_stem + ".png")
+            if not parsed:
+                parsed = parse_page_image_filename(img_stem + ".jpg")
+            if not parsed:
+                skipped.append(img_stem)
+                continue
+
+            doc_stem, page_number = parsed
+
+            # Find the matching source image
+            img_path = None
+            for ext in ('.png', '.jpg', '.jpeg', '.PNG', '.JPG', '.JPEG'):
+                candidate = img_dir / (img_stem + ext)
+                if candidate.exists():
+                    img_path = candidate
+                    break
+
+            if not img_path:
+                skipped.append(img_stem)
+                continue
+
+            doc_pages.setdefault(doc_stem, []).append((lbl_path, img_path, page_number))
+
+        if not doc_pages:
+            messagebox.showwarning("No Matches", "No label files matched the expected naming pattern ({doc}_page{NNN}.ext).")
+            return
+
+        total_assets = 0
+
+        for doc_stem, pages in doc_pages.items():
+            doc_output_dir = exports_dir / doc_stem
+            doc_output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Track asset counters per type across all pages (matching yolo_asset_extractor behavior)
+            asset_counters = {"fig": 0, "tab": 0, "eq": 0}
+
+            # Sort pages by page number
+            pages.sort(key=lambda x: x[2])
+
+            for lbl_path, img_path, page_number in pages:
+                with Image.open(img_path) as img:
+                    img_w, img_h = img.size
+
+                # Read all boxes from label file
+                all_boxes = []
+                with open(lbl_path, 'r') as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if len(parts) < 5:
+                            continue
+                        class_id = int(parts[0])
+                        cx, cy, bw, bh = map(float, parts[1:5])
+                        # Convert YOLO normalized to pixel coords
+                        x1 = int((cx - bw / 2) * img_w)
+                        y1 = int((cy - bh / 2) * img_h)
+                        x2 = int((cx + bw / 2) * img_w)
+                        y2 = int((cy + bh / 2) * img_h)
+                        all_boxes.append((x1, y1, x2, y2, class_id))
+
+                # Separate assets and captions
+                asset_boxes = [(x1, y1, x2, y2, cid) for x1, y1, x2, y2, cid in all_boxes if cid in PIPELINE_ASSET_CLASSES]
+                caption_boxes = [(x1, y1, x2, y2, cid) for x1, y1, x2, y2, cid in all_boxes if cid in PIPELINE_CAPTION_CLASSES]
+
+                for ax1, ay1, ax2, ay2, asset_class_id in asset_boxes:
+                    asset_type = PIPELINE_ASSET_CLASSES[asset_class_id]
+                    asset_counters[asset_type] += 1
+                    asset_index = asset_counters[asset_type]
+
+                    # Find nearest matching caption
+                    caption_bbox = None
+                    caption_class_id = None
+                    best_dist = float('inf')
+                    for cx1, cy1, cx2, cy2, ccid in caption_boxes:
+                        # Caption must belong to this asset type
+                        if CAPTION_TO_ASSET_CLASS.get(ccid) != asset_class_id:
+                            continue
+                        # Check horizontal overlap
+                        overlap_left = max(ax1, cx1)
+                        overlap_right = min(ax2, cx2)
+                        if overlap_right <= overlap_left:
+                            continue
+                        # Vertical distance (caption should be near asset)
+                        dist = min(abs(cy1 - ay2), abs(ay1 - cy2))
+                        if dist < best_dist and dist < img_h * 0.1:
+                            best_dist = dist
+                            caption_bbox = (cx1, cy1, cx2, cy2)
+                            caption_class_id = ccid
+
+                    # Crop asset from source image
+                    filename = f"{doc_stem}_{asset_type}_p{page_number:03d}_{asset_index:03d}.jpg"
+                    with Image.open(img_path) as img:
+                        padding = 5
+                        crop_x1 = max(0, ax1 - padding)
+                        crop_y1 = max(0, ay1 - padding)
+                        crop_x2 = min(img.width, ax2 + padding)
+                        crop_y2 = min(img.height, ay2 + padding)
+                        cropped = img.crop((crop_x1, crop_y1, crop_x2, crop_y2))
+                        cropped.save(doc_output_dir / filename, "JPEG", quality=95, dpi=(300, 300))
+
+                    # Crop caption image if found
+                    caption_image_filename = None
+                    if caption_bbox:
+                        caption_image_filename = filename.replace('.jpg', '_caption.jpg')
+                        with Image.open(img_path) as img:
+                            ccx1, ccy1, ccx2, ccy2 = caption_bbox
+                            cropped_cap = img.crop((max(0, ccx1 - padding), max(0, ccy1 - padding),
+                                                    min(img.width, ccx2 + padding), min(img.height, ccy2 + padding)))
+                            cropped_cap.save(doc_output_dir / caption_image_filename, "JPEG", quality=95, dpi=(300, 300))
+
+                    # Build metadata JSON matching create_asset_metadata() format
+                    width = ax2 - ax1
+                    height = ay2 - ay1
+                    metadata = {
+                        "asset_id": f"{doc_stem}_{asset_type}_p{page_number}_{ax1}_{ay1}",
+                        "asset_type": asset_type,
+                        "page": page_number,
+                        "bbox": {
+                            "pixels": [ax1, ay1, width, height],
+                            "page_width_px": img_w,
+                            "page_height_px": img_h,
+                        },
+                        "export": {
+                            "image_file": filename,
+                            "caption_image_file": caption_image_filename,
+                            "dpi": 300,
+                            "format": "JPEG",
+                        },
+                        "detection": {
+                            "method": "manual",
+                            "model": "simple_tagger",
+                            "confidence": 1.0,
+                            "class_id": asset_class_id,
+                            "class_name": CLASSES[asset_class_id][0],
+                            "validated_by": "manual",
+                            "has_caption": caption_bbox is not None,
+                        },
+                    }
+
+                    if caption_bbox:
+                        ccx1, ccy1, ccx2, ccy2 = caption_bbox
+                        metadata["detection"]["caption_bbox"] = {
+                            "pixels": [ccx1, ccy1, ccx2 - ccx1, ccy2 - ccy1],
+                        }
+
+                    # Save metadata JSON
+                    json_filename = filename.replace('.jpg', '.json')
+                    with open(doc_output_dir / json_filename, 'w', encoding='utf-8') as f:
+                        json.dump(metadata, f, indent=2)
+
+                    total_assets += 1
+
+        summary = f"Exported {total_assets} assets for {len(doc_pages)} document(s) to:\n{exports_dir}"
+        if skipped:
+            summary += f"\n\nSkipped {len(skipped)} files (naming didn't match {{doc}}_page{{NNN}}):\n"
+            summary += ", ".join(skipped[:10])
+            if len(skipped) > 10:
+                summary += f"... (+{len(skipped) - 10} more)"
+
+        messagebox.showinfo("Export Complete", summary)
+        print(f"[Export] {summary}")
 
 
 def main():
