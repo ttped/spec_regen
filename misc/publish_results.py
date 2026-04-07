@@ -66,7 +66,8 @@ def _build_pdf_index(pdf_dir: Path) -> tuple:
 def _find_pairs(results_dir: Path, pdf_dir: Path) -> tuple:
     exact, fuzzy = _build_pdf_index(pdf_dir)
     paired = []
-    missing = []
+    missing_pdfs = []
+    matched_pdf_paths = set()
 
     for entry in sorted(results_dir.iterdir()):
         if entry.suffix != '.docx' or not entry.is_file():
@@ -75,10 +76,15 @@ def _find_pairs(results_dir: Path, pdf_dir: Path) -> tuple:
         pdf = exact.get(stem) or fuzzy.get(_norm(stem))
         if pdf:
             paired.append((stem, entry, pdf))
+            matched_pdf_paths.add(pdf)
         else:
-            missing.append(stem)
+            missing_pdfs.append(stem)
 
-    return paired, missing
+    # Find PDFs that were never matched to a docx
+    all_pdfs = set(exact.values())
+    unmatched_pdfs = [p.name for p in all_pdfs if p not in matched_pdf_paths]
+
+    return paired, missing_pdfs, sorted(unmatched_pdfs)
 
 
 def _copy_pair(stem: str, docx: Path, pdf: Path, dest_root: Path):
@@ -98,14 +104,20 @@ if __name__ == "__main__":
             print(f"[Error] {label} not found: {path}")
             sys.exit(1)
 
-    paired, missing = _find_pairs(results_path, pdf_path)
+    paired, missing_pdfs, unmatched_pdfs = _find_pairs(results_path, pdf_path)
 
     print(f"{'[DRY RUN] ' if DRY_RUN else ''}Destination : {dest_path}")
     print(f"Pairs found : {len(paired)}")
-    if missing:
-        print(f"Missing PDF : {len(missing)}")
-        for stem in missing:
-            print(f"  [NO PDF] {stem}")
+    
+    if missing_pdfs:
+        print(f"\n[!] .docx files missing a source PDF ({len(missing_pdfs)}):")
+        for stem in missing_pdfs:
+            print(f"  - {stem}.docx")
+            
+    if unmatched_pdfs:
+        print(f"\n[!] .pdf files missing a generated .docx ({len(unmatched_pdfs)}):")
+        for pdf_name in unmatched_pdfs:
+            print(f"  - {pdf_name}")
     print()
 
     if DRY_RUN:
@@ -131,4 +143,3 @@ if __name__ == "__main__":
                 print(f"  [{completed}/{len(paired)}] {stem}")
 
         print(f"\nCopied {completed}/{len(paired)} pairs to {dest_path}")
-
