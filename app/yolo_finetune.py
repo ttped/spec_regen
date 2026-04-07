@@ -27,6 +27,9 @@ from pathlib import Path
 from dataclasses import dataclass
 
 from doclayout_yolo import YOLOv10
+import numpy as np
+if not hasattr(np, 'trapz'):
+    np.trapz = np.trapezoid
 
 
 # =============================================================================

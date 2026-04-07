@@ -616,8 +616,6 @@ def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[b
         return False, None, None, None, context
 
     # 2. Soft cap on major section number.
-    #    Old: hard reject > 10. New: let the ML model handle it.
-    #    We still reject obviously absurd numbers (> 100) as a safety valve.
     if parts and parts[0].isdigit():
         major_section = int(parts[0])
         if major_section > 100:
@@ -629,6 +627,37 @@ def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[b
     # Split title at separator (handles "--", "-", "~", "=", "." patterns)
     topic, remainder = split_topic_at_separator(full_topic)
     
+    # --- Hard filters for edge cases ---
+    
+    # Reject if topic is empty or just whitespace
+    if not topic.strip():
+        if debug:
+            print(f"      [DEBUG] Rejected (empty topic): '{section_num}'")
+        context['rejection_reason'] = 'empty_topic'
+        return False, None, None, None, context
+        
+    # Reject overly long titles (13 or more words)
+    if len(topic.split()) >= 13:
+        if debug:
+            print(f"      [DEBUG] Rejected (topic too long, >= 13 words): '{section_num}'")
+        context['rejection_reason'] = 'topic_too_long'
+        return False, None, None, None, context
+        
+    # Reject if topic contains a month
+    months_pattern = r'\b(?:january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b'
+    if re.search(months_pattern, topic, re.IGNORECASE):
+        if debug:
+            print(f"      [DEBUG] Rejected (contains month): '{section_num}'")
+        context['rejection_reason'] = 'contains_month'
+        return False, None, None, None, context
+        
+    # Reject if topic is only numbers and punctuation (contains no letters)
+    if not re.search(r'[a-zA-Z]', topic):
+        if debug:
+            print(f"      [DEBUG] Rejected (only numbers/punctuation): '{section_num}'")
+        context['rejection_reason'] = 'numbers_and_punctuation_only'
+        return False, None, None, None, context
+
     if debug:
         print(f"      [DEBUG] ACCEPTED: section='{section_num}' topic='{topic[:30] if topic else ''}...'")
         if remainder:

@@ -13,6 +13,7 @@ Features:
 - View/edit existing labels (Click to select, drag edges to resize)
 - Fades unselected boxes to easily spot your active selection
 - Zoom controls
+- File search and unlabeled document filtering
 
 Classes (matching DocLayout-YOLO DocStructBench):
   0: title           - Document titles, section headers
@@ -39,15 +40,17 @@ from datetime import datetime
 from doclayout_yolo import YOLOv10
 DOCLAYOUT_AVAILABLE = True
 
-# Try to import ensemble/post-processing from benchmark module
-try:
+# Check for ensemble/post-processing from benchmark module without using try/except
+benchmark_path = Path(__file__).resolve().parent / "yolo_benchmark.py"
+if benchmark_path.exists():
     from yolo_benchmark import (
         EnsembleYOLO, EnsembleConfig,
         apply_geometric_heuristics, TARGET_CLASSES,
     )
     ENSEMBLE_AVAILABLE = True
-except ImportError:
+else:
     ENSEMBLE_AVAILABLE = False
+
 
 # ================= CONFIGURATION =================
 def get_paths():
@@ -95,6 +98,7 @@ class DocLayoutTagger:
         self.root.minsize(1200, 800)
         
         # State
+        self.full_image_list = []
         self.image_list = []
         self.current_index = 0
         self.scale = 1.0
@@ -262,6 +266,38 @@ class DocLayoutTagger:
         self.dir_display = ttk.Label(dir_frame, text="...", wraplength=300, font=('Segoe UI', 8))
         self.dir_display.pack(fill=tk.X)
         
+        # --- File Explorer Frame ---
+        explorer_frame = ttk.LabelFrame(right_frame, text="File Explorer", padding=8)
+        explorer_frame.pack(fill=tk.X, pady=(0, 8))
+        
+        search_frame = ttk.Frame(explorer_frame)
+        search_frame.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(search_frame, text="Search:").pack(side=tk.LEFT)
+        
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *args: self._apply_filters())
+        ttk.Entry(search_frame, textvariable=self.search_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4,0))
+        
+        self.unlabeled_var = tk.BooleanVar(value=False)
+        self.unlabeled_var.trace_add("write", lambda *args: self._apply_filters())
+        ttk.Checkbutton(
+            explorer_frame,
+            text="Show Unlabeled Only",
+            variable=self.unlabeled_var
+        ).pack(anchor='w', pady=(0, 4))
+        
+        list_frame = ttk.Frame(explorer_frame)
+        list_frame.pack(fill=tk.X)
+        # exportselection=False prevents selections in this box clearing selections in labels listbox
+        self.file_listbox = tk.Listbox(list_frame, height=6, font=('Consolas', 8), exportselection=False)
+        self.file_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        file_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.file_listbox.yview)
+        file_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.file_listbox.config(yscrollcommand=file_scroll.set)
+        self.file_listbox.bind('<<ListboxSelect>>', self._on_file_select)
+        
+        # --- Class Frame ---
         class_frame = ttk.LabelFrame(right_frame, text="Class (1-9, 0)", padding=8)
         class_frame.pack(fill=tk.X, pady=(0, 8))
         
@@ -297,7 +333,7 @@ class DocLayoutTagger:
         list_container = ttk.Frame(labels_frame)
         list_container.pack(fill=tk.X)
         
-        self.labels_listbox = tk.Listbox(list_container, font=('Consolas', 8), selectmode=tk.SINGLE, height=6)
+        self.labels_listbox = tk.Listbox(list_container, font=('Consolas', 8), selectmode=tk.SINGLE, height=6, exportselection=False)
         self.labels_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
         
         list_scroll = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=self.labels_listbox.yview)
@@ -376,21 +412,63 @@ class DocLayoutTagger:
             return
         
         patterns = ["*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG"]
-        self.image_list = []
+        self.full_image_list = []
         for pattern in patterns:
-            self.image_list.extend(glob.glob(os.path.join(self.img_dir, pattern)))
-        self.image_list = sorted(set(self.image_list))
+            self.full_image_list.extend(glob.glob(os.path.join(self.img_dir, pattern)))
+        self.full_image_list = sorted(set(self.full_image_list))
         
-        if not self.image_list:
+        if not self.full_image_list:
             self.dir_display.config(text=f"⚠ No images in: {self.img_dir}")
             messagebox.showwarning("No Images", f"No images found in:\n{self.img_dir}")
             return
-        
-        self.dir_display.config(text=f"✓ {len(self.image_list)} images")
-        self.current_index = 0
-        self._load_image()
+            
+        self._apply_filters()
         self._update_stats()
+
+    def _apply_filters(self):
+        """Filters the image list by search query and unlabeled status."""
+        search_text = self.search_var.get().lower()
+        show_unlabeled = self.unlabeled_var.get()
+        
+        self.image_list = []
+        self.file_listbox.delete(0, tk.END)
+        
+        for img_path in self.full_image_list:
+            filename = os.path.basename(img_path)
+            
+            if search_text and search_text not in filename.lower():
+                continue
+                
+            txt_filename = os.path.splitext(filename)[0] + ".txt"
+            txt_path = os.path.join(self.lbl_dir, txt_filename)
+            is_labeled = os.path.exists(txt_path)
+            
+            if show_unlabeled and is_labeled:
+                continue
+                
+            self.image_list.append(img_path)
+            status = "[✓]" if is_labeled else "[ ]"
+            self.file_listbox.insert(tk.END, f"{status} {filename}")
+            
+        self.dir_display.config(text=f"✓ {len(self.image_list)} / {len(self.full_image_list)} images")
+        
+        if self.image_list:
+            self.current_index = 0
+            self._load_image()
+        else:
+            self.canvas.delete("all")
+            self.file_label.config(text="No images match filters")
+            self.progress_label.config(text="0 / 0")
+            self.boxes = []
+            self._update_labels_list()
     
+    def _on_file_select(self, event):
+        selection = self.file_listbox.curselection()
+        if selection:
+            self.save_labels()
+            self.current_index = selection[0]
+            self._load_image()
+
     def _load_image(self):
         if not self.image_list:
             return
@@ -419,6 +497,11 @@ class DocLayoutTagger:
         labeled = "✓ LABELED" if self.boxes else ""
         self.file_label.config(text=f"{filename} {labeled}")
         self.progress_label.config(text=f"{self.current_index + 1} / {len(self.image_list)}")
+        
+        # Sync file explorer listbox
+        self.file_listbox.selection_clear(0, tk.END)
+        self.file_listbox.selection_set(self.current_index)
+        self.file_listbox.see(self.current_index)
         
         self.current_rect = None
         self.start_x = None
@@ -527,11 +610,11 @@ class DocLayoutTagger:
         self._update_labels_list()
     
     def _update_stats(self):
-        total = len(self.image_list)
+        total = len(self.full_image_list)
         labeled = 0
         label_counts = {cid: 0 for cid in CLASSES}
         
-        for img_path in self.image_list:
+        for img_path in self.full_image_list:
             txt_filename = os.path.splitext(os.path.basename(img_path))[0] + ".txt"
             txt_path = os.path.join(self.lbl_dir, txt_filename)
             if os.path.exists(txt_path):
@@ -767,6 +850,13 @@ class DocLayoutTagger:
         
         self._update_stats()
         self.file_label.config(text=f"{os.path.basename(self.img_path)} ✓ SAVED")
+        
+        # Update listbox visual status to indicate it's been labeled
+        if self.image_list:
+            filename = os.path.basename(self.img_path)
+            self.file_listbox.delete(self.current_index)
+            self.file_listbox.insert(self.current_index, f"[✓] {filename}")
+            self.file_listbox.selection_set(self.current_index)
     
     def reload_image(self):
         self._load_image()
@@ -803,7 +893,7 @@ class DocLayoutTagger:
                 self._load_image()
                 return
         
-        messagebox.showinfo("Done!", "All images have been labeled!")
+        messagebox.showinfo("Done!", "All filtered images have been labeled!")
     
     def jump_to_image(self, event=None):
         if self.jump_var.get().isdigit():
