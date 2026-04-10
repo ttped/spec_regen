@@ -354,7 +354,11 @@ def call_llm(
     timeout: float = 120.0
 ) -> Optional[str]:
     """
-    Sends a prompt to either Ollama or Mission Assist API.
+    Sends a prompt to Ollama, Mission Assist, or a local transformers model.
+
+    For provider="transformers", `base_url` is interpreted as the local
+    filesystem path to the model directory (e.g. D:/transformers_cache/gemma-4-E4B-it).
+    `model_name` is informational only in that case.
     """
     if provider == "ollama":
         return _call_ollama(prompt, model_name, base_url, timeout=timeout)
@@ -362,8 +366,12 @@ def call_llm(
         if not api_key:
             raise ValueError("api_key is required for mission_assist provider")
         return _call_mission_assist(prompt, model_name, base_url, api_key, timeout=timeout)
+    elif provider == "transformers":
+        return _call_transformers(prompt, model_path=base_url)
     else:
-        raise ValueError(f"Unknown provider: {provider}. Use 'ollama' or 'mission_assist'")
+        raise ValueError(
+            f"Unknown provider: {provider}. Use 'ollama', 'mission_assist', or 'transformers'"
+        )
 
 
 def _call_ollama(
@@ -473,3 +481,88 @@ def _resolve_mission_assist_model(client: openai.OpenAI, api_url: str) -> str:
     _mission_assist_model_cache[api_url] = model_name
     print(f"  [LLM] Resolved model: {model_name}")
     return model_name
+
+
+# =============================================================================
+# Local transformers provider
+# =============================================================================
+
+# Cache for loaded transformers models, keyed by local model path.
+# Loading multi-GB weights on every call is not viable, so the bundle
+# (processor + model) is held at module scope for the life of the process.
+_transformers_cache: Dict[str, Any] = {}
+
+
+def _load_transformers_model(model_path: str) -> Dict[str, Any]:
+    """
+    Load a local transformers model and processor, caching the result.
+
+    Returns a dict with 'processor' and 'model' keys. Subsequent calls
+    with the same path return the cached bundle without reloading weights.
+    """
+    if model_path in _transformers_cache:
+        return _transformers_cache[model_path]
+
+    print(f"  [LLM] Loading transformers model from {model_path} (one-time)...")
+    import torch
+    from transformers import AutoProcessor, AutoModelForCausalLM
+
+    processor = AutoProcessor.from_pretrained(model_path)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        device_map="auto",
+        dtype=torch.bfloat16,
+    )
+    bundle = {"processor": processor, "model": model}
+    _transformers_cache[model_path] = bundle
+    print(f"  [LLM] Model loaded and cached.")
+    return bundle
+
+
+def _call_transformers(
+    prompt: str,
+    model_path: str,
+    max_new_tokens: int = 8192,
+) -> Optional[str]:
+    """
+    Run a prompt through a locally-loaded transformers model.
+
+    The model is loaded once per process and cached in `_transformers_cache`.
+    Uses greedy decoding (do_sample=False) to match the temperature=0 behavior
+    of the other providers.
+    """
+    bundle = _load_transformers_model(model_path)
+    processor = bundle["processor"]
+    model = bundle["model"]
+
+    system_prompt = """You are an expert-level JSON generation API. Your sole purpose is to respond with a single, valid JSON object or array.
+
+**CRITICAL RESPONSE DIRECTIVES:**
+
+1.  **JSON ONLY:** Your entire response MUST be a single, valid JSON object or array, enclosed in a markdown code block.
+2.  **NO EXTRA TEXT:** You MUST NOT include any other text, explanations, reasoning, or conversational filler. The response must contain ONLY the JSON.
+3.  **STRICT SYNTAX:** The response must start *exactly* with ```json on a new line and end *exactly* with ``` on a new line. There must be no characters before the opening ```json or after the closing ```.
+
+**DO NOT INCLUDE YOUR REASONING OR THOUGHTS IN THE FINAL RESPONSE.**
+"""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt},
+    ]
+
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = processor(text=text, return_tensors="pt").to(model.device)
+    input_len = inputs["input_ids"].shape[-1]
+
+    import torch
+    with torch.inference_mode():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+        )
+
+    return processor.decode(output_ids[0][input_len:], skip_special_tokens=True)
