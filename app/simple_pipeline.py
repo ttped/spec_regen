@@ -258,6 +258,7 @@ class Config:
     yolo_confidence = float(_require_env("YOLO_CONFIDENCE"))
     yolo_device = _require_env("YOLO_DEVICE")
     skip_yolo_if_exists = True  # Skip YOLO if exports already exist
+    force = False  # Force re-run of classify/title even if outputs exist
 
 
 if __name__ == '__main__':
@@ -286,6 +287,7 @@ if __name__ == '__main__':
     if cli_args.yolo_device is not None:
         Config.yolo_device = cli_args.yolo_device
     Config.skip_yolo_if_exists = not cli_args.force_yolo
+    Config.force = cli_args.force
     if cli_args.table_jsons_dir:
         Config.table_jsons_dir = cli_args.table_jsons_dir
 
