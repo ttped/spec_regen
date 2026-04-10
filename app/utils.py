@@ -512,6 +512,7 @@ def _load_transformers_model(model_path: str) -> Dict[str, Any]:
         model_path,
         device_map="auto",
         dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
     )
     bundle = {"processor": processor, "model": model}
     _transformers_cache[model_path] = bundle
