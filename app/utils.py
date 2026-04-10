@@ -513,6 +513,7 @@ def _load_transformers_model(model_path: str) -> Dict[str, Any]:
         device_map="auto",
         dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
+        attn_implementation="flash_attention_2"
     )
 
     # Diagnostics — confirm where the model actually landed.
