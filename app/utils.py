@@ -552,7 +552,7 @@ def _call_transformers(
     ]
 
     text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+        messages, tokenize=False, add_generation_prompt=True,  enable_thinking=False,
     )
     inputs = processor(text=text, return_tensors="pt").to(model.device)
     input_len = inputs["input_ids"].shape[-1]
