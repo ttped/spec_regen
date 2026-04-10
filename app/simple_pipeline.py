@@ -270,6 +270,8 @@ if __name__ == '__main__':
                        help="YOLO confidence threshold (overrides .env)")
     parser.add_argument('--yolo-device', type=str, default=None,
                        help="YOLO device: cpu, cuda:0, or mps (overrides .env)")
+    parser.add_argument('--force', action='store_true',
+                       help="Force re-run of classify/title even if outputs exist")
     parser.add_argument('--force-yolo', action='store_true',
                        help="Force re-run YOLO even if exports exist")
     parser.add_argument('--table-jsons-dir', type=str, default=None,
@@ -412,7 +414,7 @@ if __name__ == '__main__':
         # STEP 1: CLASSIFY
         if args.step in ["classify", "all"]:
             print("[1: Classify]")
-            if args.step == "all" and os.path.exists(classify_out):
+            if os.path.exists(classify_out) and not args.force:
                 print(f"  [Skip] Already done")
             else:
                 run_classification_on_file(raw_input, classify_out, LLM_CONFIG, max_workers=4)
@@ -424,7 +426,7 @@ if __name__ == '__main__':
         # STEP 2: TITLE
         if args.step in ["title", "all"]:
             print("[2: Title]")
-            if args.step == "all" and os.path.exists(title_out):
+            if os.path.exists(title_out) and not args.force:
                 print(f"  [Skip] Already done")
             else:
                 if not os.path.exists(classify_out):
