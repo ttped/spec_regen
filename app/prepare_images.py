@@ -41,36 +41,37 @@ def sanitize_filename(name):
 def process_pdfs():
     print(f"Script location: {Path(__file__).resolve()}")
     print(f"Looking for PDFs in: {SOURCE_DIR}")
-    
+
     if not OUTPUT_DIR.exists():
         os.makedirs(OUTPUT_DIR)
-    
-    # Find all PDF files
+
     pdf_files = list(SOURCE_DIR.rglob("*.pdf"))
     if not pdf_files:
         print(f"No PDFs found in {SOURCE_DIR}")
         return
-        
-    print(f"Found {len(pdf_files)} PDF files to process.")
 
-    for pdf_path in tqdm(pdf_files, desc="Converting PDFs"):
-        # Just get the filename without extension (e.g. 'report' from 'report.pdf')
-        # and sanitize it just in case it has spaces or weird chars
+    # Filter out PDFs that already have at least one output image.
+    # Conversion is the expensive step, so we decide before calling it.
+    pending = []
+    skipped = 0
+    for pdf_path in pdf_files:
         stem = sanitize_filename(pdf_path.stem)
+        if any(OUTPUT_DIR.glob(f"{stem}_page*.jpg")):
+            skipped += 1
+            continue
+        pending.append((pdf_path, stem))
 
-        # Convert to images
+    print(f"Found {len(pdf_files)} PDFs — {skipped} already converted, {len(pending)} to process.")
+
+    for pdf_path, stem in tqdm(pending, desc="Converting PDFs"):
         images = convert_from_path(str(pdf_path), dpi=DPI, fmt=FORMAT)
-
         for i, image in enumerate(images):
-            # Format: filename_page001.jpg
-            page_num = f"{i + 1:03d}" 
-            out_filename = f"{stem}_page{page_num}.jpg" 
-            out_path = OUTPUT_DIR / out_filename
-
-            # Save explicitly as JPEG to fix the previous error
+            page_num = f"{i + 1:03d}"
+            out_path = OUTPUT_DIR / f"{stem}_page{page_num}.jpg"
             image.save(out_path, "JPEG")
 
     print(f"\nDone! Images saved to {OUTPUT_DIR}")
+
 
 if __name__ == "__main__":
     process_pdfs()
