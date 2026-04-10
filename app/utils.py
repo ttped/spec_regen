@@ -514,6 +514,17 @@ def _load_transformers_model(model_path: str) -> Dict[str, Any]:
         dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
     )
+
+    # Diagnostics — confirm where the model actually landed.
+    device_info = model.hf_device_map if hasattr(model, "hf_device_map") else model.device
+    print(f"  [LLM] Device map: {device_info}")
+    print(f"  [LLM] Model dtype: {next(model.parameters()).dtype}")
+    print(f"  [LLM] CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"  [LLM] CUDA device: {torch.cuda.get_device_name(0)}")
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"  [LLM] VRAM: {vram_gb:.1f} GB")
+
     bundle = {"processor": processor, "model": model}
     _transformers_cache[model_path] = bundle
     print(f"  [LLM] Model loaded and cached.")
@@ -523,37 +534,31 @@ def _load_transformers_model(model_path: str) -> Dict[str, Any]:
 def _call_transformers(
     prompt: str,
     model_path: str,
-    max_new_tokens: int = 8192,
+    max_new_tokens: int = 1024,
 ) -> Optional[str]:
     """
     Run a prompt through a locally-loaded transformers model.
 
     The model is loaded once per process and cached in `_transformers_cache`.
     Uses greedy decoding (do_sample=False) to match the temperature=0 behavior
-    of the other providers.
+    of the other providers. Thinking mode is disabled — for structured
+    extraction tasks (classify, title) it adds latency without improving
+    output quality, and Gemma E4B follows the user prompt directly without
+    needing a JSON-enforcement system prompt.
     """
     bundle = _load_transformers_model(model_path)
     processor = bundle["processor"]
     model = bundle["model"]
 
-    system_prompt = """You are an expert-level JSON generation API. Your sole purpose is to respond with a single, valid JSON object or array.
-
-**CRITICAL RESPONSE DIRECTIVES:**
-
-1.  **JSON ONLY:** Your entire response MUST be a single, valid JSON object or array, enclosed in a markdown code block.
-2.  **NO EXTRA TEXT:** You MUST NOT include any other text, explanations, reasoning, or conversational filler. The response must contain ONLY the JSON.
-3.  **STRICT SYNTAX:** The response must start *exactly* with ```json on a new line and end *exactly* with ``` on a new line. There must be no characters before the opening ```json or after the closing ```.
-
-**DO NOT INCLUDE YOUR REASONING OR THOUGHTS IN THE FINAL RESPONSE.**
-"""
-
     messages = [
-        {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt},
     ]
 
     text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,  enable_thinking=False,
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
     )
     inputs = processor(text=text, return_tensors="pt").to(model.device)
     input_len = inputs["input_ids"].shape[-1]
