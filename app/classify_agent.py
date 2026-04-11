@@ -100,6 +100,11 @@ MIN_SECTION_NUMBERS_FOR_TOC = 10
 
 # Minimum threshold for TOC-style entries
 MIN_TOC_ENTRIES_FOR_TOC = 8
+# Density gate: on a real TOC, section-number tokens dominate the page.
+# On a content page that merely *references* sections, prose dwarfs them.
+# Ratio = sum(len of section-number matches) / non-whitespace char count.
+MIN_SECTION_DENSITY_FOR_TOC = 0.04   # 4% — tune on your corpus
+MAX_CHARS_FOR_DENSE_TOC     = 1500   # hard ceiling: real TOCs are sparse
 
 # Minimum periods (dot leaders) to suggest TOC even without section numbers
 # OCR often mangles these: "......" becomes "....eee..cc.c....e..."
@@ -293,6 +298,18 @@ def count_toc_lines(text: str) -> int:
     """
     return len(LINE_TOC_ENTRY_PATTERN.findall(text))
 
+def section_number_density(page_text: str, section_numbers: list[str]) -> float:
+    """
+    Fraction of non-whitespace characters consumed by section-number tokens.
+    Real TOC pages run high (lots of '1.2.3' with little prose between);
+    content pages that cite sections in sentences run low.
+    """
+    non_ws = sum(1 for c in page_text if not c.isspace())
+    if non_ws == 0:
+        return 0.0
+    consumed = sum(len(s) for s in section_numbers)
+    return consumed / non_ws
+
 
 def fast_classify_page(page_text: str) -> Optional[str]:
     """
@@ -375,14 +392,19 @@ def fast_classify_page(page_text: str) -> Optional[str]:
     # 6. Many garbled dot leaders (8+) + some section-like patterns → TOC
     # 7. FALLBACK: Many periods (dot leaders) + TOC header → likely TOC
     
-    if len(unique_section_numbers) >= MIN_SECTION_NUMBERS_FOR_TOC and not has_many_measurements:
-        return "TABLE_OF_CONTENTS"
+    if (len(unique_section_numbers) >= MIN_SECTION_NUMBERS_FOR_TOC and not has_many_measurements):
+        density = section_number_density(page_text, filtered_section_numbers)
+        non_ws_chars = sum(1 for c in page_text if not c.isspace())
+        if density >= MIN_SECTION_DENSITY_FOR_TOC and non_ws_chars <= MAX_CHARS_FOR_DENSE_TOC:
+            return "TABLE_OF_CONTENTS"
     
     if has_toc_header and len(unique_section_numbers) >= 5:
         return "TABLE_OF_CONTENTS"
     
     if len(toc_entries) >= MIN_TOC_ENTRIES_FOR_TOC:
-        return "TABLE_OF_CONTENTS"
+        non_ws_chars = sum(1 for c in page_text if not c.isspace())
+        if non_ws_chars <= MAX_CHARS_FOR_DENSE_TOC:
+            return "TABLE_OF_CONTENTS"
     
     # NEW: Line-level TOC detection (catches "1 Scope ... 3" style entries)
     if toc_line_count >= 6:
