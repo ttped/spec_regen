@@ -419,7 +419,7 @@ if __name__ == '__main__':
             if os.path.exists(classify_out) and not args.force:
                 print(f"  [Skip] Already done")
             else:
-                run_classification_on_file(raw_input, classify_out, LLM_CONFIG, max_workers=4)
+                run_classification_on_file(raw_input, classify_out, LLM_CONFIG, max_workers=1)
             result = load_classification_result(classify_out)
             if result and result.get('is_stub'):
                 print("  [Info] Document is a stub, skipping remaining steps.")

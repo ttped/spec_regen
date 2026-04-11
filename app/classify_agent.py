@@ -15,7 +15,8 @@ numbered lists or section headers might be misidentified as a TOC.
 
 OPTIMIZATION: Uses regex-based fast-path detection for Table of Contents pages
 to reduce reliance on smaller LLMs. A page with 10+ section numbers (like 1.1.1,
-2.3.4) is automatically classified as TOC without LLM calls.
+2.3.4) is automatically classified as TOC without LLM calls. The new heuristic
+also skips the LLM for dense prose pages based on stop-word and casing ratios.
 
 The flattened text is only used internally for LLM classification - the raw
 OCR structure is preserved for downstream processing.
@@ -108,7 +109,8 @@ MIN_PERIODS_FOR_TOC_HINT = 40
 # Matches runs of dots mixed with short bursts of letters (1-3 chars between dots)
 # e.g., "...sce..." or ".eee..cc.c...e.." or just "............"
 GARBLED_DOT_LEADER_PATTERN = re.compile(
-    r'(?:\.{2,}[a-zA-Z]{0,3}){3,}'  # 3+ repetitions of (2+ dots + 0-3 letters)
+    r'([.\s_ceos-]{10,})',
+    re.IGNORECASE
 )
 
 # Pattern for top-level section numbers (no dot required): "1", "2", "10"
@@ -131,16 +133,50 @@ LINE_TOC_ENTRY_PATTERN = re.compile(
     r'(?:'
     r'[IVXLC]+\.?\s+'                      # Roman numeral: "I.", "IV ", "IX."
     r'|[A-Z]\.\d+(?:\.\d+)*\.?\s+'         # Annex: "A.1", "B.2.3"
-    r'|\d{1,2}(?:\.\d{1,2}){0,5}\.?\s+'    # Arabic: "1", "1.1", "1.2.3"
+    r'|\d{1,2}(?:\.\d{1,2}){0,5}\.?\s*'    # Arabic: "1", "1.1", "1.2.3" (relaxed spacing)
     r')'
-    r'[A-Z][A-Za-z]'                        # Title must start with capital letter
-    r'.{3,80}'                              # Title body (3-80 chars)
-    r'[\s.]{0,200}'                         # Optional dot leaders / garbled dots / spaces
+    r'[A-Za-z0-9]'                          # Title start (relaxed to allow lowercase/numbers)
+    r'.{2,100}?'                            # Title body (non-greedy, wider net)
+    r'[.\s_cseo-]{4,150}'                   # The garbled dot leader region (incorporates OCR noise)
     r'\d{1,4}'                              # Page number at end
     r'\s*$',
-    re.MULTILINE
+    re.MULTILINE | re.IGNORECASE
 )
 
+def is_likely_content_body(page_text: str) -> bool:
+    """
+    Fast-path heuristic to detect dense prose (CONTENT_BODY) based on statistical 
+    language properties, bypassing the LLM.
+    """
+    words = page_text.split()
+    word_count = len(words)
+    
+    # 1. Volume Check: If it's short, let the LLM figure it out (might be a stub or weird title)
+    if word_count < 150: 
+        return False
+
+    # 2. Stop Word Density: Sentences require conjunctions and articles.
+    # A standard English prose page is usually 20-30% stop words. 
+    stop_words = {"the", "of", "and", "a", "to", "in", "is", "for", "on", "with", "as", "by", "this", "be"}
+    stop_word_count = sum(1 for w in words if w.lower() in stop_words)
+    stop_word_ratio = stop_word_count / word_count
+
+    # 3. Case Ratio: Paragraphs are mostly lowercase. 
+    # Title pages and TOCs often have heavy Title Case or ALL CAPS.
+    alpha_chars = [c for c in page_text if c.isalpha()]
+    if not alpha_chars:
+        return False
+    lower_ratio = sum(1 for c in alpha_chars if c.islower()) / len(alpha_chars)
+
+    # 4. Anti-TOC Safety Check: Ensure it doesn't have a massive amount of dot leaders
+    # just in case a TOC has really long descriptive titles.
+    period_count = page_text.count('.')
+    
+    # If it's dense prose (>15% stop words), mostly lowercase (>70%), and lacks TOC dot leaders
+    if stop_word_ratio > 0.15 and lower_ratio > 0.70 and period_count < 40:
+        return True
+
+    return False
 
 def count_garbled_dot_leaders(text: str) -> int:
     """
@@ -181,6 +217,7 @@ def fast_classify_page(page_text: str) -> Optional[str]:
         - "TABLE_OF_CONTENTS" if high confidence TOC detected
         - "TITLE_PAGE" if high confidence title page detected
         - "BLANK_PAGE" if intentionally blank page detected
+        - "CONTENT_BODY" if dense prose properties detected
         - None if uncertain (fall back to LLM)
     
     This function is designed to be CONSERVATIVE - it only returns a 
@@ -322,6 +359,12 @@ def fast_classify_page(page_text: str) -> Optional[str]:
     # If we have 3+ title indicators and very few section numbers, likely title page
     if title_score >= 3 and len(unique_section_numbers) <= 2:
         return "TITLE_PAGE"
+        
+    # ==========================================================================
+    # Check for dense prose (Content Body)
+    # ==========================================================================
+    if is_likely_content_body(page_text):
+        return "CONTENT_BODY"
     
     # ==========================================================================
     # No confident fast-path classification - return None to use LLM
@@ -449,6 +492,12 @@ def get_fast_classification_reason(page_text: str) -> str:
     
     if period_count >= 80 and len(unique_section_numbers) >= 3:
         return f"{period_count} periods + {len(unique_section_numbers)} section numbers"
+        
+    if is_likely_content_body(page_text):
+        words = page_text.split()
+        stop_words = {"the", "of", "and", "a", "to", "in", "is", "for", "on", "with", "as", "by", "this", "be"}
+        ratio = sum(1 for w in words if w.lower() in stop_words) / len(words)
+        return f"Dense prose detected: {len(words)} words, {ratio:.1%} stop words"
     
     return "No fast-path match"
 
@@ -563,7 +612,7 @@ A stub document is one that does NOT contain actual content, but instead tells t
 Common patterns include:
 - "This document has been superseded by..."
 - "Refer to [document name/number] for..."
-- "See [URL or location] for current information"
+- "See https://mylocation.org/ for current information"
 - "This specification is now maintained at..."
 - "Replaced by..."
 
