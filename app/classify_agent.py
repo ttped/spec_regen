@@ -178,6 +178,91 @@ def is_likely_content_body(page_text: str) -> bool:
 
     return False
 
+
+# =============================================================================
+# TITLE PAGE INDICATORS (shared between long-doc and short-doc fast paths)
+# =============================================================================
+
+# Boilerplate that almost exclusively appears on cover/title pages of technical
+# specs (distribution statements, export-control warnings, classification
+# markings, contract/org identifiers).
+TITLE_INDICATORS = [
+    # Distribution and release
+    r'\bDISTRIBUTION\s+STATEMENT\b',
+    r'\bAPPROVED\s+FOR\s+(?:PUBLIC\s+)?RELEASE\b',
+    r'\bFOREIGN\s+DISCLOSURE\b',
+    # Classification markings
+    r'\bUNCLASSIFIED\b',
+    r'\bCONTROLLED\s+UNCLASSIFIED\b',
+    r'\bCONTROLLED\s+BY\b',
+    r'\bEXPORT\s+CONTROLLED\b',
+    r'\bPROPRIETARY\b',
+    r'\bCONFIDENTIAL\b',
+    r'\bSECRET\b',
+    r'\bNOFORN\b',
+    r'\bREL\s+TO\b',
+    # Export-control legalese
+    r'\bITAR\b',
+    r'\bEAR\b',
+    r'\bEXPORT\s+ADMINISTRATION\s+ACT\b',
+    r'\bDESTRUCTION\s+NOTICE\b',
+    # Scoped WARNING — matches boilerplate blocks, not hazard callouts
+    r'\bWARNING\b.{0,80}\b(?:EXPORT|DESTRUCTION|UNAUTHORIZED|DISCLOSURE|CRIMINAL|PENALTIES)\b',
+    # Contract/document identifiers
+    r'\bCONTRACT\s+(?:NO\.?|NUMBER)',
+    r'\bPREPARED\s+(?:BY|FOR)\b',
+    r'\bSPECIFICATION\s+(?:NO\.?|NUMBER)',
+    r'\bDOCUMENT\s+(?:NO\.?|NUMBER)',
+    r'\bREVISION\s+[A-Z0-9]+\b',
+    r'\bCAGE\s+CODE\b',
+    # Org identifiers common on AF spec title pages
+    r'\bAFNWC\b',
+]
+
+_TITLE_INDICATOR_RES = [re.compile(p, re.IGNORECASE | re.DOTALL) for p in TITLE_INDICATORS]
+
+
+def count_title_indicators(text: str) -> int:
+    """Count how many title-page boilerplate patterns match in text."""
+    return sum(1 for r in _TITLE_INDICATOR_RES if r.search(text))
+
+
+def fast_classify_short_doc_page(
+    page_text: str,
+    page_id: int,
+    total_pages: int,
+) -> str:
+    """
+    Pure fast-path classifier for short documents (<=5 pages).
+
+    Short docs have no TOC by rule, so this collapses to a 2-way decision:
+    TITLE_PAGE vs CONTENT_BODY (plus BLANK_PAGE). Never calls an LLM.
+
+    Strategy:
+      - Blank pages: explicit marker or near-empty text
+      - Title pages: page 1 only, with a relaxed title-indicator bar (>=2)
+        OR >=1 indicator on a sparse page (<200 words)
+      - Everything else: CONTENT_BODY
+
+    Defaulting to CONTENT_BODY is safe because analyze_page_sequence uses the
+    first CONTENT_BODY page as the content start, which is the correct
+    behavior for short docs that lack a title page.
+    """
+    if BLANK_PAGE_PATTERN.search(page_text) or len(page_text.strip()) < 50:
+        return "BLANK_PAGE"
+
+    if page_id == 1 and total_pages > 1:
+        title_score = count_title_indicators(page_text)
+        word_count = len(page_text.split())
+
+        if title_score >= 2:
+            return "TITLE_PAGE"
+        if title_score >= 1 and word_count < 200:
+            return "TITLE_PAGE"
+
+    return "CONTENT_BODY"
+
+
 def count_garbled_dot_leaders(text: str) -> int:
     """
     Count garbled dot leader sequences in text.
@@ -338,24 +423,9 @@ def fast_classify_page(page_text: str) -> Optional[str]:
     # Check for obvious Title Page characteristics  
     # ==========================================================================
     
-    # Title pages often have these markers
-    title_indicators = [
-        r'\bDISTRIBUTION\s+STATEMENT\b',
-        r'\bAPPROVED\s+FOR\s+(?:PUBLIC\s+)?RELEASE\b',
-        r'\bUNCLASSIFIED\b',
-        r'\bCONTROLLED\s+UNCLASSIFIED\b',
-        r'\bEXPORT\s+CONTROLLED\b',
-        r'\bPROPRIETARY\b',
-        r'\bCONFIDENTIAL\b',
-        r'\bSECRET\b',
-        r'\bCONTRACT\s+(?:NO\.?|NUMBER)',
-        r'\bPREPARED\s+(?:BY|FOR)\b',
-        r'\bSPECIFICATION\s+(?:NO\.?|NUMBER)',
-        r'\bREVISION\s+[A-Z0-9]+\b',
-    ]
-    
-    title_score = sum(1 for pattern in title_indicators if re.search(pattern, text_upper))
-    
+    # Title pages: use shared indicator list (see TITLE_INDICATORS above)
+    title_score = count_title_indicators(page_text)
+
     # If we have 3+ title indicators and very few section numbers, likely title page
     if title_score >= 3 and len(unique_section_numbers) <= 2:
         return "TITLE_PAGE"
@@ -759,54 +829,20 @@ def find_content_start_page(
     # ==========================================================================
     if total_pages <= 5:
         print(f"  - Short document ({total_pages} pages) - skipping TOC detection")
+        print(f"  - Using pure fast-path classification (no LLM)")
         page_classifications = []
-        
+
         for page_id, page_text in pages:
-            # For short docs, only distinguish between TITLE_PAGE and CONTENT_BODY
-            # Never classify as TABLE_OF_CONTENTS
-            fast_result = fast_classify_page(page_text)
-            
-            # Override any TOC classification to CONTENT_BODY for short docs
-            if fast_result == 'TABLE_OF_CONTENTS':
-                fast_result = 'CONTENT_BODY'
-                print(f"    Page {page_id}: CONTENT_BODY [short doc override, was TOC]")
-                page_classifications.append({
-                    'page': page_id, 
-                    'type': 'CONTENT_BODY', 
-                    'method': 'fast',
-                    'note': 'TOC overridden for short document'
-                })
-            elif fast_result:
-                print(f"    Page {page_id}: {fast_result} [fast]")
-                page_classifications.append({
-                    'page': page_id, 
-                    'type': fast_result, 
-                    'method': 'fast'
-                })
-            else:
-                # Use LLM but override TOC results
-                page_type, method = classify_page_smart(page_text, llm_config)
-                if page_type == 'TABLE_OF_CONTENTS':
-                    page_type = 'CONTENT_BODY'
-                    print(f"    Page {page_id}: CONTENT_BODY [short doc override, LLM said TOC]")
-                    page_classifications.append({
-                        'page': page_id, 
-                        'type': 'CONTENT_BODY', 
-                        'method': method,
-                        'note': 'TOC overridden for short document'
-                    })
-                else:
-                    print(f"    Page {page_id}: {page_type} [{method}]")
-                    page_classifications.append({
-                        'page': page_id, 
-                        'type': page_type, 
-                        'method': method
-                    })
-        
-        # Sort and analyze
+            page_type = fast_classify_short_doc_page(page_text, page_id, total_pages)
+            print(f"    Page {page_id}: {page_type} [fast-short]")
+            page_classifications.append({
+                'page': page_id,
+                'type': page_type,
+                'method': 'fast-short',
+            })
+
         page_classifications.sort(key=lambda x: x['page'])
         result = analyze_page_sequence(page_classifications)
-        # Force document_type to indicate no TOC for short docs
         if result['document_type'] == 'standard':
             result['document_type'] = 'no_toc'
         return result
