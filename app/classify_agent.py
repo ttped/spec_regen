@@ -900,13 +900,17 @@ def find_content_start_page(
     # ==========================================================================
     # Multi-page document: ADAPTIVE classification with proportional cap
     # Start with initial batch, then continue if still seeing TOC pages.
-    # Cap total pages checked at max(initial_pages_to_check, 15% of doc).
+    # Cap is sliding: 50% for medium docs, 15% for large docs.
     # Stop early after 3 consecutive CONTENT_BODY pages.
     # ==========================================================================
     
-    # Proportional cap: don't check more than ~15% of the document
-    proportional_limit = max(initial_pages_to_check, int(total_pages * max_pages_pct))
-    effective_max = min(proportional_limit, max_pages_to_check, total_pages)
+    if total_pages <= 20:
+        # For medium docs (6-20 pages), cap at 50% of the document (min 5 pages)
+        effective_max = max(5, int(total_pages * 0.5))
+    else:
+        # For large docs (>20 pages), use 15% (min 10 pages, cap at max_pages_to_check)
+        effective_max = min(max_pages_to_check, max(10, int(total_pages * max_pages_pct)))
+        
     print(f"  - Classification window: up to {effective_max} pages (doc has {total_pages})")
     
     page_classifications = []
