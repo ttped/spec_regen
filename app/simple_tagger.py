@@ -1001,7 +1001,7 @@ class DocLayoutTagger:
         
         # Build ensemble wrapper if available (reuses the same underlying model)
         if ENSEMBLE_AVAILABLE:
-            config = EnsembleConfig(model_path=model_path)
+            config = EnsembleConfig(model_paths=[model_path])
             self.ensemble_model = EnsembleYOLO(config)
             # Share the already-loaded model weights to avoid double memory
             self.ensemble_model.model = self.model
