@@ -862,6 +862,7 @@ def process_document(
     print(f"  Processing {len(page_images)} pages...")
     
     for image_path, page_number in page_images:
+        print(f"    Page {page_number}...", end=' ', flush=True)
         # Run detection
         detected_assets = run_detection_on_image(
             model=model,
@@ -872,9 +873,11 @@ def process_document(
             device=device,
             raw_ocr_dir=raw_ocr_dir
         )
-        
+
         if detected_assets:
-            print(f"    Page {page_number}: Found {len(detected_assets)} validated assets")
+            print(f"Found {len(detected_assets)} asset(s)")
+        else:
+            print("ok")
         
         # Process each detected asset
         for asset in detected_assets:
