@@ -987,28 +987,43 @@ def run_yolo_extraction(
             print(f"  Available documents: {list(docs.keys())}")
             return {}
     
-    print(f"  Found {len(docs)} document(s) to process")
+    print(f"  Found {len(docs)} document(s) in images directory")
+
+    # Pre-filter: separate docs that need processing from those already done.
+    # A directory existing (even empty) means YOLO was previously attempted for
+    # that document. process_document creates the dir before inference, so an
+    # empty dir means a prior run crashed mid-document — treat that as "attempted"
+    # and skip it (user can retry with --force-yolo).
+    if skip_existing:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        docs_to_run = {s: p for s, p in docs.items()
+                       if not (output_dir / s).exists()}
+        already_done = len(docs) - len(docs_to_run)
+        if already_done:
+            print(f"  Skipping {already_done} already-attempted document(s) "
+                  f"(use --force-yolo to re-run)")
+        if not docs_to_run:
+            print(f"  Nothing to do.")
+            print()
+            return {s: [] for s in docs}
+    else:
+        docs_to_run = docs
+
+    print(f"  Processing {len(docs_to_run)} document(s)")
     print()
-    
-    # Load model once
+
+    # Load model once — only reached when there is actual work to do
     print("Loading YOLO model...")
     model = load_model(model_path)
     if model is None:
         return {}
     print()
-    
+
     # Process each document
     output_dir.mkdir(parents=True, exist_ok=True)
     results = {}
-    
-    skipped = 0
-    for doc_stem, page_images in docs.items():
-        doc_output_dir = output_dir / doc_stem
-        if skip_existing and doc_output_dir.exists() and any(doc_output_dir.iterdir()):
-            skipped += 1
-            results[doc_stem] = []
-            continue
 
+    for doc_stem, page_images in docs_to_run.items():
         print(f"[{doc_stem}]")
 
         assets = process_document(
@@ -1020,9 +1035,9 @@ def run_yolo_extraction(
             device=device,
             raw_ocr_dir=raw_ocr_dir
         )
-        
+
         results[doc_stem] = assets
-        
+
         # Summary for this document
         fig_count = sum(1 for a in assets if a['asset_type'] == 'fig')
         tab_count = sum(1 for a in assets if a['asset_type'] == 'tab')
@@ -1030,13 +1045,11 @@ def run_yolo_extraction(
         tab_layout_count = sum(1 for a in assets if a['asset_type'] == 'tab_layout')
         print(f"  Extracted: {fig_count} figures, {tab_count} tables, {eq_count} equations, {tab_layout_count} layout tables")
         print()
-    
+
     # Overall summary
     print("=" * 60)
     print("EXTRACTION COMPLETE")
     print("=" * 60)
-    if skipped:
-        print(f"  Skipped (already processed): {skipped} document(s)")
     total_figs = sum(sum(1 for a in assets if a['asset_type'] == 'fig') for assets in results.values())
     total_tabs = sum(sum(1 for a in assets if a['asset_type'] == 'tab') for assets in results.values())
     total_eqs = sum(sum(1 for a in assets if a['asset_type'] == 'eq') for assets in results.values())
