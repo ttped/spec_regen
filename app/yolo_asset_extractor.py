@@ -17,6 +17,7 @@ Usage:
 """
 
 import os
+import gc
 import json
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
@@ -681,7 +682,11 @@ def run_detection_on_image(
             validated_by=validated_by
         )
         validated_assets.append(asset)
-    
+
+    # Explicitly release the result tensors so they don't accumulate across pages
+    del results
+    del result
+
     return validated_assets
 
 
@@ -1044,6 +1049,13 @@ def run_yolo_extraction(
         eq_count = sum(1 for a in assets if a['asset_type'] == 'eq')
         tab_layout_count = sum(1 for a in assets if a['asset_type'] == 'tab_layout')
         print(f"  Extracted: {fig_count} figures, {tab_count} tables, {eq_count} equations, {tab_layout_count} layout tables")
+
+        # Release any cached state in the YOLO predictor so it doesn't accumulate
+        # across documents (ultralytics keeps an internal predictor object that
+        # holds image buffers and result tensors between calls)
+        if hasattr(model, 'predictor') and model.predictor is not None:
+            model.predictor = None
+        gc.collect()
         print()
 
     # Overall summary
