@@ -923,7 +923,8 @@ def run_yolo_extraction(
     confidence_threshold: float = 0.25,
     device: str = 'cpu',
     model_path: Optional[str] = None,
-    raw_ocr_dir: Optional[str] = None
+    raw_ocr_dir: Optional[str] = None,
+    skip_existing: bool = False,
 ) -> Dict[str, List[Dict]]:
     """
     Main function to run YOLO extraction on all documents (or a specific one).
@@ -997,9 +998,16 @@ def run_yolo_extraction(
     output_dir.mkdir(parents=True, exist_ok=True)
     results = {}
     
+    skipped = 0
     for doc_stem, page_images in docs.items():
+        doc_output_dir = output_dir / doc_stem
+        if skip_existing and doc_output_dir.exists() and any(doc_output_dir.iterdir()):
+            skipped += 1
+            results[doc_stem] = []
+            continue
+
         print(f"[{doc_stem}]")
-        
+
         assets = process_document(
             model=model,
             doc_stem=doc_stem,
@@ -1024,6 +1032,8 @@ def run_yolo_extraction(
     print("=" * 60)
     print("EXTRACTION COMPLETE")
     print("=" * 60)
+    if skipped:
+        print(f"  Skipped (already processed): {skipped} document(s)")
     total_figs = sum(sum(1 for a in assets if a['asset_type'] == 'fig') for assets in results.values())
     total_tabs = sum(sum(1 for a in assets if a['asset_type'] == 'tab') for assets in results.values())
     total_eqs = sum(sum(1 for a in assets if a['asset_type'] == 'eq') for assets in results.values())
