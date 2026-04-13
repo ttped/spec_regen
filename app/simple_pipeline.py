@@ -329,30 +329,14 @@ if __name__ == '__main__':
         print("YOLO ASSET EXTRACTION")
         print("=" * 60)
 
-        # Check if we should skip
-        if args.skip_yolo_if_exists and os.path.exists(args.yolo_exports_dir):
-            existing_docs = [d for d in os.listdir(args.yolo_exports_dir)
-                          if os.path.isdir(os.path.join(args.yolo_exports_dir, d))]
-            if existing_docs:
-                print(f"  [Skip] YOLO exports already exist for {len(existing_docs)} documents")
-                print(f"  Set skip_yolo_if_exists=False to re-run extraction")
-                print()
-            else:
-                run_yolo_extraction(
-                    images_dir=Path(args.images_dir),
-                    output_dir=Path(args.yolo_exports_dir),
-                    confidence_threshold=args.yolo_confidence,
-                    device=args.yolo_device,
-                    raw_ocr_dir=args.raw_ocr_dir
-                )
-        else:
-            run_yolo_extraction(
-                images_dir=Path(args.images_dir),
-                output_dir=Path(args.yolo_exports_dir),
-                confidence_threshold=args.yolo_confidence,
-                device=args.yolo_device,
-                raw_ocr_dir=args.raw_ocr_dir
-            )
+        run_yolo_extraction(
+            images_dir=Path(args.images_dir),
+            output_dir=Path(args.yolo_exports_dir),
+            confidence_threshold=args.yolo_confidence,
+            device=args.yolo_device,
+            raw_ocr_dir=args.raw_ocr_dir,
+            skip_existing=args.skip_yolo_if_exists,
+        )
         print()
 
     # ==========================================================================
