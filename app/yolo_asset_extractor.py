@@ -17,6 +17,7 @@ Usage:
 """
 
 import os
+import gc
 import json
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
@@ -681,7 +682,11 @@ def run_detection_on_image(
             validated_by=validated_by
         )
         validated_assets.append(asset)
-    
+
+    # Explicitly release the result tensors so they don't accumulate across pages
+    del results
+    del result
+
     return validated_assets
 
 
@@ -862,6 +867,7 @@ def process_document(
     print(f"  Processing {len(page_images)} pages...")
     
     for image_path, page_number in page_images:
+        print(f"    Page {page_number}...", end=' ', flush=True)
         # Run detection
         detected_assets = run_detection_on_image(
             model=model,
@@ -872,9 +878,11 @@ def process_document(
             device=device,
             raw_ocr_dir=raw_ocr_dir
         )
-        
+
         if detected_assets:
-            print(f"    Page {page_number}: Found {len(detected_assets)} validated assets")
+            print(f"Found {len(detected_assets)} asset(s)")
+        else:
+            print("ok")
         
         # Process each detected asset
         for asset in detected_assets:
@@ -923,7 +931,8 @@ def run_yolo_extraction(
     confidence_threshold: float = 0.25,
     device: str = 'cpu',
     model_path: Optional[str] = None,
-    raw_ocr_dir: Optional[str] = None
+    raw_ocr_dir: Optional[str] = None,
+    skip_existing: bool = False,
 ) -> Dict[str, List[Dict]]:
     """
     Main function to run YOLO extraction on all documents (or a specific one).
@@ -983,23 +992,45 @@ def run_yolo_extraction(
             print(f"  Available documents: {list(docs.keys())}")
             return {}
     
-    print(f"  Found {len(docs)} document(s) to process")
+    print(f"  Found {len(docs)} document(s) in images directory")
+
+    # Pre-filter: separate docs that need processing from those already done.
+    # A directory existing (even empty) means YOLO was previously attempted for
+    # that document. process_document creates the dir before inference, so an
+    # empty dir means a prior run crashed mid-document — treat that as "attempted"
+    # and skip it (user can retry with --force-yolo).
+    if skip_existing:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        docs_to_run = {s: p for s, p in docs.items()
+                       if not (output_dir / s).exists()}
+        already_done = len(docs) - len(docs_to_run)
+        if already_done:
+            print(f"  Skipping {already_done} already-attempted document(s) "
+                  f"(use --force-yolo to re-run)")
+        if not docs_to_run:
+            print(f"  Nothing to do.")
+            print()
+            return {s: [] for s in docs}
+    else:
+        docs_to_run = docs
+
+    print(f"  Processing {len(docs_to_run)} document(s)")
     print()
-    
-    # Load model once
+
+    # Load model once — only reached when there is actual work to do
     print("Loading YOLO model...")
     model = load_model(model_path)
     if model is None:
         return {}
     print()
-    
+
     # Process each document
     output_dir.mkdir(parents=True, exist_ok=True)
     results = {}
-    
-    for doc_stem, page_images in docs.items():
+
+    for doc_stem, page_images in docs_to_run.items():
         print(f"[{doc_stem}]")
-        
+
         assets = process_document(
             model=model,
             doc_stem=doc_stem,
@@ -1009,17 +1040,24 @@ def run_yolo_extraction(
             device=device,
             raw_ocr_dir=raw_ocr_dir
         )
-        
+
         results[doc_stem] = assets
-        
+
         # Summary for this document
         fig_count = sum(1 for a in assets if a['asset_type'] == 'fig')
         tab_count = sum(1 for a in assets if a['asset_type'] == 'tab')
         eq_count = sum(1 for a in assets if a['asset_type'] == 'eq')
         tab_layout_count = sum(1 for a in assets if a['asset_type'] == 'tab_layout')
         print(f"  Extracted: {fig_count} figures, {tab_count} tables, {eq_count} equations, {tab_layout_count} layout tables")
+
+        # Release any cached state in the YOLO predictor so it doesn't accumulate
+        # across documents (ultralytics keeps an internal predictor object that
+        # holds image buffers and result tensors between calls)
+        if hasattr(model, 'predictor') and model.predictor is not None:
+            model.predictor = None
+        gc.collect()
         print()
-    
+
     # Overall summary
     print("=" * 60)
     print("EXTRACTION COMPLETE")
