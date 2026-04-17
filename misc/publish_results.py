@@ -1,14 +1,8 @@
 """
-publish_results.py - Copy completed docx + source PDF pairs to an output drive.
+validate_results.py - Validate 1:1:1 mapping of JSONs, PDFs, and generated DOCXs.
 
-For each generated .docx in results_dir, finds the matching source PDF in
-pdf_dir and copies both into a paired folder on the destination drive:
-
-    {OUTPUT_DRIVE}/{stem}/
-        {stem}.docx
-        {stem}.pdf
-
-Configure via .env at project root. Edit the variables below to override.
+Checks for missing files across the three main pipeline directories and
+generates a summary and a detailed text report.
 """
 
 import os
@@ -17,7 +11,6 @@ import sys
 import shutil
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
 
 def _load_env(env_path: Path) -> None:
     if not env_path.exists():
@@ -28,64 +21,77 @@ def _load_env(env_path: Path) -> None:
             if not line or line.startswith('#') or '=' not in line:
                 continue
             key, _, value = line.partition('=')
-            os.environ.setdefault(key.strip(), value.strip())
+            os.environ.setdefault(key.strip(), value.strip().strip("'").strip('"'))
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _load_env(_PROJECT_ROOT / ".env")
 
-# =============================================================================
-# CONFIG — edit here or set in .env
-# =============================================================================
+RESULTS_DIR = _PROJECT_ROOT / os.environ.get("RESULTS_DIR", "results_simple")
+PDF_DIR = _PROJECT_ROOT / os.environ.get("IMAGES_DIR", "docs/ci_repo")
+RAW_OCR_DIR = _PROJECT_ROOT / os.environ.get("RAW_OCR_DIR", "iris_ocr/advanced/jsons")
 
-RESULTS_DIR  = str(_PROJECT_ROOT / "results_simple")
-PDF_DIR      = str(_PROJECT_ROOT / "docs" / "ci_repo")
-OUTPUT_DRIVE = r"Z:\\Public\\Mazer_Joel\\Spec_Regen_Files\\output"
-
-DRY_RUN = True   # Set True to preview without copying
-WORKERS = 8      # Parallel copy threads — increase for fast network drives
-
-# =============================================================================
-
+OUTPUT_DRIVE = Path(os.environ.get("OUTPUT_DRIVE", r"Z:\Public\Mazer_Joel\Spec_Regen_Files\output"))
+DRY_RUN = False   # Set True to preview without copying
+WORKERS = 4      # Parallel copy threads
 
 def _norm(name: str) -> str:
-    """Collapse separators and lowercase for fuzzy matching. Strips trailing _1 or _2."""
+    """Collapse separators and lowercase for fuzzy matching."""
     base = re.sub(r'[\s\-_]+', '_', name.lower()).strip('_')
     return re.sub(r'_[12]$', '', base)
 
+def validate_mappings():
+    print("Scanning directories...")
+    
+    json_stems = { _norm(p.stem): p.name for p in RAW_OCR_DIR.glob("*.json") if p.is_file() }
+    pdf_stems = { _norm(p.stem): p.name for p in PDF_DIR.glob("*.pdf") if p.is_file() }
+    docx_stems = { _norm(p.stem): p.name for p in RESULTS_DIR.glob("*.docx") if p.is_file() }
 
-def _build_pdf_index(pdf_dir: Path) -> tuple:
-    exact = {}
-    fuzzy = {}
-    for entry in pdf_dir.iterdir():
-        if entry.suffix.lower() == '.pdf' and entry.is_file():
-            exact[entry.stem] = entry
-            fuzzy[_norm(entry.stem)] = entry
-    return exact, fuzzy
+    all_keys = set(json_stems.keys()) | set(pdf_stems.keys()) | set(docx_stems.keys())
 
+    perfect_matches = []
+    missing_docx = []
+    missing_pdf = []
+    missing_json = []
 
-def _find_pairs(results_dir: Path, pdf_dir: Path) -> tuple:
-    exact, fuzzy = _build_pdf_index(pdf_dir)
-    paired = []
-    missing_pdfs = []
-    matched_pdf_paths = set()
+    for k in sorted(all_keys):
+        has_json = k in json_stems
+        has_pdf = k in pdf_stems
+        has_docx = k in docx_stems
 
-    for entry in sorted(results_dir.iterdir()):
-        if entry.suffix != '.docx' or not entry.is_file():
-            continue
-        stem = entry.stem
-        pdf = exact.get(stem) or fuzzy.get(_norm(stem))
-        if pdf:
-            paired.append((stem, entry, pdf))
-            matched_pdf_paths.add(pdf)
+        if has_json and has_pdf and has_docx:
+            perfect_matches.append(k)
         else:
-            missing_pdfs.append(stem)
+            display_name = json_stems.get(k) or pdf_stems.get(k) or docx_stems.get(k)
+            if not has_docx: missing_docx.append(display_name)
+            if not has_pdf: missing_pdf.append(display_name)
+            if not has_json: missing_json.append(display_name)
 
-    # Find PDFs that were never matched to a docx
-    all_pdfs = set(exact.values())
-    unmatched_pdfs = [p.name for p in all_pdfs if p not in matched_pdf_paths]
+    # Console Summary
+    print("\n--- Validation Summary ---")
+    print(f"Total Unique Documents : {len(all_keys)}")
+    print(f"Perfect 3-way Matches  : {len(perfect_matches)}")
+    print(f"Missing DOCX Files     : {len(missing_docx)}")
+    print(f"Missing PDF Files      : {len(missing_pdf)}")
+    print(f"Missing JSON Files     : {len(missing_json)}")
 
-    return paired, missing_pdfs, sorted(unmatched_pdfs)
+    # Detailed Text Report
+    report_path = _PROJECT_ROOT / "validation_report.txt"
+    with open(report_path, "w") as f:
+        f.write("PIPELINE VALIDATION REPORT\n")
+        f.write("==========================\n\n")
+        
+        f.write(f"Missing DOCX Files ({len(missing_docx)}):\n")
+        for m in missing_docx: f.write(f"  - {m}\n")
+        
+        f.write(f"\nMissing PDF Files ({len(missing_pdf)}):\n")
+        for m in missing_pdf: f.write(f"  - {m}\n")
+            
+        f.write(f"\nMissing JSON Files ({len(missing_json)}):\n")
+        for m in missing_json: f.write(f"  - {m}\n")
 
+    print(f"\nDetailed discrepancy list saved to: {report_path.relative_to(_PROJECT_ROOT)}")
+    
+    return perfect_matches, pdf_stems, docx_stems
 
 def _copy_pair(stem: str, docx: Path, pdf: Path, dest_root: Path):
     folder = dest_root / stem
@@ -93,53 +99,31 @@ def _copy_pair(stem: str, docx: Path, pdf: Path, dest_root: Path):
     shutil.copy2(docx, folder / docx.name)
     shutil.copy2(pdf,  folder / pdf.name)
 
-
 if __name__ == "__main__":
-    results_path = Path(RESULTS_DIR)
-    pdf_path     = Path(PDF_DIR)
-    dest_path    = Path(OUTPUT_DRIVE)
-
-    for label, path in [("RESULTS_DIR", results_path), ("PDF_DIR", pdf_path)]:
-        if not path.is_dir():
-            print(f"[Error] {label} not found: {path}")
-            sys.exit(1)
-
-    paired, missing_pdfs, unmatched_pdfs = _find_pairs(results_path, pdf_path)
-
-    print(f"{'[DRY RUN] ' if DRY_RUN else ''}Destination : {dest_path}")
-    print(f"Pairs found : {len(paired)}")
+    perfect_matches, pdf_stems, docx_stems = validate_mappings()
     
-    if missing_pdfs:
-        print(f"\n[!] .docx files missing a source PDF ({len(missing_pdfs)}):")
-        for stem in missing_pdfs:
-            print(f"  - {stem}.docx")
-            
-    if unmatched_pdfs:
-        print(f"\n[!] .pdf files missing a generated .docx ({len(unmatched_pdfs)}):")
-        for pdf_name in unmatched_pdfs:
-            print(f"  - {pdf_name}")
-    print()
-
-    if DRY_RUN:
-        for stem, docx, pdf in paired:
-            print(f"  {stem}/")
-            print(f"    {docx.name}")
-            print(f"    {pdf.name}")
-        print(f"\nWould copy {len(paired)} pairs. Set DRY_RUN = False to apply.")
+    print("\n--- Publishing ---")
+    if not OUTPUT_DRIVE.exists() and not DRY_RUN:
+        OUTPUT_DRIVE.mkdir(parents=True, exist_ok=True)
         
-    if not DRY_RUN:
-        dest_path.mkdir(parents=True, exist_ok=True)
+    print(f"{'[DRY RUN] ' if DRY_RUN else ''}Destination : {OUTPUT_DRIVE}")
+    print(f"Valid pairs ready to publish : {len(perfect_matches)}")
+    
+    if DRY_RUN:
+        print(f"\nWould copy {len(perfect_matches)} pairs. Set DRY_RUN = False in script to apply.")
+    else:
         completed = 0
-
         with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-            futures = {
-                pool.submit(_copy_pair, stem, docx, pdf, dest_path): stem
-                for stem, docx, pdf in paired
-            }
+            futures = {}
+            for stem in perfect_matches:
+                pdf_path = PDF_DIR / pdf_stems[stem]
+                docx_path = RESULTS_DIR / docx_stems[stem]
+                futures[pool.submit(_copy_pair, stem, docx_path, pdf_path, OUTPUT_DRIVE)] = stem
+                
             for future in as_completed(futures):
                 stem = futures[future]
                 future.result()
                 completed += 1
-                print(f"  [{completed}/{len(paired)}] {stem}")
-
-        print(f"\nCopied {completed}/{len(paired)} pairs to {dest_path}")
+                print(f"  [{completed}/{len(perfect_matches)}] {stem}")
+        
+        print(f"\nCopied {completed}/{len(perfect_matches)} pairs to {OUTPUT_DRIVE}")
