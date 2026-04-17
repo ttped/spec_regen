@@ -738,7 +738,12 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
     footer_run.bold = True
     footer_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    for element in elements:
+    total_elements = len(elements)
+    for idx, element in enumerate(elements, 1):
+        # Print progress every 250 elements or on the very last element
+        if idx % 250 == 0 or idx == total_elements:
+            print(f"      -> Writing element {idx}/{total_elements} ({(idx/total_elements)*100:.1f}%)")
+
         element_type = str(element.get("type", "")).strip().lower()
 
         if element_type == "section":

@@ -120,13 +120,14 @@ def iris_ready_for_doc(table_jsons_dir: str, doc_stem: str) -> bool:
 
 def get_document_stems(input_dir: str) -> List[str]:
     stems = set()
-    try:
-        for filename in os.listdir(input_dir):
-            if filename.endswith(".json"):
-                stems.add(os.path.splitext(filename)[0])
-    except FileNotFoundError:
+    if not os.path.exists(input_dir):
         print(f"Error: Input directory '{input_dir}' not found.")
         return []
+        
+    for filename in os.listdir(input_dir):
+        if filename.endswith(".json"):
+            stems.add(os.path.splitext(filename)[0])
+            
     return sorted(list(stems))
 
 
@@ -175,19 +176,14 @@ def extract_title_from_first_page(raw_input_path: str, output_path: str):
 
     info = None
     if page_text and page_text.strip():
-        try:
-            info = extract_title_page_info(
-                page_text, 
-                LLM_CONFIG['model_name'], 
-                LLM_CONFIG['base_url'], 
-                LLM_CONFIG['api_key'], 
-                LLM_CONFIG['provider']
-            )
-        except Exception as e:
-            # LLM calls are external/flaky — warn but don't crash the pipeline
-            print(f"  [WARNING] Title extraction LLM call failed: {e}")
-            print(f"            Document will be created without title page.")
-            info = None
+        # Avoiding try/except based on preferences; if it fails we let the stack trace show the real issue.
+        info = extract_title_page_info(
+            page_text, 
+            LLM_CONFIG['model_name'], 
+            LLM_CONFIG['base_url'], 
+            LLM_CONFIG['api_key'], 
+            LLM_CONFIG['provider']
+        )
     
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     with open(output_path, 'w', encoding='utf-8') as f:
@@ -242,7 +238,6 @@ class Config:
     
     # Directories
     raw_ocr_dir = DEFAULT_RAW_OCR_DIR
-    #figures_dir = DEFAULT_FIGURES_DIR      # Manual exports (fallback)
     images_dir = DEFAULT_IMAGES_DIR        # Page images for YOLO
     yolo_exports_dir = DEFAULT_YOLO_EXPORTS_DIR  # YOLO output
     results_dir = DEFAULT_RESULTS_DIR
@@ -277,6 +272,8 @@ if __name__ == '__main__':
                        help="Force re-run YOLO even if exports exist")
     parser.add_argument('--table-jsons-dir', type=str, default=None,
                        help="Directory containing IRIS table OCR JSONs (overrides .env)")
+    parser.add_argument('--shard', type=int, choices=[1, 2, 3, 4], default=None,
+                       help="Run only a quarter of the documents: 1, 2, 3, or 4 for parallel processing")
 
     cli_args = parser.parse_args()
 
@@ -356,10 +353,16 @@ if __name__ == '__main__':
         print()
 
     # ==========================================================================
-    # DOCUMENT LIST
+    # DOCUMENT LIST & SHARDING
     # ==========================================================================
     doc_stems = get_document_stems(args.raw_ocr_dir)
-    print(f"Found {len(doc_stems)} documents in {args.raw_ocr_dir}\n")
+    
+    # 4-way sharding to allow running 4 separate terminals concurrently
+    if cli_args.shard is not None:
+        doc_stems = doc_stems[cli_args.shard - 1 :: 4]
+        print(f"Running shard {cli_args.shard}/4: Processing {len(doc_stems)} documents.\n")
+    else:
+        print(f"Found {len(doc_stems)} documents in {args.raw_ocr_dir}\n")
 
     # ==========================================================================
     # ML TRAINING
@@ -396,7 +399,6 @@ if __name__ == '__main__':
         print(f"{'=' * 60}")
 
         # Resolve the actual YOLO exports subdirectory for this stem.
-        # Handles space/underscore naming mismatches between OCR filenames and YOLO dir names.
         from asset_processor import resolve_asset_directory
         doc_asset_dir = resolve_asset_directory(figures_dir, stem)
         if doc_asset_dir:
@@ -461,7 +463,7 @@ if __name__ == '__main__':
                     raw_input,
                     organized_out,
                     content_start_page=content_start,
-                    yolo_exports_dir=figures_dir,  # Pass YOLO exports for overlap filtering
+                    yolo_exports_dir=figures_dir,
                     doc_stem=figures_stem
                 )
                 if not os.path.exists(organized_out):
@@ -496,7 +498,7 @@ if __name__ == '__main__':
                     with open(ml_filtered_out, 'w') as f:
                         json.dump({'page_metadata': page_metadata, 'elements': reclassified_elements}, f, indent=4)
 
-        # STEP 5: ASSETS (using YOLO exports or manual exports)
+        # STEP 5: ASSETS
         if args.step in ["assets", "all"]:
             print("[5: Assets]")
             if args.step == "all" and os.path.exists(with_assets_out):
@@ -567,17 +569,16 @@ if __name__ == '__main__':
             if not os.path.exists(final_docx):
                 print(f"  [FAIL] Cannot validate - DOCX not found: {final_docx}")
                 continue
-            try:
-                result = run_validation_on_file(stem, args.raw_ocr_dir, args.results_dir)
-                if result:
-                    validation_results.append({
-                        'document': stem,
-                        'has_toc': result.has_toc,
-                        'toc_coverage': result.toc_coverage,
-                        'precision': result.precision,
-                    })
-            except Exception as e:
-                print(f"  [WARNING] Validation failed: {e}")
+            
+            result = run_validation_on_file(stem, args.raw_ocr_dir, args.results_dir)
+            if result:
+                validation_results.append({
+                    'document': stem,
+                    'has_toc': result.has_toc,
+                    'toc_coverage': result.toc_coverage,
+                    'precision': result.precision,
+                })
+
         print()
 
     # ==========================================================================
