@@ -354,11 +354,16 @@ def call_llm(
     timeout: float = 120.0
 ) -> Optional[str]:
     """
-    Sends a prompt to Ollama, Mission Assist, or a local transformers model.
+    Sends a prompt to Ollama, Mission Assist, llama-server, or a local transformers model.
 
     For provider="transformers", `base_url` is interpreted as the local
     filesystem path to the model directory (e.g. D:/transformers_cache/gemma-4-E4B-it).
     `model_name` is informational only in that case.
+
+    For provider="llama_server", `base_url` is the root URL of a running
+    llama.cpp `llama-server` process (e.g. http://localhost:8080). `model_name`
+    is informational — llama-server serves whatever GGUF it was launched with —
+    but is still sent in the OpenAI-compatible request body.
     """
     if provider == "ollama":
         return _call_ollama(prompt, model_name, base_url, timeout=timeout)
@@ -368,9 +373,12 @@ def call_llm(
         return _call_mission_assist(prompt, model_name, base_url, api_key, timeout=timeout)
     elif provider == "transformers":
         return _call_transformers(prompt, model_path=base_url)
+    elif provider == "llama_server":
+        return _call_llama_server(prompt, model_name, base_url, timeout=timeout)
     else:
         raise ValueError(
-            f"Unknown provider: {provider}. Use 'ollama', 'mission_assist', or 'transformers'"
+            f"Unknown provider: {provider}. "
+            f"Use 'ollama', 'mission_assist', 'transformers', or 'llama_server'"
         )
 
 
@@ -403,6 +411,43 @@ def _call_ollama(
         response_data = response.json()
         raw_llm_content = response_data.get("message", {}).get("content")
         return raw_llm_content
+
+
+def _call_llama_server(
+    prompt: str,
+    model_name: str,
+    base_url: str,
+    timeout: float = 120.0
+) -> Optional[str]:
+    """
+    Sends a prompt to a llama.cpp `llama-server` process via its
+    OpenAI-compatible `/v1/chat/completions` endpoint.
+
+    JSON output is requested via `response_format={"type": "json_object"}`,
+    which llama-server enforces through constrained sampling (GBNF grammar
+    under the hood), matching Ollama's `format: "json"` behavior.
+
+    `model_name` is informational — llama-server serves whatever GGUF was
+    loaded at startup — but the field is required by the OpenAI request schema.
+    """
+    # Ensure URL has a scheme
+    if not base_url.startswith(("http://", "https://")):
+        base_url = f"http://{base_url}"
+
+    api_url = f"{base_url.rstrip('/')}/v1/chat/completions"
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": prompt}],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.0,
+        "stream": False,
+    }
+
+    response = requests.post(api_url, json=payload, timeout=timeout)
+    response.raise_for_status()
+
+    response_data = response.json()
+    return response_data["choices"][0]["message"]["content"]
 
 
 def _call_mission_assist(
