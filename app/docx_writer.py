@@ -1,4 +1,5 @@
 import os
+import re
 import json
 from typing import List, Dict, Optional
 
@@ -42,6 +43,86 @@ def configure_heading_styles(doc):
             
             style.paragraph_format.space_before = Pt(12) if style_name == 'Heading 1' else Pt(8)
             style.paragraph_format.space_after = Pt(6)
+
+
+# ---------------------------------------------------------------------------
+# Heading / body text normalization
+# ---------------------------------------------------------------------------
+
+# Minor words that stay lowercase in title case unless they lead the heading.
+_MINOR_WORDS = {
+    "a", "an", "and", "as", "at", "but", "by", "for", "from", "in", "into",
+    "nor", "of", "on", "onto", "or", "over", "per", "the", "to", "via", "vs",
+    "with", "within",
+}
+
+
+def to_initial_caps(text: str) -> str:
+    """
+    Convert a heading topic to initial caps ("title case").
+
+    Capitalizes the first letter of each significant word, keeps minor words
+    (of, the, and, ...) lowercase unless they lead the heading, and preserves
+    short all-caps tokens as acronyms (RF, USB, CUI) and tokens containing
+    digits (M16, 2A).
+    """
+    if not text:
+        return text
+
+    words = text.split()
+    result = []
+    for idx, word in enumerate(words):
+        alpha = re.sub(r'[^A-Za-z]', '', word)
+
+        # Preserve acronyms and alphanumeric designators unchanged.
+        if (alpha.isupper() and 2 <= len(alpha) <= 4) or any(c.isdigit() for c in word):
+            result.append(word)
+            continue
+
+        lower = word.lower()
+        if idx != 0 and lower in _MINOR_WORDS:
+            result.append(lower)
+        else:
+            result.append(lower[:1].upper() + lower[1:])
+
+    return " ".join(result)
+
+
+def strip_duplicate_section_number(topic: str, section_number: str) -> str:
+    """
+    Remove a section number accidentally duplicated at the start of the topic.
+
+    OCR sometimes repeats the number ("1.2 1.2 Scope") and the detector keeps
+    the leading copy in the topic. Strip it so the rendered heading shows the
+    number only once.
+    """
+    if not topic or not section_number:
+        return topic
+
+    sn = section_number.strip().rstrip('.')
+    if not sn:
+        return topic
+
+    pattern = r'^\s*' + re.escape(sn) + r'[.)]?\s+'
+    stripped = re.sub(pattern, '', topic)
+    return stripped if stripped.strip() else topic
+
+
+def add_body_paragraphs(doc, content: str):
+    """
+    Render body text as one Word paragraph per logical paragraph.
+
+    `content` uses '\n' to separate paragraphs (see section_processor's
+    paragraph reconstruction). Each segment becomes its own Word paragraph —
+    a hard return — so the document never contains stray soft line-breaks,
+    which reviewers had to delete by hand.
+    """
+    if not content:
+        return
+    for para_text in content.split("\n"):
+        para_text = para_text.strip()
+        if para_text:
+            doc.add_paragraph(para_text)
 
 
 def _estimate_column_widths_from_content(rows: list, num_cols: int) -> List[float]:
@@ -376,22 +457,30 @@ def add_section_heading(doc, section_number: str, topic: str, level: int = 1):
         style_name = 'Normal'
         
     p = doc.add_paragraph(style=style_name)
-    
+
+    # Clean the topic: drop a duplicated leading section number and apply
+    # initial caps so headings read consistently in the final document.
+    topic = str(topic) if topic else ""
+    if section_number and topic:
+        topic = strip_duplicate_section_number(topic, str(section_number))
+    if topic:
+        topic = to_initial_caps(topic)
+
     if section_number:
         run_number = p.add_run(str(section_number))
         run_number.bold = True
         run_number.underline = False
-        
+
         if topic:
             run_space = p.add_run(" ")
             run_space.bold = True
             run_space.underline = False
-            
+
     if topic:
-        run_topic = p.add_run(str(topic))
+        run_topic = p.add_run(topic)
         run_topic.bold = True
-        run_topic.underline = True
-    
+        run_topic.underline = False
+
     return p
 
 
@@ -756,14 +845,12 @@ def create_docx_from_elements(elements: List[Dict], output_filename: str, figure
             
             if section_number or topic:
                 add_section_heading(doc, section_number, topic, level=heading_level)
-            
-            if content:
-                doc.add_paragraph(content)
-        
+
+            add_body_paragraphs(doc, content)
+
         elif element_type == "unassigned_text_block":
             content = str(element.get("content", ""))
-            if content:
-                doc.add_paragraph(content)
+            add_body_paragraphs(doc, content)
 
         elif element_type == "figure":
             export_data = element.get("export") or {}
