@@ -365,108 +365,125 @@ def normalize_all_element_bboxes(
 
 
 
+def _resolve_norm_top(bbox: Optional[Dict], page: int, page_metadata: Dict, default: float) -> float:
+    """
+    Best-effort normalized (0-1) top position for a bbox.
+
+    Prefers an existing norm_top; otherwise normalizes the raw top using the
+    page height; falls back to `default` when nothing is available so the item
+    sorts to a sensible place (top for text, bottom for unplaceable assets).
+    """
+    bbox = bbox or {}
+    norm_top = bbox.get('norm_top')
+    if norm_top is not None:
+        return norm_top
+
+    raw_top = bbox.get('top')
+    if raw_top is not None:
+        _, page_height = get_page_ocr_dimensions(page_metadata, page)
+        if page_height:
+            return raw_top / page_height
+        return raw_top / 10000
+
+    return default
+
+
 def integrate_assets_with_elements(
-    elements: List[Dict], 
+    elements: List[Dict],
     assets: List[Dict],
     page_metadata: Optional[Dict] = None,
     verbose: bool = False
 ) -> List[Dict]:
     """
-    Merge assets into element stream using normalized Y positions for ordering.
-    
+    Merge assets into the element stream in true reading order.
+
     Note: Overlap filtering of text inside figures/tables is handled earlier
     in section_processor.py at the line level, before text aggregation.
-    
+
     Algorithm:
-    1. Normalize all element bboxes (so they have norm_* values)
-    2. Sort assets by normalized top position
-    3. Interleave assets before text elements they precede (by norm_top)
+    1. Normalize all element bboxes (so they have norm_* values).
+    2. Expand each section into a heading unit plus one unit per body paragraph
+       (using `_body_blocks`), each carrying its own vertical position. This
+       lets a figure/table land *between* the paragraphs it sits between,
+       instead of being pushed to the end of the whole section.
+    3. Place every unit and asset with a single stable sort by
+       (page_number, normalized_top). This keeps assets on their own page and
+       in the right vertical slot — no more orphaned assets piling up at the
+       end of the document.
     """
     if not assets:
         return elements
-    
+
     if not page_metadata:
         print(f"    [Warning] No page_metadata - asset positioning will use raw fallback estimation.")
         page_metadata = {}
-    
+
     # --- STEP 1: Normalize all element bboxes ---
     print(f"    Normalizing element bboxes...")
     elements = normalize_all_element_bboxes(elements, page_metadata, verbose=verbose)
-    
-    # --- STEP 2: Group and sort assets by page and normalized top ---
-    assets_by_page: Dict[int, List[Dict]] = {}
+
+    # --- STEP 2: Build positioned units (expanding sections by paragraph) ---
+    # Each entry: (page, norm_top, sequence, item). `sequence` preserves input
+    # order as a stable tiebreaker for items sharing a position.
+    units: List[Tuple[int, float, int, Dict]] = []
+    seq = 0
+
+    for element in elements:
+        page = int(element.get('page_number', 9999))
+        body_blocks = element.get('_body_blocks')
+
+        if element.get('type') == 'section' and body_blocks:
+            # Heading unit: same section element minus its body (rendered as
+            # separate paragraph units below) and minus the internal field.
+            heading = {k: v for k, v in element.items() if k != '_body_blocks'}
+            heading['content'] = ''
+            head_top = _resolve_norm_top(element.get('bbox'), page, page_metadata, 0.0)
+            units.append((page, head_top, seq, heading))
+            seq += 1
+
+            for block in body_blocks:
+                text = str(block.get('text', '')).strip()
+                if not text:
+                    continue
+                bbox = block.get('bbox')
+                if bbox and not bbox.get('_is_normalized'):
+                    pw, ph = get_page_ocr_dimensions(page_metadata, page)
+                    if pw and ph:
+                        bbox = normalize_text_bbox(bbox, pw, ph)
+                body_top = _resolve_norm_top(bbox, page, page_metadata, head_top)
+                body_unit = {
+                    'type': 'unassigned_text_block',
+                    'page_number': element.get('page_number'),
+                    'content': text,
+                    'bbox': bbox,
+                }
+                units.append((page, body_top, seq, body_unit))
+                seq += 1
+        else:
+            # Non-section elements (and sections without body) pass through;
+            # strip the internal field if it somehow lingers.
+            item = {k: v for k, v in element.items() if k != '_body_blocks'} \
+                if '_body_blocks' in element else element
+            top = _resolve_norm_top(element.get('bbox'), page, page_metadata, 0.0)
+            units.append((page, top, seq, item))
+            seq += 1
+
+    # --- STEP 3: Add assets (unplaceable ones sort to the page bottom) ---
     for asset in assets:
         page = int(asset.get('page_number', 9999))
-        if page not in assets_by_page:
-            assets_by_page[page] = []
-        assets_by_page[page].append(asset)
-    
-    # Sort by normalized top (fall back to raw top / 10000 if not normalized)
-    for page, page_assets in assets_by_page.items():
-        def get_asset_sort_key(a):
-            bbox = a.get('bbox') or {}
-            norm_top = bbox.get('norm_top')
-            return norm_top if norm_top is not None else (bbox.get('top', 9999) / 10000)
-            
-        page_assets.sort(key=get_asset_sort_key)
-    
-    # --- STEP 3: Interleave assets with text elements ---
-    result = []
-    current_page = None
-    
-    for element in elements:
-        elem_page = int(element.get('page_number', 9999))
-        
-        # Flush remaining assets from previous and skipped pages
-        if current_page is not None and elem_page != current_page:
-            pages_to_flush = [p for p in list(assets_by_page.keys()) if p < elem_page]
-            for p in sorted(pages_to_flush):
-                result.extend(assets_by_page.pop(p, []))
-        
-        current_page = elem_page
-        
-        # Get element's normalized top position
-        elem_bbox = element.get('bbox') or {}
-        elem_norm_top = elem_bbox.get('norm_top')
-        
-        # Fallback if not normalized
-        if elem_norm_top is None:
-            _, page_height = get_page_ocr_dimensions(page_metadata, current_page)
-            if page_height:
-                elem_norm_top = elem_bbox.get('top', 0) / page_height
-            else:
-                elem_norm_top = elem_bbox.get('top', 0) / 10000
-        
-        # Insert assets that come before this element
-        if current_page in assets_by_page:
-            page_assets = assets_by_page[current_page]
-            
-            while page_assets:
-                asset = page_assets[0]
-                asset_bbox = asset.get('bbox') or {}
-                asset_norm_top = asset_bbox.get('norm_top')
-                
-                if asset_norm_top is None:
-                    asset_norm_top = asset_bbox.get('top', 9999) / 10000
-                
-                if asset_norm_top < elem_norm_top:
-                    result.append(page_assets.pop(0))
-                    if verbose:
-                        print(f"      Inserted asset at norm_top={asset_norm_top:.3f} "
-                              f"before element at {elem_norm_top:.3f}")
-                else:
-                    break
-        
-        result.append(element)
-    
-    # Flush final page and any remaining orphaned pages
-    for page in sorted(assets_by_page.keys()):
-        page_assets = assets_by_page[page]
-        result.extend(page_assets)
-        if verbose and page_assets:
-            print(f"      Added {len(page_assets)} assets to end of page {page}")
-    
-    return result
+        top = _resolve_norm_top(asset.get('bbox'), page, page_metadata, 1.0)
+        units.append((page, top, seq, asset))
+        seq += 1
+
+    # --- STEP 4: Stable sort by (page, vertical position) ---
+    units.sort(key=lambda u: (u[0], u[1], u[2]))
+
+    if verbose:
+        asset_count = sum(1 for _, _, _, item in units
+                          if item.get('type') in ('figure', 'table', 'equation', 'table_layout'))
+        print(f"      Ordered {len(units)} units ({asset_count} assets) by page and position")
+
+    return [item for _, _, _, item in units]
 
 
 def run_asset_integration(
