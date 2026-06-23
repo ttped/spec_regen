@@ -674,9 +674,82 @@ def check_if_paragraph_is_header_legacy(line_text: str, debug: bool = False) -> 
     return is_header, section_num, topic, remainder
 
 
+def _merge_bboxes(bboxes: List[Dict]) -> Optional[Dict]:
+    """Union of several OCR bboxes into one spanning box (or None if empty)."""
+    boxes = [b for b in bboxes if b]
+    if not boxes:
+        return None
+    left = min(b.get('left', 0) for b in boxes)
+    top = min(b.get('top', 0) for b in boxes)
+    right = max(b.get('right', b.get('left', 0) + b.get('width', 0)) for b in boxes)
+    bottom = max(b.get('bottom', b.get('top', 0) + b.get('height', 0)) for b in boxes)
+    return {
+        "left": left, "top": top,
+        "width": right - left, "height": bottom - top,
+        "right": right, "bottom": bottom,
+    }
+
+
+def _reconstruct_paragraphs(blocks: List[Dict]) -> List[Dict]:
+    """
+    Rebuild logical paragraphs from a run of text-block elements.
+
+    OCR yields one element per *visual* line. Lines that belong to the same OCR
+    paragraph (same page / block / paragraph number) are joined with a single
+    space so wrapped text flows naturally; a new OCR paragraph starts a new
+    output paragraph. Each returned paragraph carries its own spanning bbox so
+    downstream steps (asset interleaving) can place figures/tables in the
+    correct reading position *within* a section, not just after it.
+
+    Returns a list of {"text": str, "bbox": dict|None}, one per paragraph.
+    """
+    paragraphs: List[Dict] = []
+    current_words: List[str] = []
+    current_bboxes: List[Dict] = []
+    current_key = None
+
+    def flush():
+        if current_words:
+            paragraphs.append({
+                "text": " ".join(current_words),
+                "bbox": _merge_bboxes(current_bboxes),
+            })
+
+    for block in blocks:
+        text = str(block.get('content', '')).strip()
+        if not text:
+            continue
+
+        meta = block.get('ocr_metadata') or {}
+        key = (
+            block.get('page_number'),
+            meta.get('ocr_block_num'),
+            meta.get('ocr_par_num'),
+        )
+
+        if current_words and key != current_key:
+            flush()
+            current_words = []
+            current_bboxes = []
+
+        current_words.append(text)
+        bbox = block.get('bbox')
+        if bbox:
+            current_bboxes.append(bbox)
+        current_key = key
+
+    flush()
+    return paragraphs
+
+
 def group_elements_with_bbox(elements: List[Dict]) -> List[Dict]:
     """
     Merges consecutive content blocks and attaches them to preceding section headers.
+
+    The merged text is stored as `content` (paragraphs separated by '\n', which
+    docx_writer renders as hard returns — never soft line-breaks). The
+    per-paragraph breakdown is also kept on `_body_blocks` so the asset step can
+    interleave figures/tables at the right position inside a section.
     """
     if not elements:
         return []
@@ -687,24 +760,27 @@ def group_elements_with_bbox(elements: List[Dict]) -> List[Dict]:
         current_element = elements[i]
 
         if current_element['type'] == 'section':
-            content_pieces = []
-            
+            content_blocks = []
+
             original_bbox = current_element.get('bbox')
-            
+
             j = i + 1
             while j < len(elements) and elements[j]['type'] == 'unassigned_text_block':
-                content_pieces.append(elements[j]['content'])
+                content_blocks.append(elements[j])
                 j += 1
-            
-            current_element['content'] = "\n\n".join(content_pieces)
+
+            paragraphs = _reconstruct_paragraphs(content_blocks)
+            current_element['content'] = "\n".join(p["text"] for p in paragraphs)
+            if paragraphs:
+                current_element['_body_blocks'] = paragraphs
             current_element['bbox'] = original_bbox
-            
+
             merged_elements.append(current_element)
             i = j
         else:
             merged_elements.append(current_element)
             i += 1
-            
+
     return merged_elements
 
 
