@@ -202,7 +202,6 @@ def grid_to_table_data(ncols, grid_rows, caption=""):
                 cd["rowspan"] = rs
             if cell.get("is_header"):
                 cd["bold"] = True
-                cd["shading"] = "D9E2F3"
                 row_is_header = True
             cells.append(cd)
         out_rows.append({"cells": cells, "is_header": row_is_header})
