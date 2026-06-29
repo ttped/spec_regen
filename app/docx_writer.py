@@ -174,37 +174,25 @@ def _set_cell_border(cell, **kwargs):
     tcPr.append(tcBorders)
 
 
-def _apply_clean_borders(table, num_rows: int, num_cols: int):
+TABLE_GRID_COLOR = "808080"  # medium gray — neat but clearly gridded
+TABLE_GRID_SIZE = "4"        # border width in eighths of a point (4 = 0.5pt)
+
+
+def _apply_grid_borders(table, num_rows: int, num_cols: int):
     """
-    Apply a clean borderless look: only thin horizontal rules between rows,
-    with a slightly heavier rule under the header row.
-    No vertical dividers, no outer box.
+    Apply full, uniform grid lines: a thin single rule on all four edges of
+    every cell (standard Word "Table Grid" look).
+
+    Works for merged cells too — table.cell() returns the owning cell for any
+    position covered by a span, so its outer edges get the grid line.
     """
-    NONE = {"val": "none", "sz": "0", "color": "auto"}
-    THIN = {"val": "single", "sz": "4", "color": "BFBFBF"}
-    HEADER_BOTTOM = {"val": "single", "sz": "8", "color": "808080"}
+    grid = {"val": "single", "sz": TABLE_GRID_SIZE, "color": TABLE_GRID_COLOR}
 
     for row_idx in range(num_rows):
         for col_idx in range(num_cols):
             cell = table.cell(row_idx, col_idx)
+            _set_cell_border(cell, top=grid, bottom=grid, left=grid, right=grid)
 
-            top = NONE
-            if row_idx == 0:
-                top = THIN  # light top edge on first row
-
-            bottom = THIN
-            if row_idx == 0:
-                bottom = HEADER_BOTTOM  # heavier rule under header
-            elif row_idx == num_rows - 1:
-                bottom = THIN  # close off bottom
-
-            _set_cell_border(
-                cell,
-                top=top,
-                bottom=bottom,
-                left=NONE,
-                right=NONE,
-            )
 
 
 def _style_table_cell(cell, font_size: Pt = TABLE_FONT_SIZE, bold: bool = False):
@@ -355,7 +343,7 @@ def add_excel_table_to_docx(doc, table_data: dict, total_width_inches: float = 6
     """
     Adds a table to the docx document using data extracted from Excel.
     
-    Formatting: compact 8pt text, no vertical grid lines, light horizontal rules.
+    Formatting: compact 8pt text with full grid lines.
     Total table width fills the page; Word auto-fits columns.
     
     Args:
@@ -372,7 +360,7 @@ def add_excel_table_to_docx(doc, table_data: dict, total_width_inches: float = 6
     num_rows = len(rows)
     num_cols = len(columns)
     
-    # Default table style has no borders; we apply our own via _apply_clean_borders.
+    # Default table style has no borders; we apply our own via _apply_grid_borders.
     table = doc.add_table(rows=num_rows, cols=num_cols)
 
     _set_table_width(table, total_width_inches)
@@ -388,7 +376,7 @@ def add_excel_table_to_docx(doc, table_data: dict, total_width_inches: float = 6
             cell.text = cell_text
             _style_table_cell(cell, bold=is_header)
 
-    _apply_clean_borders(table, num_rows, num_cols)
+    _apply_grid_borders(table, num_rows, num_cols)
 
 def add_isolated_landscape_table(doc, table_data: dict, caption_text: str = ""):
     """
@@ -487,8 +475,7 @@ def add_section_heading(doc, section_number: str, topic: str, level: int = 1):
 def _restyle_existing_table(table):
     """
     Post-process a table that was rendered by complex_table_schema (or any other
-    renderer) to match the shared clean style: compact 8pt text, horizontal-only
-    rules, no grid lines.
+    renderer) to match the shared style: compact 8pt text with full grid lines.
     """
     num_rows = len(table.rows)
     num_cols = len(table.columns)
@@ -514,7 +501,7 @@ def _restyle_existing_table(table):
         for col_idx, cell in enumerate(row.cells):
             _style_table_cell(cell, bold=is_header)
 
-    _apply_clean_borders(table, num_rows, num_cols)
+    _apply_grid_borders(table, num_rows, num_cols)
 
 
 def add_docx_table_from_data(doc, table_data: Dict):
