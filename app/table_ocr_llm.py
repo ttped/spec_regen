@@ -164,8 +164,23 @@ def html_to_grid(rows: List[List[Dict]]) -> Tuple[int, List[List], Dict]:
         for cell in row:
             while (r, c) in occupied:        # skip positions covered by earlier rowspans
                 c += 1
-            cs = max(1, _to_int(cell.get("colspan"), 1))
-            rs = max(1, _to_int(cell.get("rowspan"), 1))
+            want_cs = max(1, _to_int(cell.get("colspan"), 1))
+            want_rs = max(1, _to_int(cell.get("rowspan"), 1))
+
+            # Clamp spans so the claimed rectangle is entirely free. Overlapping
+            # spans (from noisy OCR) would otherwise produce a non-rectangular
+            # merge that python-docx rejects with InvalidSpanError.
+            cs = 1
+            while cs < want_cs and (r, c + cs) not in occupied:
+                cs += 1
+            rs = 1
+            while rs < want_rs and all((r + rs, c + dc) not in occupied for dc in range(cs)):
+                rs += 1
+
+            # Record the effective spans so downstream rendering stays consistent.
+            cell["colspan"] = cs
+            cell["rowspan"] = rs
+
             for dr in range(rs):
                 for dc in range(cs):
                     occupied[(r + dr, c + dc)] = cell if (dr == 0 and dc == 0) else None

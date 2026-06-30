@@ -368,8 +368,13 @@ def add_complex_table(doc, table_data: Dict, total_width_dxa: int = 9360):
             if cs > 1 or rs > 1:
                 end_r = min(r + rs - 1, num_rows - 1)
                 end_c = min(c + cs - 1, num_cols - 1)
-                merge_target = table.cell(end_r, end_c)
-                cell_obj = cell_obj.merge(merge_target)
+                try:
+                    merge_target = table.cell(end_r, end_c)
+                    cell_obj = cell_obj.merge(merge_target)
+                except Exception as e:
+                    # Conflicting/non-rectangular span (e.g. from noisy OCR output)
+                    # — render the cell unmerged instead of crashing the writer.
+                    print(f"    [warn] skipped table cell merge at ({r},{c}) span {cs}x{rs}: {e}")
 
                 for dr in range(rs):
                     for dc in range(cs):
