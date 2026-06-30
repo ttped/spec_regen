@@ -458,28 +458,47 @@ def _call_mission_assist(
     timeout: float = 120.0
 ) -> Optional[str]:
     """
-    Sends a prompt to Mission Assist API using the openai client and chat completions endpoint.
+    Sends a prompt to Mission Assist (OpenAI-compatible) chat completions.
+
+    Connection details are env-driven so every pipeline step can share one
+    Mission Assist setup:
+      MA_URL_SEGMENT            full path segment, e.g. "bae-api-gemma-4-31B"
+                                (default: "bae-api-{model_name}" for back-compat)
+      MA_CA_CERT / VISION_CA_CERT  CA bundle path for TLS verification
+
+    The request model id is `model_name` used directly when it looks like a full
+    id (starts with "/", e.g. "/genai/Gemma-4-31B-IT"); otherwise it is resolved
+    from the endpoint via models.list().
     """
-    if model_name == "gpt-oss":
-        url_model_segment = "gptoss"
-    else:
-        url_model_segment = model_name
+    segment = os.environ.get("MA_URL_SEGMENT")
+    if not segment:
+        seg = "gptoss" if model_name == "gpt-oss" else model_name
+        segment = f"bae-api-{seg}"
 
     if not base_url.startswith(("http://", "https://")):
-        base_url = f"http://{base_url}"
-    
-    api_url = f"{base_url.rstrip('/')}/bae-api-{url_model_segment}/v1"
-    headers = {"apikey": api_key}
+        base_url = f"https://{base_url}"
+
+    api_url = f"{base_url.rstrip('/')}/{segment}/v1"
+
+    ca_cert = os.environ.get("MA_CA_CERT") or os.environ.get("VISION_CA_CERT") or ""
+    http_client = None
+    if ca_cert:
+        import httpx
+        http_client = httpx.Client(verify=ca_cert, timeout=timeout)
 
     client = openai.OpenAI(
-        default_headers=headers,
-        api_key=api_key,
+        default_headers={"apikey": api_key},
+        api_key=api_key or "not-needed",
         base_url=api_url,
-        timeout=timeout
+        timeout=timeout,
+        http_client=http_client,
     )
 
-    # Resolve model name once and cache it
-    client_model_name = _resolve_mission_assist_model(client, api_url)
+    # Use the model id directly when it's a full id; otherwise resolve it.
+    if model_name.startswith("/"):
+        client_model_name = model_name
+    else:
+        client_model_name = _resolve_mission_assist_model(client, api_url)
 
     system_prompt = """You are an expert-level JSON generation API. Your sole purpose is to respond with a single, valid JSON object or array.
 
