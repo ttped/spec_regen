@@ -226,15 +226,21 @@ def grid_to_table_data(ncols: int, grid_rows: List[List], caption: str = "") -> 
 # Vision call -> table_data
 # ---------------------------------------------------------------------------
 
-def ocr_table_image(image_path: str, cfg: Dict) -> Tuple[Optional[Dict], str, str]:
+def ocr_table_image(image_path: str, cfg: Dict, max_side: int = None) -> Tuple[Optional[Dict], str, str]:
     """
     OCR one table crop into table_data via HTML, using the single configured LLM.
 
     `cfg` is the unified LLM config (see simple_pipeline.LLM_CONFIG). Returns
     (table_data, caption, raw_output); table_data is None when the model returned
     no usable table (caller should fall back to the crop image).
+
+    `max_side` optionally overrides cfg['max_image_side'] (accepted for backward
+    compatibility with older callers).
     """
     from utils import call_llm_vision  # lazy: keeps this module import-light
+
+    if max_side is not None:
+        cfg = {**cfg, "max_image_side": max_side}
 
     raw = call_llm_vision(HTML_TABLE_PROMPT, image_path, cfg)
 
