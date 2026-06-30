@@ -45,6 +45,7 @@ from classify_agent import run_classification_on_file, load_content_start_page, 
 from title_agent import extract_title_page_info
 from asset_processor import run_asset_integration
 from table_iris_processor import run_iris_table_processing
+from table_llm_processor import run_llm_table_processing
 from docx_writer import run_docx_creation
 from section_processor import run_section_processing_on_file
 from section_classifier import train_and_predict
@@ -79,6 +80,22 @@ LLM_CONFIG = {
     "base_url":   _require_env("LLM_BASE_URL"),
     "api_key":    os.environ.get("LLM_API_KEY") or None,
 }
+
+# Vision LLM used only by the table step (step 7) when TABLE_MODE=llm.
+# Separate from LLM_CONFIG because table OCR needs a vision model (e.g. Gemma 4
+# on Mission Assist) which may differ from the classify/title text model.
+# All values are optional with sensible Mission Assist defaults; the API key /
+# CA cert reuse the same env vars the standalone OCR test uses.
+VISION_LLM_CONFIG = {
+    "provider": os.environ.get("VISION_LLM_PROVIDER", "mission_assist"),
+    "host":     os.environ.get("VISION_LLM_HOST", "https://devmissionassist.api.us.baesystems.com"),
+    "segment":  os.environ.get("VISION_LLM_SEGMENT", "bae-api-gemma-4-31B"),
+    "model":    os.environ.get("VISION_LLM_MODEL", "/genai/Gemma-4-31B-IT"),
+    "base_url": os.environ.get("VISION_LLM_BASE_URL"),  # only for generic openai-compatible providers
+    "api_key":  os.environ.get("VISION_LLM_API_KEY") or os.environ.get("MA_API_KEY") or os.environ.get("LLM_API_KEY"),
+    "ca_cert":  os.environ.get("VISION_CA_CERT") or os.environ.get("MA_CA_CERT", ""),
+}
+VISION_MAX_SIDE = int(os.environ.get("VISION_MAX_SIDE", "2048"))
 
 
 def has_table_crops(yolo_exports_dir: str, doc_stem: str) -> bool:
@@ -245,6 +262,9 @@ class Config:
     # ML settings
     ml_threshold = 0.5
     
+    # Table processing: "llm" (vision-LLM OCR of crops) or "iris" (IRIS deliverable)
+    table_mode = os.environ.get("TABLE_MODE", "llm")
+
     # IRIS table OCR
     table_jsons_dir = DEFAULT_TABLE_JSONS_DIR
     
@@ -272,6 +292,8 @@ if __name__ == '__main__':
                        help="Force re-run YOLO even if exports exist")
     parser.add_argument('--table-jsons-dir', type=str, default=None,
                        help="Directory containing IRIS table OCR JSONs (overrides .env)")
+    parser.add_argument('--table-mode', type=str, choices=['llm', 'iris'], default=None,
+                       help="Table reconstruction: 'llm' (vision OCR of crops) or 'iris' (IRIS deliverable)")
     parser.add_argument('--shard', type=int, choices=[1, 2, 3, 4], default=None,
                        help="Run only a quarter of the documents: 1, 2, 3, or 4 for parallel processing")
 
@@ -287,6 +309,8 @@ if __name__ == '__main__':
     Config.force = cli_args.force
     if cli_args.table_jsons_dir:
         Config.table_jsons_dir = cli_args.table_jsons_dir
+    if cli_args.table_mode:
+        Config.table_mode = cli_args.table_mode
 
     args = Config()
 
@@ -500,9 +524,9 @@ if __name__ == '__main__':
                     print(f"         Skipping remaining steps for {stem}.")
                     continue
 
-        # STEP 6: TABLES (IRIS table OCR)
+        # STEP 6: TABLES
         if args.step in ["tables", "all"]:
-            print("[6: Tables (IRIS)]")
+            print(f"[6: Tables ({args.table_mode})]")
             if args.step == "all" and os.path.exists(tables_out):
                 print(f"  [Skip] Already done")
             else:
@@ -511,18 +535,30 @@ if __name__ == '__main__':
                     print(f"         Step 5 (assets) must complete successfully first.")
                     print(f"         Skipping remaining steps for {stem}.")
                     continue
-                # Gate: if doc has table crops, IRIS table OCR must be present
-                if has_table_crops(figures_dir, figures_stem):
-                    if not iris_ready_for_doc(args.table_jsons_dir, figures_stem):
-                        print(f"  [WAIT] Document has table crops but IRIS table OCR not yet received.")
-                        print(f"         Deferring tables/write/validate for {stem}.")
-                        continue
-                run_iris_table_processing(
-                    with_assets_out,
-                    tables_out,
-                    args.table_jsons_dir,
-                    figures_stem,
-                )
+
+                if args.table_mode == "llm":
+                    # Vision-LLM OCR of the table crops — no external deliverable needed.
+                    run_llm_table_processing(
+                        with_assets_out,
+                        tables_out,
+                        figures_dir,
+                        figures_stem,
+                        VISION_LLM_CONFIG,
+                        max_side=VISION_MAX_SIDE,
+                    )
+                else:
+                    # Gate: if doc has table crops, IRIS table OCR must be present
+                    if has_table_crops(figures_dir, figures_stem):
+                        if not iris_ready_for_doc(args.table_jsons_dir, figures_stem):
+                            print(f"  [WAIT] Document has table crops but IRIS table OCR not yet received.")
+                            print(f"         Deferring tables/write/validate for {stem}.")
+                            continue
+                    run_iris_table_processing(
+                        with_assets_out,
+                        tables_out,
+                        args.table_jsons_dir,
+                        figures_stem,
+                    )
 
         # STEP 7: WRITE
         if args.step in ["write", "all"]:
