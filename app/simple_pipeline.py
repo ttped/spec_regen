@@ -356,6 +356,7 @@ if __name__ == '__main__':
     # DOCUMENT LIST & SHARDING
     # ==========================================================================
     doc_stems = get_document_stems(args.raw_ocr_dir)
+    doc_stems = doc_stems[10:20]
     
     # 4-way sharding to allow running 4 separate terminals concurrently
     if cli_args.shard is not None:

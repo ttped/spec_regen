@@ -270,7 +270,7 @@ def train_and_predict(
         scoring='f1',
         cv=cv,
         random_state=42,
-        n_jobs=search_jobs,
+        n_jobs=1,
         verbose=0,
     )
     search.fit(X_train, y_train)
