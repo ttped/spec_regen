@@ -828,14 +828,9 @@ def get_page_dict_from_object(page_obj: Any) -> Optional[Dict]:
 def extract_page_metadata(page_dict: Dict, page_obj: Dict = None) -> Dict:
     """
     Extract useful metadata from a page_dict and page_obj.
-    DEBUG VERSION - prints what it's receiving.
     """
     metadata = {}
-    
-    print('extract_page_metadata')
-    print('page_dict', page_dict.keys()) # contains level, page_num, block_num, left, top, width, height, etc
-    print('page_obj', page_obj.keys()) # contains document_Id, page_Id, page_dict
-    
+
     # === PRESERVE ORIGINAL IMAGE_META ===
     image_meta = page_obj.get('image_meta')
     # Store the FULL image_meta structure
@@ -930,9 +925,7 @@ def load_raw_ocr_pages(input_path: str) -> List[Tuple[int, Dict, Dict]]:
     for key, val in data.items():
         # val is the full page object containing 'page_dict' and 'image_meta'
         page_dict = get_page_dict_from_object(val)
-        print('page val load_raw', val.keys())
-        print('page_dict load_raw', page_dict.keys())
-        
+
         if page_dict is not None:
             page_id = get_page_id_from_object(val, fallback_key=key)
             # Ensure we pass the original 'val' so extract_page_metadata sees 'image_meta'

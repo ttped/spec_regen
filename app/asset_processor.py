@@ -321,10 +321,8 @@ def normalize_all_element_bboxes(
             continue
         
         page = elem.get('page_number', 9999)
-        
-        # Enable verbose on first failure to help debug
-        debug_this = verbose or (skipped_no_dims == 0)
-        page_width, page_height = get_page_ocr_dimensions(page_metadata, page, verbose=debug_this)
+
+        page_width, page_height = get_page_ocr_dimensions(page_metadata, page, verbose=verbose)
         
         if not page_width or not page_height:
             skipped_no_dims += 1

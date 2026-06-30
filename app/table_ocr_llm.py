@@ -34,7 +34,11 @@ HTML_TABLE_PROMPT = (
     "correct, translate, or invent.\n"
     "- Join a cell that wraps across printed lines into one line separated by spaces.\n"
     "- Empty cells should be empty (<td></td>). Do not add rows or columns not in the image.\n"
-    "- If the table has a printed title/caption, put it in a <caption> element."
+    "- Use <caption> ONLY for a title that sits OUTSIDE the table's ruled grid (above or "
+    "below the box, with no cell border around it). If a title or heading is itself a cell "
+    "INSIDE the grid — e.g. a bordered row that spans all columns across the top — keep it "
+    "as a row in the table (a <th colspan=N> spanning all columns). Never both: do not copy "
+    "a structural title cell into <caption>, and never drop a cell that is part of the table."
 )
 
 
