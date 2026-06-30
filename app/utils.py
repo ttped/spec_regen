@@ -470,12 +470,25 @@ def _call_mission_assist(
     id (starts with "/", e.g. "/genai/Gemma-4-31B-IT"); otherwise it is resolved
     from the endpoint via models.list().
     """
-    segment = os.environ.get("MA_URL_SEGMENT")
+    # URL path segment. Prefer an explicit override; fall back to the vision
+    # step's segment so one setting configures every Mission Assist step.
+    segment = os.environ.get("MA_URL_SEGMENT") or os.environ.get("VISION_LLM_SEGMENT")
     if not segment:
+        if model_name.startswith("/"):
+            # A full model id ("/genai/...") can't be turned into a path segment.
+            raise ValueError(
+                f"Mission Assist URL segment not set for model '{model_name}'. "
+                f"Set MA_URL_SEGMENT (e.g. 'bae-api-gemma-4-31B')."
+            )
         seg = "gptoss" if model_name == "gpt-oss" else model_name
         segment = f"bae-api-{seg}"
 
-    if not base_url.startswith(("http://", "https://")):
+    # Mission Assist is HTTPS-only; normalize the scheme so an http:// base_url
+    # (e.g. a stale LLM_BASE_URL) doesn't matter.
+    base_url = base_url.strip()
+    if base_url.startswith("http://"):
+        base_url = "https://" + base_url[len("http://"):]
+    elif not base_url.startswith("https://"):
         base_url = f"https://{base_url}"
 
     api_url = f"{base_url.rstrip('/')}/{segment}/v1"

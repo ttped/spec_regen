@@ -99,6 +99,16 @@ VISION_LLM_CONFIG = {
 }
 VISION_MAX_SIDE = int(os.environ.get("VISION_MAX_SIDE", "2048"))
 
+# Single source of truth: make the vision step's Mission Assist connection drive
+# the text steps too (classify/title go through utils._call_mission_assist, which
+# reads these from the environment). This keeps the two configs from diverging —
+# the text path can't derive a URL segment from a full "/genai/..." model id, so
+# it inherits the vision segment, and reuses the same CA bundle.
+if VISION_LLM_CONFIG["provider"] == "mission_assist":
+    os.environ.setdefault("MA_URL_SEGMENT", VISION_LLM_CONFIG["segment"])
+    if VISION_LLM_CONFIG["ca_cert"]:
+        os.environ.setdefault("MA_CA_CERT", VISION_LLM_CONFIG["ca_cert"])
+
 
 def has_table_crops(yolo_exports_dir: str, doc_stem: str) -> bool:
     """Check if YOLO exported any table crops for this document."""
