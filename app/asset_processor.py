@@ -254,7 +254,12 @@ def load_all_assets(exports_dir: str, doc_stem: str) -> List[Dict]:
         
         if not meta:
             continue
-        
+
+        # "abandon" regions (headers/footers/junk) are filter-only — used by
+        # section_processor to drop overlapping text, never placed as assets.
+        if meta.get("asset_type", "").lower() == "abandon":
+            continue
+
         # Normalize asset type
         raw_type = meta.get("asset_type", "").lower()
         if raw_type in ["fig", "figure"]:
