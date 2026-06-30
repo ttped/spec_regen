@@ -78,7 +78,9 @@ LLM_CONFIG = {
     "provider":   _require_env("LLM_PROVIDER"),
     "model_name": _require_env("LLM_MODEL"),
     "base_url":   _require_env("LLM_BASE_URL"),
-    "api_key":    os.environ.get("LLM_API_KEY") or None,
+    # Reuse the same key var the table/vision step uses, so one MA_API_KEY
+    # configures every step on Mission Assist.
+    "api_key":    os.environ.get("LLM_API_KEY") or os.environ.get("MA_API_KEY") or None,
 }
 
 # Vision LLM used only by the table step (step 7) when TABLE_MODE=llm.
