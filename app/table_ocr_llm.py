@@ -7,7 +7,7 @@ physical grid that complex_table_schema renders. Doing the grid arithmetic in
 code — not in the LLM — is what makes irregular/merged tables reliable.
 
 Public API:
-    ocr_table_image(image_path, vision_cfg, max_side) -> (table_data|None, caption, raw_html)
+    ocr_table_image(image_path, llm_config) -> (table_data|None, caption, raw_html)
 
 `table_data` is the rich schema docx_writer understands:
     {"columns": [{"name": ...}], "rows": [{"cells": [...]}], "header_rows": N}
@@ -16,11 +16,7 @@ The HTML parser and grid expander are unit-tested in
 tests/test_table_html_to_docx.py (which imports them from here).
 """
 
-import os
-import io
 import re
-import base64
-import mimetypes
 from html.parser import HTMLParser
 from typing import Dict, List, Optional, Tuple
 
@@ -45,27 +41,6 @@ HTML_TABLE_PROMPT = (
 # ---------------------------------------------------------------------------
 # Image encoding
 # ---------------------------------------------------------------------------
-
-def encode_image_data_url(image_path: str, max_side: int = 2048) -> str:
-    """
-    Return an OpenAI-style data: URL. Downscales to max_side on the long edge
-    and re-encodes as JPEG to stay within vision-model size limits.
-    max_side <= 0 sends the original bytes untouched.
-    """
-    if max_side and max_side > 0:
-        from PIL import Image  # Pillow is a project dependency
-        im = Image.open(image_path).convert("RGB")
-        im.thumbnail((max_side, max_side))
-        buf = io.BytesIO()
-        im.save(buf, format="JPEG", quality=90)
-        raw, mime = buf.getvalue(), "image/jpeg"
-    else:
-        raw = open(image_path, "rb").read()
-        mime = mimetypes.guess_type(image_path)[0] or "image/png"
-
-    b64 = base64.b64encode(raw).decode()
-    return f"data:{mime};base64,{b64}"
-
 
 # ---------------------------------------------------------------------------
 # HTML parsing
@@ -244,69 +219,20 @@ def grid_to_table_data(ncols: int, grid_rows: List[List], caption: str = "") -> 
 
 
 # ---------------------------------------------------------------------------
-# Vision call
+# Vision call -> table_data
 # ---------------------------------------------------------------------------
 
-def _build_vision_client(cfg: Dict, timeout: float = 180.0):
+def ocr_table_image(image_path: str, cfg: Dict) -> Tuple[Optional[Dict], str, str]:
     """
-    Build an OpenAI client for the configured vision endpoint.
+    OCR one table crop into table_data via HTML, using the single configured LLM.
 
-    cfg keys: provider, host, segment, model, api_key, ca_cert, base_url(optional).
-    Mirrors the Mission Assist "OpenAI Connector" pattern: per-model base_url,
-    apikey header, optional CA bundle via httpx.
+    `cfg` is the unified LLM config (see simple_pipeline.LLM_CONFIG). Returns
+    (table_data, caption, raw_output); table_data is None when the model returned
+    no usable table (caller should fall back to the crop image).
     """
-    import httpx
-    import openai
+    from utils import call_llm_vision  # lazy: keeps this module import-light
 
-    api_key = cfg.get("api_key") or ""
-    ca_cert = cfg.get("ca_cert") or ""
-    http_client = httpx.Client(verify=ca_cert, timeout=timeout) if ca_cert else None
-
-    provider = cfg.get("provider", "mission_assist")
-    if provider == "mission_assist":
-        base_url = f"{cfg['host'].rstrip('/')}/{cfg['segment']}/v1"
-        headers = {"apikey": api_key}
-    else:
-        # Generic OpenAI-compatible endpoint (e.g. llama-server, ollama /v1).
-        base_url = (cfg.get("base_url") or cfg.get("host", "")).rstrip("/")
-        headers = {}
-
-    return openai.OpenAI(
-        api_key=api_key or "not-needed",
-        base_url=base_url,
-        default_headers=headers,
-        http_client=http_client,
-        timeout=timeout,
-    )
-
-
-def call_vision(prompt: str, data_url: str, cfg: Dict, timeout: float = 180.0) -> str:
-    """Send a prompt + image to the vision model and return the raw text reply."""
-    client = _build_vision_client(cfg, timeout=timeout)
-    response = client.chat.completions.create(
-        model=cfg["model"],
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": data_url}},
-            ],
-        }],
-        temperature=0.0,
-    )
-    return response.choices[0].message.content or ""
-
-
-def ocr_table_image(image_path: str, cfg: Dict, max_side: int = 2048
-                    ) -> Tuple[Optional[Dict], str, str]:
-    """
-    OCR one table crop into table_data via HTML.
-
-    Returns (table_data, caption, raw_output). table_data is None when the model
-    returned no usable table (caller should fall back to the crop image).
-    """
-    data_url = encode_image_data_url(image_path, max_side=max_side)
-    raw = call_vision(HTML_TABLE_PROMPT, data_url, cfg)
+    raw = call_llm_vision(HTML_TABLE_PROMPT, image_path, cfg)
 
     html = extract_table_html(raw)
     if not html:

@@ -35,7 +35,7 @@ TITLE_PAGE_PLACEHOLDERS: Dict[str, Any] = {
 }
 
 
-def extract_title_page_info(text: str, model_name: str, base_url: str, api_key: str, provider: str) -> Dict[str, Any]:
+def extract_title_page_info(text: str, llm_config: Dict) -> Dict[str, Any]:
     """Extract only the document title; fill the rest with placeholders."""
     prompt = f"""You are a document analysis expert. Extract the document title from the title page text below.
 
@@ -53,7 +53,7 @@ Example:
 
 Return ONLY the JSON object, no other text."""
 
-    llm_response = call_llm(prompt, model_name, base_url, api_key, provider)
+    llm_response = call_llm(prompt, llm_config)
     json_string = _extract_json_from_llm_string(llm_response)
 
     result: Dict[str, Any] = {"document_title": ""}
@@ -99,13 +99,7 @@ def run_title_extraction_on_file(input_path: str, output_path: str, llm_config: 
 
         if subject == "Title Page":
             print(f"Found Title Page on page {page.get('page')}. Extracting title...")
-            extracted_info = extract_title_page_info(
-                page.get('text', ''),
-                llm_config['model_name'],
-                llm_config['base_url'],
-                llm_config['api_key'],
-                llm_config['provider']
-            )
+            extracted_info = extract_title_page_info(page.get('text', ''), llm_config)
             extracted_info['page_number'] = page.get('page')
             title_page_data.append(extracted_info)
 
@@ -122,8 +116,9 @@ if __name__ == '__main__':
 
     llm_config = {
         "provider": "mission_assist",
-        "model_name": "gemma3",
-        "base_url": "http://devmissionassist.api.us.baesystems.com",
+        "model": "/genai/Gemma-4-31B-IT",
+        "segment": "bae-api-gemma-4-31B",
+        "base_url": "https://devmissionassist.api.us.baesystems.com",
         "api_key": "aTOIT9hJM3DBYMQbEY"
     }
 
