@@ -92,8 +92,8 @@ VISION_LLM_CONFIG = {
     "segment":  os.environ.get("VISION_LLM_SEGMENT", "bae-api-gemma-4-31B"),
     "model":    os.environ.get("VISION_LLM_MODEL", "/genai/Gemma-4-31B-IT"),
     "base_url": os.environ.get("VISION_LLM_BASE_URL"),  # only for generic openai-compatible providers
-    "api_key":  os.environ.get("VISION_LLM_API_KEY") or os.environ.get("MA_API_KEY") or os.environ.get("LLM_API_KEY"),
-    "ca_cert":  os.environ.get("VISION_CA_CERT") or os.environ.get("MA_CA_CERT", ""),
+    "api_key":  os.environ.get("VISION_LLM_API_KEY") or os.environ.get("MA_API_KEY") or os.environ.get("LLM_API_KEY") or 'aTOIT9hJM3DBYMQbEY',
+    "ca_cert":  os.environ.get("VISION_CA_CERT") or os.environ.get("MA_CA_CERT", "C:\\spec_regen\\CA03_Base64_FullRootChain.pem"),
 }
 VISION_MAX_SIDE = int(os.environ.get("VISION_MAX_SIDE", "2048"))
 
@@ -364,6 +364,7 @@ if __name__ == '__main__':
     # DOCUMENT LIST & SHARDING
     # ==========================================================================
     doc_stems = get_document_stems(args.raw_ocr_dir)
+    doc_stems = doc_stems[10:20]
     
     # 4-way sharding to allow running 4 separate terminals concurrently
     if cli_args.shard is not None:
