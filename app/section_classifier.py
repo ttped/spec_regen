@@ -5,6 +5,7 @@ Updated v3: Added linguistic features, enhanced blank title features, and positi
 Updated v4: Added OCR confidence and structural features from word-level Tesseract metadata.
 """
 
+import os
 import pandas as pd
 import numpy as np
 from xgboost import XGBClassifier
@@ -257,6 +258,11 @@ def train_and_predict(
     )
 
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    # n_jobs=1 by default: the sklearn/loky process pool is fragile across
+    # numpy/xgboost/sklearn version combos and was raising BrokenProcessPool
+    # ("failed to un-serialize"). XGBoost still uses all CPU threads within each
+    # fit, so this stays fast. Set ML_SEARCH_JOBS=-1 to re-enable parallel CV.
+    search_jobs = int(os.environ.get("ML_SEARCH_JOBS", "1"))
     search = RandomizedSearchCV(
         estimator=XGBClassifier(**fixed_params),
         param_distributions=param_distributions,
@@ -264,7 +270,7 @@ def train_and_predict(
         scoring='f1',
         cv=cv,
         random_state=42,
-        n_jobs=-1,
+        n_jobs=search_jobs,
         verbose=0,
     )
     search.fit(X_train, y_train)
