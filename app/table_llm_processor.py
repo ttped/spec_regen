@@ -26,8 +26,7 @@ def run_llm_table_processing(
     output_path: str,
     figures_dir: str,
     doc_stem: str,
-    vision_cfg: Dict,
-    max_side: int = 2048,
+    llm_config: Dict,
 ):
     """
     Args:
@@ -35,8 +34,8 @@ def run_llm_table_processing(
         output_path: Path to write {doc}_with_tables.json
         figures_dir: Root of YOLO exports (crops live in figures_dir/<doc_stem>/)
         doc_stem:    Resolved YOLO subdirectory name for this document
-        vision_cfg:  Vision-LLM config (see simple_pipeline.VISION_LLM_CONFIG)
-        max_side:    Long-edge downscale for the crop before sending
+        llm_config:  The single LLM config (see simple_pipeline.LLM_CONFIG);
+                     image downscale comes from its 'max_image_side'.
     """
     print(f"  - Reading elements: {input_path}")
 
@@ -80,7 +79,7 @@ def run_llm_table_processing(
 
         # API call — guard so one bad table doesn't abort the whole document.
         try:
-            table_data, caption, _raw = ocr_table_image(image_path, vision_cfg, max_side=max_side)
+            table_data, caption, _raw = ocr_table_image(image_path, llm_config)
         except Exception as e:
             print(f"    [warn] vision OCR failed for {image_file}: {e} — keeping crop image")
             fell_back += 1

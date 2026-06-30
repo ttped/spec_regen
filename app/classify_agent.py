@@ -646,13 +646,7 @@ Example Output:
 {{"page_type": "CONTENT_BODY"}}
 """
     try:
-        llm_response = call_llm(
-            prompt,
-            llm_config['model_name'],
-            llm_config['base_url'],
-            llm_config['api_key'],
-            llm_config['provider']
-        )
+        llm_response = call_llm(prompt, llm_config)
     except Exception as e:
         print(f"    [Error] LLM Call failed: {e}")
         return "AMBIGUOUS"
@@ -718,13 +712,7 @@ Page Text:
 ---
 """
     try:
-        llm_response = call_llm(
-            prompt,
-            llm_config['model_name'],
-            llm_config['base_url'],
-            llm_config['api_key'],
-            llm_config['provider']
-        )
+        llm_response = call_llm(prompt, llm_config)
     except Exception as e:
         print(f"    [Error] Stub check LLM call failed: {e}")
         return None
@@ -1287,9 +1275,11 @@ def test_fast_classification(text: str) -> None:
 if __name__ == '__main__':
     llm_config = {
         "provider": "mission_assist",
-        "model_name": "gemma3",
-        "base_url": "http://devmissionassist.api.us.baesystems.com",
-        "api_key": "aTOIT9hJM3DBYMQbEY"
+        "model": "/genai/Gemma-4-31B-IT",
+        "segment": "bae-api-gemma-4-31B",
+        "base_url": "https://devmissionassist.api.us.baesystems.com",
+        "api_key": os.environ.get("LLM_API_KEY") or os.environ.get("MA_API_KEY"),
+        "ca_cert": os.environ.get("LLM_CA_CERT") or os.environ.get("MA_CA_CERT"),
     }
     
     import sys

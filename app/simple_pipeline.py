@@ -74,28 +74,26 @@ DEFAULT_YOLO_EXPORTS_DIR = _require_env("YOLO_EXPORTS_DIR")
 DEFAULT_TABLE_JSONS_DIR  = _require_env("TABLE_JSONS_DIR")
 DEFAULT_RESULTS_DIR      = _require_env("RESULTS_DIR")
 
+# =============================================================================
+# ONE LLM CONFIG for every step (classify, title, and table OCR).
+# Swap providers by changing LLM_PROVIDER; all params come from LLM_* env vars.
+#   provider  : ollama | llama_server | mission_assist | transformers
+#   model     : model id (e.g. /genai/Gemma-4-31B-IT, gemma3:12b)
+#   base_url  : endpoint host (or local model dir for transformers)
+#   segment   : mission_assist URL path segment (e.g. bae-api-gemma-4-31B)
+#   ca_cert   : mission_assist TLS CA bundle path
+#   max_image_side : long-edge downscale for table-OCR images
+# =============================================================================
 LLM_CONFIG = {
-    "provider":   _require_env("LLM_PROVIDER"),
-    "model_name": _require_env("LLM_MODEL"),
-    "base_url":   _require_env("LLM_BASE_URL"),
-    "api_key":    os.environ.get("LLM_API_KEY") or None,
+    "provider":       _require_env("LLM_PROVIDER"),
+    "model":          _require_env("LLM_MODEL"),
+    "base_url":       _require_env("LLM_BASE_URL"),
+    "api_key":        os.environ.get("LLM_API_KEY") or os.environ.get("MA_API_KEY") or None,
+    "segment":        os.environ.get("LLM_URL_SEGMENT") or os.environ.get("MA_URL_SEGMENT") or None,
+    "ca_cert":        os.environ.get("LLM_CA_CERT") or os.environ.get("MA_CA_CERT") or None,
+    "max_image_side": int(os.environ.get("LLM_MAX_IMAGE_SIDE", "2048")),
+    "timeout":        float(os.environ.get("LLM_TIMEOUT", "180")),
 }
-
-# Vision LLM used only by the table step (step 7) when TABLE_MODE=llm.
-# Separate from LLM_CONFIG because table OCR needs a vision model (e.g. Gemma 4
-# on Mission Assist) which may differ from the classify/title text model.
-# All values are optional with sensible Mission Assist defaults; the API key /
-# CA cert reuse the same env vars the standalone OCR test uses.
-VISION_LLM_CONFIG = {
-    "provider": os.environ.get("VISION_LLM_PROVIDER", "mission_assist"),
-    "host":     os.environ.get("VISION_LLM_HOST", "https://devmissionassist.api.us.baesystems.com"),
-    "segment":  os.environ.get("VISION_LLM_SEGMENT", "bae-api-gemma-4-31B"),
-    "model":    os.environ.get("VISION_LLM_MODEL", "/genai/Gemma-4-31B-IT"),
-    "base_url": os.environ.get("VISION_LLM_BASE_URL"),  # only for generic openai-compatible providers
-    "api_key":  os.environ.get("VISION_LLM_API_KEY") or os.environ.get("MA_API_KEY") or os.environ.get("LLM_API_KEY") or 'aTOIT9hJM3DBYMQbEY',
-    "ca_cert":  os.environ.get("VISION_CA_CERT") or os.environ.get("MA_CA_CERT", "C:\\spec_regen\\CA03_Base64_FullRootChain.pem"),
-}
-VISION_MAX_SIDE = int(os.environ.get("VISION_MAX_SIDE", "2048"))
 
 
 def has_table_crops(yolo_exports_dir: str, doc_stem: str) -> bool:
@@ -194,13 +192,7 @@ def extract_title_from_first_page(raw_input_path: str, output_path: str):
     info = None
     if page_text and page_text.strip():
         # Avoiding try/except based on preferences; if it fails we let the stack trace show the real issue.
-        info = extract_title_page_info(
-            page_text, 
-            LLM_CONFIG['model_name'], 
-            LLM_CONFIG['base_url'], 
-            LLM_CONFIG['api_key'], 
-            LLM_CONFIG['provider']
-        )
+        info = extract_title_page_info(page_text, LLM_CONFIG)
     
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     with open(output_path, 'w', encoding='utf-8') as f:
@@ -544,8 +536,7 @@ if __name__ == '__main__':
                         tables_out,
                         figures_dir,
                         figures_stem,
-                        VISION_LLM_CONFIG,
-                        max_side=VISION_MAX_SIDE,
+                        LLM_CONFIG,
                     )
                 else:
                     # Gate: if doc has table crops, IRIS table OCR must be present

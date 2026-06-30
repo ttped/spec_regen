@@ -3,7 +3,6 @@ import os
 import re
 import requests
 from typing import Optional, Any, Dict, List
-from langchain_openai import OpenAI
 import openai
 
 
@@ -345,98 +344,100 @@ def load_pages_from_json(file_path: str) -> Dict[str, str]:
         return {}
 
 
-def call_llm(
-    prompt: str,
-    model_name: str,
-    base_url: str,
-    api_key: str = None,
-    provider: str = "ollama",
-    timeout: float = 120.0
-) -> Optional[str]:
+def call_llm(prompt: str, cfg: Dict, timeout: float = None) -> Optional[str]:
     """
-    Sends a prompt to Ollama, Mission Assist, llama-server, or a local transformers model.
+    Text completion through the single configured LLM provider.
 
-    For provider="transformers", `base_url` is interpreted as the local
-    filesystem path to the model directory (e.g. D:/transformers_cache/gemma-4-E4B-it).
-    `model_name` is informational only in that case.
+    `cfg` is the one LLM config dict (see simple_pipeline.LLM_CONFIG) with keys:
+        provider, model, base_url, api_key, segment, ca_cert, timeout, ...
 
-    For provider="llama_server", `base_url` is the root URL of a running
-    llama.cpp `llama-server` process (e.g. http://localhost:8080). `model_name`
-    is informational — llama-server serves whatever GGUF it was launched with —
-    but is still sent in the OpenAI-compatible request body.
+    Per-provider meaning of `base_url`:
+      - transformers : local filesystem path to the model directory
+      - llama_server : root URL of the running llama-server (e.g. http://localhost:8080)
+      - ollama       : Ollama host
+      - mission_assist : API host; combined with `segment` -> host/segment/v1
     """
+    provider = cfg["provider"]
+    timeout = timeout if timeout is not None else float(cfg.get("timeout") or 120.0)
+
     if provider == "ollama":
-        return _call_ollama(prompt, model_name, base_url, timeout=timeout)
+        return _call_ollama(cfg, prompt, timeout)
     elif provider == "mission_assist":
-        if not api_key:
+        if not cfg.get("api_key"):
             raise ValueError("api_key is required for mission_assist provider")
-        return _call_mission_assist(prompt, model_name, base_url, api_key, timeout=timeout)
+        return _call_mission_assist(cfg, prompt, timeout)
     elif provider == "transformers":
-        return _call_transformers(prompt, model_path=base_url)
+        return _call_transformers(prompt, model_path=cfg["base_url"])
     elif provider == "llama_server":
-        return _call_llama_server(prompt, model_name, base_url, timeout=timeout)
+        return _call_llama_server(cfg, prompt, timeout)
     else:
         raise ValueError(
             f"Unknown provider: {provider}. "
-            f"Use 'ollama', 'mission_assist', 'transformers', or 'llama_server'"
+            f"Use 'ollama', 'mission_assist', 'transformers', or 'llama_server'."
         )
 
 
-def _call_ollama(
-    prompt: str,
-    model_name: str,
-    base_url: str,
-    timeout: float = 120.0
-) -> Optional[str]:
+def call_llm_vision(prompt: str, image_path: str, cfg: Dict, timeout: float = None) -> Optional[str]:
     """
-    Sends a prompt to Ollama and expects a JSON object in the response.
+    Vision completion (prompt + image) through the same configured provider.
+
+    Works for mission_assist and any OpenAI-compatible endpoint (llama_server,
+    ollama). The image is downscaled to cfg['max_image_side'] and sent as a
+    data: URL. The 'transformers' provider does not support vision here.
     """
-    # Ensure URL has a scheme — requests requires it
+    provider = cfg["provider"]
+    if provider == "transformers":
+        raise NotImplementedError("Vision is not supported for the 'transformers' provider.")
+    timeout = timeout if timeout is not None else float(cfg.get("timeout") or 180.0)
+
+    data_url = _encode_image_data_url(image_path, int(cfg.get("max_image_side") or 2048))
+    client, model = _openai_client(cfg, timeout)
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }],
+        temperature=0.0,
+    )
+    return response.choices[0].message.content or ""
+
+
+def _call_ollama(cfg: Dict, prompt: str, timeout: float = 120.0) -> Optional[str]:
+    """Sends a prompt to Ollama and expects a JSON object in the response."""
+    base_url = cfg["base_url"]
     if not base_url.startswith(("http://", "https://")):
         base_url = f"http://{base_url}"
-    
+
     api_url = f"{base_url.rstrip('/')}/api/chat"
     payload = {
-        "model": model_name,
+        "model": cfg["model"],
         "messages": [{"role": "user", "content": prompt}],
         "format": "json",
         "stream": False,
-        "options": {"temperature": 0.0}
+        "options": {"temperature": 0.0},
     }
 
     response = requests.post(api_url, json=payload, timeout=timeout)
     response.raise_for_status()
-
-    if response.status_code == 200:
-        response_data = response.json()
-        raw_llm_content = response_data.get("message", {}).get("content")
-        return raw_llm_content
+    return response.json().get("message", {}).get("content")
 
 
-def _call_llama_server(
-    prompt: str,
-    model_name: str,
-    base_url: str,
-    timeout: float = 120.0
-) -> Optional[str]:
+def _call_llama_server(cfg: Dict, prompt: str, timeout: float = 120.0) -> Optional[str]:
     """
-    Sends a prompt to a llama.cpp `llama-server` process via its
-    OpenAI-compatible `/v1/chat/completions` endpoint.
-
-    JSON output is requested via `response_format={"type": "json_object"}`,
-    which llama-server enforces through constrained sampling (GBNF grammar
-    under the hood), matching Ollama's `format: "json"` behavior.
-
-    `model_name` is informational — llama-server serves whatever GGUF was
-    loaded at startup — but the field is required by the OpenAI request schema.
+    Sends a prompt to a llama.cpp `llama-server` via its OpenAI-compatible
+    `/v1/chat/completions` endpoint, requesting JSON output.
     """
-    # Ensure URL has a scheme
+    base_url = cfg["base_url"]
     if not base_url.startswith(("http://", "https://")):
         base_url = f"http://{base_url}"
 
     api_url = f"{base_url.rstrip('/')}/v1/chat/completions"
     payload = {
-        "model": model_name,
+        "model": cfg["model"],
         "messages": [{"role": "user", "content": prompt}],
         "response_format": {"type": "json_object"},
         "temperature": 0.0,
@@ -445,62 +446,10 @@ def _call_llama_server(
 
     response = requests.post(api_url, json=payload, timeout=timeout)
     response.raise_for_status()
-
-    response_data = response.json()
-    return response_data["choices"][0]["message"]["content"]
+    return response.json()["choices"][0]["message"]["content"]
 
 
-def _call_mission_assist(
-    prompt: str,
-    model_name: str,
-    base_url: str,
-    api_key: str,
-    timeout: float = 120.0
-) -> Optional[str]:
-    """
-    Sends a prompt to Mission Assist (OpenAI-compatible) chat completions.
-
-    Connection details are env-driven so every pipeline step can share one
-    Mission Assist setup:
-      MA_URL_SEGMENT            full path segment, e.g. "bae-api-gemma-4-31B"
-                                (default: "bae-api-{model_name}" for back-compat)
-      MA_CA_CERT / VISION_CA_CERT  CA bundle path for TLS verification
-
-    The request model id is `model_name` used directly when it looks like a full
-    id (starts with "/", e.g. "/genai/Gemma-4-31B-IT"); otherwise it is resolved
-    from the endpoint via models.list().
-    """
-    segment = os.environ.get("MA_URL_SEGMENT")
-    if not segment:
-        seg = "gptoss" if model_name == "gpt-oss" else model_name
-        segment = f"bae-api-{seg}"
-
-    if not base_url.startswith(("http://", "https://")):
-        base_url = f"https://{base_url}"
-
-    api_url = f"{base_url.rstrip('/')}/{segment}/v1"
-
-    ca_cert = os.environ.get("MA_CA_CERT") or os.environ.get("VISION_CA_CERT") or ""
-    http_client = None
-    if ca_cert:
-        import httpx
-        http_client = httpx.Client(verify=ca_cert, timeout=timeout)
-
-    client = openai.OpenAI(
-        default_headers={"apikey": api_key},
-        api_key=api_key or "not-needed",
-        base_url=api_url,
-        timeout=timeout,
-        http_client=http_client,
-    )
-
-    # Use the model id directly when it's a full id; otherwise resolve it.
-    if model_name.startswith("/"):
-        client_model_name = model_name
-    else:
-        client_model_name = _resolve_mission_assist_model(client, api_url)
-
-    system_prompt = """You are an expert-level JSON generation API. Your sole purpose is to respond with a single, valid JSON object or array.
+_MISSION_ASSIST_SYSTEM_PROMPT = """You are an expert-level JSON generation API. Your sole purpose is to respond with a single, valid JSON object or array.
 
 **CRITICAL RESPONSE DIRECTIVES:**
 
@@ -510,18 +459,98 @@ def _call_mission_assist(
 
 **DO NOT INCLUDE YOUR REASONING OR THOUGHTS IN THE FINAL RESPONSE.**
 """
-    
+
+
+def _mission_assist_base_url(cfg: Dict) -> str:
+    """Build the Mission Assist per-model API base URL (host/segment/v1) from cfg."""
+    segment = cfg.get("segment")
+    if not segment:
+        model = cfg["model"]
+        if model.startswith("/"):
+            # A full model id ("/genai/...") can't be turned into a path segment.
+            raise ValueError(
+                f"Mission Assist URL segment not set for model '{model}'. "
+                f"Set LLM_URL_SEGMENT (e.g. 'bae-api-gemma-4-31B')."
+            )
+        segment = "bae-api-gptoss" if model == "gpt-oss" else f"bae-api-{model}"
+
+    base_url = (cfg.get("base_url") or "").strip()
+    if base_url.startswith("http://"):            # Mission Assist is HTTPS-only
+        base_url = "https://" + base_url[len("http://"):]
+    elif not base_url.startswith("https://"):
+        base_url = f"https://{base_url}"
+    return f"{base_url.rstrip('/')}/{segment}/v1"
+
+
+def _openai_client(cfg: Dict, timeout: float):
+    """
+    Return (client, model_id) for an OpenAI-compatible endpoint — shared by the
+    text and vision paths. Handles Mission Assist (apikey header, optional CA
+    bundle, per-model URL segment) and generic endpoints (llama_server, ollama).
+    """
+    api_key = cfg.get("api_key") or "not-needed"
+    http_client = None
+    if cfg.get("ca_cert"):
+        import httpx
+        http_client = httpx.Client(verify=cfg["ca_cert"], timeout=timeout)
+
+    if cfg["provider"] == "mission_assist":
+        api_url = _mission_assist_base_url(cfg)
+        client = openai.OpenAI(
+            base_url=api_url,
+            api_key=api_key,
+            default_headers={"apikey": cfg.get("api_key") or ""},
+            http_client=http_client,
+            timeout=timeout,
+        )
+        model = cfg["model"]
+        if not model.startswith("/"):            # resolve short ids via the endpoint
+            model = _resolve_mission_assist_model(client, api_url)
+        return client, model
+
+    # Generic OpenAI-compatible endpoint (llama_server, ollama)
+    base_url = (cfg["base_url"] or "").strip()
+    if not base_url.startswith(("http://", "https://")):
+        base_url = f"http://{base_url}"
+    base_url = base_url.rstrip("/")
+    if not base_url.endswith("/v1"):
+        base_url += "/v1"
+    client = openai.OpenAI(base_url=base_url, api_key=api_key, http_client=http_client, timeout=timeout)
+    return client, cfg["model"]
+
+
+def _call_mission_assist(cfg: Dict, prompt: str, timeout: float = 120.0) -> Optional[str]:
+    """Mission Assist text completion with a JSON-enforcing system prompt."""
+    client, model = _openai_client(cfg, timeout)
     response = client.chat.completions.create(
-        model=client_model_name,
+        model=model,
         messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt}
+            {"role": "system", "content": _MISSION_ASSIST_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
         ],
         temperature=0.0,
-        max_tokens=8192
+        max_tokens=8192,
     )
-    
     return response.choices[0].message.content
+
+
+def _encode_image_data_url(image_path: str, max_side: int = 2048) -> str:
+    """Downscale (long edge) + base64-encode an image as a data: URL for vision calls."""
+    import base64
+    import io
+    import mimetypes
+    if max_side and max_side > 0:
+        from PIL import Image
+        im = Image.open(image_path).convert("RGB")
+        im.thumbnail((max_side, max_side))
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=90)
+        raw, mime = buf.getvalue(), "image/jpeg"
+    else:
+        with open(image_path, "rb") as fh:
+            raw = fh.read()
+        mime = mimetypes.guess_type(image_path)[0] or "image/png"
+    return f"data:{mime};base64,{base64.b64encode(raw).decode()}"
 
 
 # Cache for resolved Mission Assist model names (keyed by API URL)
