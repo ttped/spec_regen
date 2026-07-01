@@ -66,9 +66,12 @@ TOC_ENTRY_PATTERN = re.compile(
     re.MULTILINE
 )
 
-# Pattern for "Table of Contents", "Contents", "TOC" headers
+# Pattern for "Table of Contents", "Contents", "TOC" headers.
+# Note: the standalone alternative requires the plural "CONTENTS" — matching the
+# singular "content" (very common in spec prose) caused content pages with a few
+# section numbers to be misclassified as a TOC.
 TOC_HEADER_PATTERN = re.compile(
-    r'\b(?:TABLE\s+OF\s+CONTENTS?|CONTENTS?|TOC)\b',
+    r'\b(?:TABLE\s+OF\s+CONTENTS?|CONTENTS|TOC)\b',
     re.IGNORECASE
 )
 
@@ -382,63 +385,68 @@ def fast_classify_page(page_text: str) -> Optional[str]:
     # "1.1 SCOPE .............. 5" becomes various garbled versions
     period_count = page_text.count('.')
     has_many_periods = period_count >= MIN_PERIODS_FOR_TOC_HINT
-    
+
+    # Sparseness gate: real TOC pages are sparse (mostly short "x.y Title ... N"
+    # entries), while content pages are dense prose. Many of the softer rules
+    # below rely on signals — the word "contents", raw period counts, a few
+    # section numbers — that also occur on ordinary content pages, so they only
+    # fire when the page is actually TOC-sparse.
+    non_ws_chars = sum(1 for c in page_text if not c.isspace())
+    is_sparse = non_ws_chars <= MAX_CHARS_FOR_DENSE_TOC
+
     # Decision logic for TOC:
     # 1. Many unique section numbers (10+) AND not dominated by measurements → definitely TOC
-    # 2. TOC header + several section numbers (5+) → definitely TOC  
+    # 2. TOC header + several section numbers (5+) → definitely TOC
     # 3. Many TOC-style entries (8+) → definitely TOC
     # 4. Many line-level TOC entries (6+) → definitely TOC (catches top-level numbers)
     # 5. List of Figures/Tables header with numbered items → TOC
     # 6. Many garbled dot leaders (8+) + some section-like patterns → TOC
     # 7. FALLBACK: Many periods (dot leaders) + TOC header → likely TOC
-    
+
     if (len(unique_section_numbers) >= MIN_SECTION_NUMBERS_FOR_TOC and not has_many_measurements):
         density = section_number_density(page_text, filtered_section_numbers)
-        non_ws_chars = sum(1 for c in page_text if not c.isspace())
-        if density >= MIN_SECTION_DENSITY_FOR_TOC and non_ws_chars <= MAX_CHARS_FOR_DENSE_TOC:
+        if density >= MIN_SECTION_DENSITY_FOR_TOC and is_sparse:
             return "TABLE_OF_CONTENTS"
-    
-    if has_toc_header and len(unique_section_numbers) >= 5:
+
+    if has_toc_header and len(unique_section_numbers) >= 5 and is_sparse:
         return "TABLE_OF_CONTENTS"
-    
-    if len(toc_entries) >= MIN_TOC_ENTRIES_FOR_TOC:
-        non_ws_chars = sum(1 for c in page_text if not c.isspace())
-        if non_ws_chars <= MAX_CHARS_FOR_DENSE_TOC:
-            return "TABLE_OF_CONTENTS"
-    
+
+    if len(toc_entries) >= MIN_TOC_ENTRIES_FOR_TOC and is_sparse:
+        return "TABLE_OF_CONTENTS"
+
     # NEW: Line-level TOC detection (catches "1 Scope ... 3" style entries)
-    if toc_line_count >= 6:
+    if toc_line_count >= 6 and is_sparse:
         return "TABLE_OF_CONTENTS"
-    
+
     # NEW: TOC header + fewer line entries is still a TOC
-    if has_toc_header and toc_line_count >= 3:
+    if has_toc_header and toc_line_count >= 3 and is_sparse:
         return "TABLE_OF_CONTENTS"
-    
+
     # For List of Figures/Tables, we have the header but numbering is simpler
     # Still auto-classify if we have the header AND multiple numbered items
     if has_list_of_header:
         # Look for figure/table numbers: Figure 1, Table 2, etc.
         fig_tab_numbers = re.findall(r'\b(?:Figure|Table|Fig\.?)\s*\d+', page_text, re.IGNORECASE)
-        if len(fig_tab_numbers) >= 5:
+        if len(fig_tab_numbers) >= 5 and is_sparse:
             return "TABLE_OF_CONTENTS"
-    
+
     # NEW: Garbled dot leaders — strong signal for OCR-mangled TOC pages
     # 8+ garbled dot sequences + at least a couple section numbers or line entries
     if garbled_dot_count >= 8 and (len(unique_section_numbers) >= 2 or toc_line_count >= 2):
         return "TABLE_OF_CONTENTS"
-    
+
     # NEW: TOC header + garbled dot leaders (OCR destroyed the numbers but dots remain)
-    if has_toc_header and garbled_dot_count >= 4:
+    if has_toc_header and garbled_dot_count >= 4 and is_sparse:
         return "TABLE_OF_CONTENTS"
-    
+
     # FALLBACK: Dot leader detection for TOC pages where OCR missed section numbers
     # If we have TOC header + lots of periods, it's probably a TOC even without parsed numbers
-    if has_toc_header and has_many_periods:
+    if has_toc_header and has_many_periods and is_sparse:
         return "TABLE_OF_CONTENTS"
-    
+
     # Even without header, if we have LOTS of periods (80+) and some section-like patterns
     # This catches TOC pages where the header was on a previous page
-    if period_count >= 80 and len(unique_section_numbers) >= 3:
+    if period_count >= 80 and len(unique_section_numbers) >= 3 and is_sparse:
         return "TABLE_OF_CONTENTS"
     
     # ==========================================================================
