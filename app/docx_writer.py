@@ -151,47 +151,34 @@ TABLE_FONT_NAME = 'Calibri'
 HEADER_SHADING_COLOR = "D9E2F3"  # light blue-gray
 
 
-def _set_cell_border(cell, **kwargs):
-    """
-    Set individual borders on a table cell.
-    
-    Usage: _set_cell_border(cell, top={"sz": 4, "val": "single", "color": "CCCCCC"})
-    Pass val="none" to hide a border edge.
-    """
-    tc = cell._tc
-    tcPr = tc.get_or_add_tcPr()
-
-    # Remove existing borders element if present
-    for existing in tcPr.findall(qn('w:tcBorders')):
-        tcPr.remove(existing)
-
-    tcBorders = OxmlElement('w:tcBorders')
-    for edge_name, attrs in kwargs.items():
-        edge = OxmlElement(f'w:{edge_name}')
-        for attr_key, attr_val in attrs.items():
-            edge.set(qn(f'w:{attr_key}'), str(attr_val))
-        tcBorders.append(edge)
-    tcPr.append(tcBorders)
-
-
 TABLE_GRID_COLOR = "808080"  # medium gray — neat but clearly gridded
 TABLE_GRID_SIZE = "4"        # border width in eighths of a point (4 = 0.5pt)
 
 
-def _apply_grid_borders(table, num_rows: int, num_cols: int):
+def _set_table_grid_borders(table):
     """
-    Apply full, uniform grid lines: a thin single rule on all four edges of
-    every cell (standard Word "Table Grid" look).
+    Apply full, uniform grid lines at the TABLE level (outer box + insideH/V).
 
-    Works for merged cells too — table.cell() returns the owning cell for any
-    position covered by a span, so its outer edges get the grid line.
+    Table-level borders are the robust way to get a complete grid: Word draws
+    them correctly across merged cells (colspan/rowspan). Per-cell borders can't
+    — table.cell() returns the same origin cell for every position a span
+    covers, so a spanned cell's far edges get skipped, leaving random gaps.
     """
-    grid = {"val": "single", "sz": TABLE_GRID_SIZE, "color": TABLE_GRID_COLOR}
+    tbl = table._tbl
+    tblPr = tbl.tblPr if tbl.tblPr is not None else OxmlElement("w:tblPr")
 
-    for row_idx in range(num_rows):
-        for col_idx in range(num_cols):
-            cell = table.cell(row_idx, col_idx)
-            _set_cell_border(cell, top=grid, bottom=grid, left=grid, right=grid)
+    for existing in tblPr.findall(qn("w:tblBorders")):
+        tblPr.remove(existing)
+
+    tblBorders = OxmlElement("w:tblBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        el = OxmlElement(f"w:{edge}")
+        el.set(qn("w:val"), "single")
+        el.set(qn("w:sz"), TABLE_GRID_SIZE)
+        el.set(qn("w:space"), "0")
+        el.set(qn("w:color"), TABLE_GRID_COLOR)
+        tblBorders.append(el)
+    tblPr.append(tblBorders)
 
 
 
@@ -222,7 +209,7 @@ def _shade_cell(cell, color: str):
 
 
 def _set_table_width(table, total_width_inches: float):
-    """Set the total table width in DXA, enable autofit layout, and clear table-level borders."""
+    """Set the total table width in DXA and enable autofit layout."""
     total_width_dxa = int(total_width_inches * 1440)
     tbl = table._tbl
     tblPr = tbl.tblPr if tbl.tblPr is not None else OxmlElement("w:tblPr")
@@ -241,19 +228,6 @@ def _set_table_width(table, total_width_inches: float):
     layout = OxmlElement("w:tblLayout")
     layout.set(qn("w:type"), "autofit")
     tblPr.append(layout)
-
-    # Clear table-level borders (cell-level borders take precedence)
-    for existing in tblPr.findall(qn("w:tblBorders")):
-        tblPr.remove(existing)
-    tblBorders = OxmlElement("w:tblBorders")
-    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
-        el = OxmlElement(f"w:{edge}")
-        el.set(qn("w:val"), "none")
-        el.set(qn("w:sz"), "0")
-        el.set(qn("w:space"), "0")
-        el.set(qn("w:color"), "auto")
-        tblBorders.append(el)
-    tblPr.append(tblBorders)
 
 
 # ---------------------------------------------------------------------------
@@ -360,11 +334,11 @@ def add_excel_table_to_docx(doc, table_data: dict, total_width_inches: float = 6
     num_rows = len(rows)
     num_cols = len(columns)
     
-    # Default table style has no borders; we apply our own via _apply_grid_borders.
+    # Default table style has no borders; we apply our own full grid at the table level.
     table = doc.add_table(rows=num_rows, cols=num_cols)
 
     _set_table_width(table, total_width_inches)
-    
+
     # Populate cells with compact styled text
     for row_idx, row_data in enumerate(rows):
         is_header = (row_idx == 0)
@@ -376,7 +350,7 @@ def add_excel_table_to_docx(doc, table_data: dict, total_width_inches: float = 6
             cell.text = cell_text
             _style_table_cell(cell, bold=is_header)
 
-    _apply_grid_borders(table, num_rows, num_cols)
+    _set_table_grid_borders(table)
 
 def add_isolated_landscape_table(doc, table_data: dict, caption_text: str = ""):
     """
@@ -477,31 +451,14 @@ def _restyle_existing_table(table):
     Post-process a table that was rendered by complex_table_schema (or any other
     renderer) to match the shared style: compact 8pt text with full grid lines.
     """
-    num_rows = len(table.rows)
-    num_cols = len(table.columns)
-
-    # Clear table-level borders
-    tbl = table._tbl
-    tblPr = tbl.tblPr if tbl.tblPr is not None else OxmlElement("w:tblPr")
-    for existing in tblPr.findall(qn("w:tblBorders")):
-        tblPr.remove(existing)
-    tblBorders = OxmlElement("w:tblBorders")
-    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
-        el = OxmlElement(f"w:{edge}")
-        el.set(qn("w:val"), "none")
-        el.set(qn("w:sz"), "0")
-        el.set(qn("w:space"), "0")
-        el.set(qn("w:color"), "auto")
-        tblBorders.append(el)
-    tblPr.append(tblBorders)
-
-    # Restyle every cell: compact font + clean borders
+    # Restyle every cell: compact font
     for row_idx, row in enumerate(table.rows):
         is_header = (row_idx == 0)
         for col_idx, cell in enumerate(row.cells):
             _style_table_cell(cell, bold=is_header)
 
-    _apply_grid_borders(table, num_rows, num_cols)
+    # Full grid at the table level (renders correctly across merged cells)
+    _set_table_grid_borders(table)
 
 
 def add_docx_table_from_data(doc, table_data: Dict):
