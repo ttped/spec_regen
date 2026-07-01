@@ -2,6 +2,7 @@ import os
 import json
 import re
 import statistics
+from collections import defaultdict
 from typing import List, Dict, Tuple, Optional, Any
 from json_repair import repair_json
 
@@ -124,6 +125,84 @@ def line_overlaps_asset(
             return True
     
     return False
+
+
+# =============================================================================
+# RUNNING HEADER / FOOTER DETECTION (by repeated text across pages)
+# =============================================================================
+
+_REPEAT_TOP_BAND = 0.12      # a line in the top 12% of the page is a header candidate
+_REPEAT_BOTTOM_BAND = 0.88   # a line in the bottom 12% is a footer candidate
+
+
+def _normalize_repeat_text(text: str) -> str:
+    """
+    Normalize a line for repetition matching: lowercased, digit runs collapsed to
+    '#' (so 'Page 5' and 'Page 6' match), punctuation stripped, spaces collapsed.
+    """
+    t = re.sub(r'\d+', '#', text.lower())
+    t = re.sub(r'[^\w#]+', ' ', t)
+    return re.sub(r'\s+', ' ', t).strip()
+
+
+def _repeat_band(norm_top: float) -> Optional[str]:
+    """Which header/footer band a line falls in ('top'/'bottom'), or None for the body."""
+    if norm_top <= _REPEAT_TOP_BAND:
+        return 'top'
+    if norm_top >= _REPEAT_BOTTOM_BAND:
+        return 'bottom'
+    return None
+
+
+def detect_running_headers_footers(
+    pages_lines: List[Tuple],
+    min_pages: int = 3,
+    min_fraction: float = 0.5,
+) -> set:
+    """
+    Find text that repeats across many pages in the top/bottom band — i.e. running
+    headers/footers (document titles, classification banners, "Page X of Y", dates).
+
+    `pages_lines`: list of (page_id, page_height, page_width, lines, median_height).
+    Returns a set of (normalized_text, band) signatures considered running
+    headers/footers.
+
+    Two safeguards keep real content safe: only the top/bottom bands are
+    considered, and a line that parses as a section header is never counted (so a
+    recurring-looking heading can't be flagged). Position-tolerant — catches
+    headers/footers outside the narrow fixed threshold as long as they recur.
+    """
+    num_pages = len(pages_lines)
+    if num_pages < min_pages:
+        return set()
+
+    pages_with_sig = defaultdict(set)   # (sig, band) -> set of page_ids it appears on
+    for page_id, page_height, _page_width, lines, _median in pages_lines:
+        if not page_height:
+            continue
+        seen_here = set()
+        for line in lines:
+            text = (line.get('text') or '').strip()
+            if not text:
+                continue
+            bbox = line.get('bbox')
+            norm_top = (bbox.get('top', 0) / page_height) if bbox else 0.0
+            band = _repeat_band(norm_top)
+            if not band:
+                continue
+            is_hdr, _num, _topic, _rem, _ctx = check_if_paragraph_is_header(text)
+            if is_hdr:
+                continue
+            sig = _normalize_repeat_text(text)
+            if not sig:
+                continue
+            key = (sig, band)
+            if key not in seen_here:
+                seen_here.add(key)
+                pages_with_sig[key].add(page_id)
+
+    threshold = max(min_pages, int(num_pages * min_fraction))
+    return {key for key, pages in pages_with_sig.items() if len(pages) >= threshold}
 
 
 def get_line_bbox(page_dict: Dict, word_indices: List[int]) -> Optional[Dict]:
@@ -999,65 +1078,78 @@ def run_section_processing_on_file(
     dropped_header_lines = 0
     dropped_footer_lines = 0
     dropped_asset_overlap_lines = 0
-    
+    dropped_repeat_lines = 0
+
+    # --- Pre-pass: reconstruct lines once per page (and capture page metadata) ---
+    pages_lines = []  # (page_id, page_height, page_width, lines, median_height)
     for page_id, page_dict, page_meta in content_pages:
         if page_meta:
             all_page_metadata[page_id] = page_meta
 
         page_height = page_meta.get('page_height', 0)
         page_width = page_meta.get('page_width', 0)
-        
+
+        lines = reconstruct_lines_with_bbox(page_dict)
+
+        # Median line height for this page (headers are usually > 1.1x median).
+        line_heights = [
+            line['bbox']['height'] for line in lines
+            if line.get('bbox') and line['bbox'].get('height', 0) > 0
+        ]
+        median_height = statistics.median(line_heights) if line_heights else 10.0
+
+        pages_lines.append((page_id, page_height, page_width, lines, median_height))
+
+    # --- Detect running headers/footers by repeated text across the document ---
+    running_sigs = detect_running_headers_footers(pages_lines)
+    if running_sigs:
+        print(f"  - Detected {len(running_sigs)} running header/footer text signature(s) across pages.")
+
+    # --- Main pass: filter lines and build elements ---
+    for page_id, page_height, page_width, lines, median_height in pages_lines:
         # Get YOLO assets for this page (if any)
         assets_on_page = yolo_assets_by_page.get(page_id, [])
-        
-        lines = reconstruct_lines_with_bbox(page_dict)
-        
-        # --- NEW: Calculate Page-Level Font Stats ---
-        # We calculate the median line height for this specific page.
-        # Headers are usually > 1.1x the median height.
-        line_heights = []
-        for line in lines:
-            if line.get('bbox') and line['bbox'].get('height', 0) > 0:
-                line_heights.append(line['bbox']['height'])
-        
-        median_height = statistics.median(line_heights) if line_heights else 10.0
-        # --------------------------------------------
-        
+
         for line_data in lines:
             line_text = line_data['text'].strip()
             if not line_text:
                 continue
-            
+
             line_bbox = line_data.get('bbox')
-            
+
             # CALCULATE NORMALIZED TOP
             norm_top = 0.0
             if line_bbox and page_height > 0:
                 norm_top = line_bbox.get('top', 0) / page_height
 
-            # --- HEADER FILTER (UPDATED) ---
-            # Old: if line_bbox.get('top', 9999) < header_top_threshold:
+            is_header, section_num, topic, remainder, context = check_if_paragraph_is_header(line_text)
+
+            # --- RUNNING HEADER/FOOTER FILTER (repeated text, position-tolerant) ---
+            # Never drop a real section header this way.
+            if not is_header and running_sigs:
+                band = _repeat_band(norm_top)
+                if band and (_normalize_repeat_text(line_text), band) in running_sigs:
+                    dropped_repeat_lines += 1
+                    continue
+
+            # --- HEADER FILTER (fixed-threshold backstop) ---
             if header_rel_threshold > 0 and norm_top < header_rel_threshold:
                 dropped_header_lines += 1
                 continue
-            
-            # --- FOOTER FILTER (UPDATED) ---
-            # Old: if line_bbox.get('top', 0) > footer_top_threshold:
-            # Note: For footers, you usually check if norm_top > 0.94 (or similar)
+
+            # --- FOOTER FILTER (fixed-threshold backstop) ---
             if footer_rel_threshold > 0 and norm_top > footer_rel_threshold:
                 dropped_footer_lines += 1
                 continue
-            
-            # --- YOLO ASSET OVERLAP FILTER ---
-            # Filter out text that overlaps with detected figures/tables
+
+            # --- YOLO ASSET / ABANDON OVERLAP FILTER ---
+            # Filter out text that overlaps detected figures/tables/abandon regions
             if assets_on_page and line_overlaps_asset(
                 line_bbox, page_height, page_width, assets_on_page, asset_overlap_threshold
             ):
                 dropped_asset_overlap_lines += 1
                 continue
 
-            is_header, section_num, topic, remainder, context = check_if_paragraph_is_header(line_text)
-            
             # --- NEW: Calculate Visual Features ---
             current_height = line_bbox['height'] if line_bbox and 'height' in line_bbox else median_height
             relative_height = current_height / median_height if median_height > 0 else 1.0
@@ -1124,8 +1216,12 @@ def run_section_processing_on_file(
     
     section_count = sum(1 for e in final_elements if e['type'] == 'section')
     print(f"  - Extracted {len(final_elements)} elements ({section_count} sections).")
+    if dropped_repeat_lines > 0:
+        print(f"  - Filtered {dropped_repeat_lines} running header/footer lines (repeated text).")
+    if dropped_header_lines or dropped_footer_lines:
+        print(f"  - Filtered {dropped_header_lines} header + {dropped_footer_lines} footer lines (edge threshold).")
     if dropped_asset_overlap_lines > 0:
-        print(f"  - Filtered {dropped_asset_overlap_lines} lines overlapping with YOLO-detected assets.")
+        print(f"  - Filtered {dropped_asset_overlap_lines} lines overlapping with YOLO-detected assets/abandon regions.")
 
 if __name__ == '__main__':
     import sys

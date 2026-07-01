@@ -561,10 +561,12 @@ def run_detection_on_image(
         raw_ocr_dir: Directory containing raw OCR files (for keyword fallback)
     
     Returns:
-        List of validated DetectedAsset objects for figures and tables
+        (validated_assets, abandon_regions): a list of validated DetectedAsset
+        objects (figures/tables/formulas) and a list of abandon-region dicts
+        ({bbox_pixels, img_width, img_height}) for header/footer filtering.
     """
     validated_assets = []
-    
+
     # Run prediction
     results = model.predict(
         str(image_path),
@@ -574,9 +576,9 @@ def run_detection_on_image(
         device=device,
         verbose=False
     )
-    
+
     if not results or len(results) == 0:
-        return validated_assets
+        return validated_assets, []
     
     result = results[0]
     
@@ -602,6 +604,13 @@ def run_detection_on_image(
     # Separate assets and captions
     asset_detections = [d for d in all_detections if d.class_name in ASSET_CLASSES]
     caption_detections = [d for d in all_detections if d.class_name in CAPTION_CLASSES]
+
+    # "abandon" = headers/footers/page-numbers/junk. Kept (without cropping) so
+    # section_processor can filter OCR text that overlaps these regions.
+    abandon_regions = [
+        {"bbox_pixels": d.bbox_pixels, "img_width": img_width, "img_height": img_height}
+        for d in all_detections if d.class_name == "abandon"
+    ]
     
     # Filter out likely hole-punch false positives
     filtered_assets = []
@@ -687,7 +696,7 @@ def run_detection_on_image(
     del results
     del result
 
-    return validated_assets
+    return validated_assets, abandon_regions
 
 
 def crop_and_save_asset(
@@ -869,7 +878,7 @@ def process_document(
     for image_path, page_number in page_images:
         print(f"    Page {page_number}...", end=' ', flush=True)
         # Run detection
-        detected_assets = run_detection_on_image(
+        detected_assets, abandon_regions = run_detection_on_image(
             model=model,
             image_path=image_path,
             doc_stem=doc_stem,
@@ -883,6 +892,25 @@ def process_document(
             print(f"Found {len(detected_assets)} asset(s)")
         else:
             print("ok")
+
+        # Save "abandon" (header/footer/junk) regions as filter-only metadata —
+        # no crop. section_processor uses them to drop overlapping OCR text;
+        # asset_processor skips them so they're never placed as figures.
+        for abandon_index, region in enumerate(abandon_regions, start=1):
+            x1, y1, x2, y2 = region["bbox_pixels"]
+            abandon_meta = {
+                "asset_id": f"{doc_stem}_abandon_p{page_number}_{x1}_{y1}",
+                "asset_type": "abandon",
+                "page": page_number,
+                "bbox": {
+                    "pixels": [x1, y1, x2 - x1, y2 - y1],
+                    "page_width_px": region["img_width"],
+                    "page_height_px": region["img_height"],
+                },
+            }
+            abandon_json = doc_output_dir / f"{doc_stem}_abandon_p{page_number:03d}_{abandon_index:03d}.json"
+            with open(abandon_json, 'w', encoding='utf-8') as f:
+                json.dump(abandon_meta, f, indent=2)
         
         # Process each detected asset
         for asset in detected_assets:
