@@ -101,6 +101,11 @@ BLANK_PAGE_PATTERN = re.compile(
 # Minimum threshold for section numbers to auto-classify as TOC
 MIN_SECTION_NUMBERS_FOR_TOC = 10
 
+# Minimum section numbers required alongside a TOC header to fast-classify as TOC.
+# Kept above the "few headings on a content page" range (a content page commonly
+# shows 1.0/1.1/2.0/2.1/2.2 ~= 5); below that we defer to the LLM.
+MIN_SECTION_NUMBERS_FOR_HEADER_TOC = 7
+
 # Minimum threshold for TOC-style entries
 MIN_TOC_ENTRIES_FOR_TOC = 8
 # Density gate: on a real TOC, section-number tokens dominate the page.
@@ -408,7 +413,7 @@ def fast_classify_page(page_text: str) -> Optional[str]:
         if density >= MIN_SECTION_DENSITY_FOR_TOC and is_sparse:
             return "TABLE_OF_CONTENTS"
 
-    if has_toc_header and len(unique_section_numbers) >= 5 and is_sparse:
+    if has_toc_header and len(unique_section_numbers) >= MIN_SECTION_NUMBERS_FOR_HEADER_TOC and is_sparse:
         return "TABLE_OF_CONTENTS"
 
     if len(toc_entries) >= MIN_TOC_ENTRIES_FOR_TOC and is_sparse:
@@ -563,7 +568,7 @@ def get_fast_classification_reason(page_text: str) -> str:
     if len(unique_section_numbers) >= MIN_SECTION_NUMBERS_FOR_TOC:
         return f"Found {len(unique_section_numbers)} unique section numbers{filter_note}"
     
-    if has_toc_header and len(unique_section_numbers) >= 5:
+    if has_toc_header and len(unique_section_numbers) >= MIN_SECTION_NUMBERS_FOR_HEADER_TOC:
         return f"TOC header + {len(unique_section_numbers)} section numbers{filter_note}"
     
     if len(toc_entries) >= MIN_TOC_ENTRIES_FOR_TOC:
