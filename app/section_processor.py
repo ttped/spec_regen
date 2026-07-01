@@ -540,6 +540,53 @@ def roman_to_int(s: str) -> Optional[int]:
     return total if total > 0 else None
 
 
+# Physical units that, when they lead a "topic", almost always mean a
+# measurement was misread as a section (e.g. "5.0 GHz", "12 ms", "100 KA").
+_UNIT_STRONG = {
+    'hz', 'khz', 'mhz', 'ghz', 'thz', 'mv', 'kv', 'vdc', 'vac', 'vrms', 'rms',
+    'ma', 'ka', 'ua', 'mw', 'kw', 'kva', 'kvar', 'var', 'ohm', 'ohms', 'kohm',
+    'mohm', 'db', 'dbm', 'dbi', 'dbc', 'dbw', 'ms', 'us', 'ns', 'ps', 'sec',
+    'secs', 'second', 'seconds', 'msec', 'usec', 'nsec', 'min', 'mins', 'minute',
+    'minutes', 'hr', 'hrs', 'hour', 'hours', 'mm', 'cm', 'km', 'mil', 'mils',
+    'nm', 'um', 'micron', 'microns', 'mg', 'kg', 'lb', 'lbs', 'oz', 'psi',
+    'psia', 'psig', 'kpa', 'mpa', 'bar', 'torr', 'rpm', 'hp', 'gpm', 'cfm',
+    'percent', 'pct', 'kb', 'mb', 'gb', 'tb', 'bps', 'kbps', 'mbps', 'gbps',
+    'baud', 'ppm', 'mah', 'ah', 'wh', 'kwh', 'deg', 'rad', 'mrad', 'sr', '%',
+}
+# Ambiguous short units — only reject when the "section number" is a plain
+# measurement value (integer or single decimal), not a hierarchical number.
+_UNIT_WEAK = {'v', 'a', 'w', 's', 'm', 'c', 'f', 'k', 'g', 'n', 'in', 'ft', 'pa', 'j', 't'}
+# A topic that starts with a linking word is usually a cross-reference in body
+# text ("1.1.2 and 1.3.4"), not a heading.
+_TOPIC_LINK_WORDS = {'and', 'or', 'thru', 'through'}
+
+
+def _measurement_or_reference_reason(section_num: str, topic: str) -> Optional[str]:
+    """
+    High-precision detector for common false-positive 'sections':
+      - measurements misread as sections ('5.0 GHz', '1.0 VDC peak', '12 ms')
+      - cross-references ('1.1.2 and 1.3.4')
+    Returns a rejection reason string, or None if the topic looks legitimate.
+    """
+    tokens = topic.split()
+    if not tokens:
+        return None
+
+    first_raw = tokens[0].lower()
+    if first_raw in ('&',) or first_raw in _TOPIC_LINK_WORDS:
+        return 'cross_reference'
+
+    first = re.sub(r'[^a-z%]', '', first_raw)  # strip punctuation/degree marks
+    if not first:
+        return None
+    if first in _UNIT_STRONG:
+        return 'unit_measurement'
+    # Weak units only count against value-like numbers (<= one decimal level).
+    if first in _UNIT_WEAK and section_num.replace('.', '', 1).isdigit():
+        return 'unit_measurement'
+    return None
+
+
 def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[bool, Optional[str], Optional[str], Optional[str], Optional[Dict]]:
     """
     Checks if a line of text is a section header using regex.
@@ -735,6 +782,14 @@ def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[b
         if debug:
             print(f"      [DEBUG] Rejected (only numbers/punctuation): '{section_num}'")
         context['rejection_reason'] = 'numbers_and_punctuation_only'
+        return False, None, None, None, context
+
+    # Reject measurements ("5.0 GHz", "12 ms") and cross-references ("1.1.2 and 1.3.4")
+    measurement_reason = _measurement_or_reference_reason(section_num, topic)
+    if measurement_reason:
+        if debug:
+            print(f"      [DEBUG] Rejected ({measurement_reason}): '{section_num} {topic[:20]}'")
+        context['rejection_reason'] = measurement_reason
         return False, None, None, None, context
 
     if debug:
