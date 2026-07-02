@@ -208,26 +208,52 @@ def _shade_cell(cell, color: str):
     tcPr.append(shading)
 
 
-def _set_table_width(table, total_width_inches: float):
-    """Set the total table width in DXA and enable autofit layout."""
-    total_width_dxa = int(total_width_inches * 1440)
+def _set_autofit_to_contents(table):
+    """
+    Configure a table as Word's "AutoFit to Contents": columns size to their
+    content instead of being forced to fixed widths / full page width.
+
+    Sets the autofit layout algorithm and makes the table AND every cell width
+    "auto" (removing any fixed dxa widths), and zeroes the grid column widths so
+    Word recomputes them from the content. Handles merged cells fine — setting a
+    merged cell's width to auto repeatedly is harmless.
+    """
     tbl = table._tbl
     tblPr = tbl.tblPr if tbl.tblPr is not None else OxmlElement("w:tblPr")
 
-    # Set total width
-    for existing in tblPr.findall(qn("w:tblW")):
-        tblPr.remove(existing)
-    tblW = OxmlElement("w:tblW")
-    tblW.set(qn("w:w"), str(total_width_dxa))
-    tblW.set(qn("w:type"), "dxa")
-    tblPr.append(tblW)
-
-    # Enable autofit so Word can shrink columns to fit
+    # Autofit layout algorithm
     for existing in tblPr.findall(qn("w:tblLayout")):
         tblPr.remove(existing)
     layout = OxmlElement("w:tblLayout")
     layout.set(qn("w:type"), "autofit")
     tblPr.append(layout)
+
+    # Table preferred width = auto
+    for existing in tblPr.findall(qn("w:tblW")):
+        tblPr.remove(existing)
+    tblW = OxmlElement("w:tblW")
+    tblW.set(qn("w:w"), "0")
+    tblW.set(qn("w:type"), "auto")
+    tblPr.append(tblW)
+
+    # Every cell preferred width = auto (let content drive column widths)
+    for row in table.rows:
+        for cell in row.cells:
+            tcPr = cell._tc.get_or_add_tcPr()
+            for existing in tcPr.findall(qn("w:tcW")):
+                tcPr.remove(existing)
+            tcW = OxmlElement("w:tcW")
+            tcW.set(qn("w:w"), "0")
+            tcW.set(qn("w:type"), "auto")
+            tcPr.append(tcW)
+
+    # Zero fixed grid column widths so Word recomputes from content
+    tblGrid = tbl.find(qn("w:tblGrid"))
+    if tblGrid is not None:
+        for gc in tblGrid.findall(qn("w:gridCol")):
+            gc.set(qn("w:w"), "0")
+
+    table.autofit = True
 
 
 # ---------------------------------------------------------------------------
@@ -316,14 +342,15 @@ def _needs_landscape(table_data: dict, portrait_width: float = PORTRAIT_WIDTH) -
 def add_excel_table_to_docx(doc, table_data: dict, total_width_inches: float = 6.5):
     """
     Adds a table to the docx document using data extracted from Excel.
-    
-    Formatting: compact 8pt text with full grid lines.
-    Total table width fills the page; Word auto-fits columns.
-    
+
+    Formatting: compact 8pt text, full grid lines, AutoFit-to-Contents column
+    sizing (columns size to their content rather than filling the page).
+
     Args:
         doc: python-docx Document instance
         table_data: {"columns": [{"width": float}, ...], "rows": [[val, ...], ...]}
-        total_width_inches: Total table width (default 6.5" = US Letter with 1" margins)
+        total_width_inches: Unused (kept for signature compatibility); columns
+            are now auto-sized to content.
     """
     rows = table_data.get("rows", [])
     columns = table_data.get("columns", [])
@@ -337,8 +364,6 @@ def add_excel_table_to_docx(doc, table_data: dict, total_width_inches: float = 6
     # Default table style has no borders; we apply our own full grid at the table level.
     table = doc.add_table(rows=num_rows, cols=num_cols)
 
-    _set_table_width(table, total_width_inches)
-
     # Populate cells with compact styled text
     for row_idx, row_data in enumerate(rows):
         is_header = (row_idx == 0)
@@ -351,6 +376,7 @@ def add_excel_table_to_docx(doc, table_data: dict, total_width_inches: float = 6
             _style_table_cell(cell, bold=is_header)
 
     _set_table_grid_borders(table)
+    _set_autofit_to_contents(table)
 
 def add_isolated_landscape_table(doc, table_data: dict, caption_text: str = ""):
     """
@@ -449,7 +475,8 @@ def add_section_heading(doc, section_number: str, topic: str, level: int = 1):
 def _restyle_existing_table(table):
     """
     Post-process a table that was rendered by complex_table_schema (or any other
-    renderer) to match the shared style: compact 8pt text with full grid lines.
+    renderer) to match the shared style: compact 8pt text, full grid lines, and
+    AutoFit-to-Contents column sizing.
     """
     # Restyle every cell: compact font
     for row_idx, row in enumerate(table.rows):
@@ -459,6 +486,8 @@ def _restyle_existing_table(table):
 
     # Full grid at the table level (renders correctly across merged cells)
     _set_table_grid_borders(table)
+    # Size columns to content (overrides the renderer's fixed dxa widths)
+    _set_autofit_to_contents(table)
 
 
 def add_docx_table_from_data(doc, table_data: Dict):
