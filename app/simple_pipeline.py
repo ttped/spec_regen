@@ -162,6 +162,20 @@ def get_document_stems_from_images(images_dir: str) -> List[str]:
     return sorted(list(stems))
 
 
+def is_figure_only_document(name: str) -> bool:
+    """
+    True if a document name is just a figure label — "FIG A", "FIGURE A",
+    "fig_a", "fig-a", "FIG. A-1", "Figure 3", etc. Those are standalone figure
+    sheets that don't need the spec pipeline.
+
+    Matches 'fig'/'figure' followed by a short identifier and nothing else, so
+    real documents like "Figure Control Requirements" are NOT skipped.
+    """
+    import re
+    return bool(re.match(r'^\s*fig(?:ure)?s?[\s_\-.]*[a-z0-9][a-z0-9\-.]{0,5}\s*$',
+                         name or "", re.IGNORECASE))
+
+
 def extract_title_from_first_page(raw_input_path: str, output_path: str):
     """Extract title page information from page 1."""
     print(f"  Loading: {raw_input_path}")
@@ -398,6 +412,11 @@ if __name__ == '__main__':
         print(f"{'=' * 60}")
         print(f"[{doc_idx}/{total_docs} ({pct:.0f}%)] {stem}")
         print(f"{'=' * 60}")
+
+        # Standalone figure sheets ("FIG A", "FIGURE B", ...) aren't specs — skip.
+        if is_figure_only_document(stem):
+            print(f"  [Skip] '{stem}' looks like a standalone figure sheet — not processed.")
+            continue
 
         # Resolve the actual YOLO exports subdirectory for this stem.
         from asset_processor import resolve_asset_directory

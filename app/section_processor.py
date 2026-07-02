@@ -560,6 +560,10 @@ _UNIT_WEAK = {'v', 'a', 'w', 's', 'm', 'c', 'f', 'k', 'g', 'n', 'in', 'ft', 'pa'
 # text ("1.1.2 and 1.3.4"), not a heading.
 _TOPIC_LINK_WORDS = {'and', 'or', 'thru', 'through'}
 
+# Hard cap on the major section number. Real specs occasionally reach the low
+# 20s, so this stays generous and only rejects the clearly impossible.
+MAX_MAJOR_SECTION_NUMBER = 90
+
 
 def _measurement_or_reference_reason(section_num: str, topic: str) -> Optional[str]:
     """
@@ -741,12 +745,15 @@ def check_if_paragraph_is_header(line_text: str, debug: bool = False) -> Tuple[b
         context['rejection_reason'] = 'zero_section'
         return False, None, None, None, context
 
-    # 2. Soft cap on major section number.
+    # 2. Hard cap on major section number. A few real specs legitimately reach
+    #    the low 20s, so keep this generous — it only rejects the clearly
+    #    impossible. (Smaller-but-suspicious majors are handled softly by the ML
+    #    features major_section_gt_6/10/20.)
     if parts and parts[0].isdigit():
         major_section = int(parts[0])
-        if major_section > 100:
+        if major_section > MAX_MAJOR_SECTION_NUMBER:
             if debug:
-                print(f"      [DEBUG] Rejected (major section > 100): '{section_num}'")
+                print(f"      [DEBUG] Rejected (major section > {MAX_MAJOR_SECTION_NUMBER}): '{section_num}'")
             context['rejection_reason'] = 'major_section_too_large'
             return False, None, None, None, context
 
