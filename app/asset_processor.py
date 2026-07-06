@@ -448,19 +448,28 @@ def integrate_assets_with_elements(
                 text = str(block.get('text', '')).strip()
                 if not text:
                     continue
+                # A section's body can span pages; each paragraph must sort by
+                # the page it physically sits on, not the header's page —
+                # otherwise a paragraph near the top of the NEXT page sorts
+                # before this page's own content and misplaces assets.
+                try:
+                    body_page = int(block.get('page') or page)
+                except (ValueError, TypeError):
+                    body_page = page
                 bbox = block.get('bbox')
                 if bbox and not bbox.get('_is_normalized'):
-                    pw, ph = get_page_ocr_dimensions(page_metadata, page)
+                    pw, ph = get_page_ocr_dimensions(page_metadata, body_page)
                     if pw and ph:
                         bbox = normalize_text_bbox(bbox, pw, ph)
-                body_top = _resolve_norm_top(bbox, page, page_metadata, head_top)
+                default_top = head_top if body_page == page else 0.0
+                body_top = _resolve_norm_top(bbox, body_page, page_metadata, default_top)
                 body_unit = {
                     'type': 'unassigned_text_block',
-                    'page_number': element.get('page_number'),
+                    'page_number': body_page,
                     'content': text,
                     'bbox': bbox,
                 }
-                units.append((page, body_top, seq, body_unit))
+                units.append((body_page, body_top, seq, body_unit))
                 seq += 1
         else:
             # Non-section elements (and sections without body) pass through;

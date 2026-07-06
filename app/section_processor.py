@@ -842,7 +842,10 @@ def _reconstruct_paragraphs(blocks: List[Dict]) -> List[Dict]:
     downstream steps (asset interleaving) can place figures/tables in the
     correct reading position *within* a section, not just after it.
 
-    Returns a list of {"text": str, "bbox": dict|None}, one per paragraph.
+    Returns a list of {"text": str, "bbox": dict|None, "page": int|None}, one
+    per paragraph. `page` is the paragraph's own page — a section's body can
+    span pages, and downstream ordering must sort each paragraph by where it
+    physically sits, not by the section header's page.
     """
     paragraphs: List[Dict] = []
     current_words: List[str] = []
@@ -854,6 +857,7 @@ def _reconstruct_paragraphs(blocks: List[Dict]) -> List[Dict]:
             paragraphs.append({
                 "text": " ".join(current_words),
                 "bbox": _merge_bboxes(current_bboxes),
+                "page": current_key[0] if current_key else None,
             })
 
     for block in blocks:
