@@ -302,6 +302,10 @@ if __name__ == '__main__':
                        help="Table reconstruction: 'llm' (vision OCR of crops) or 'iris' (IRIS deliverable)")
     parser.add_argument('--shard', type=int, choices=[1, 2, 3, 4], default=None,
                        help="Run only a quarter of the documents: 1, 2, 3, or 4 for parallel processing")
+    parser.add_argument('--docs', nargs='+', default=None, metavar='NAME',
+                       help="Process only these document(s) by name (space-separated). "
+                            "Matching ignores case and space/underscore/hyphen differences, "
+                            "e.g. --docs roland tyler")
 
     cli_args = parser.parse_args()
 
@@ -370,10 +374,27 @@ if __name__ == '__main__':
     # DOCUMENT LIST & SHARDING
     # ==========================================================================
     doc_stems = get_document_stems(args.raw_ocr_dir)
-    doc_stems = doc_stems[10:20]
-    
+
+    if cli_args.docs:
+        # Select specific documents by name, tolerant of case and
+        # space/underscore/hyphen differences (substring match).
+        import re
+        def _norm(s: str) -> str:
+            return re.sub(r'[\s_\-]+', '', s.lower())
+        selected, seen = [], set()
+        for req in cli_args.docs:
+            rn = _norm(req)
+            matches = [s for s in doc_stems if rn in _norm(s)]
+            if not matches:
+                print(f"  [Warn] No document matched '{req}'")
+            for m in matches:
+                if m not in seen:
+                    seen.add(m)
+                    selected.append(m)
+        doc_stems = selected
+        print(f"Selected {len(doc_stems)} document(s) via --docs: {doc_stems}\n")
     # 4-way sharding to allow running 4 separate terminals concurrently
-    if cli_args.shard is not None:
+    elif cli_args.shard is not None:
         doc_stems = doc_stems[cli_args.shard - 1 :: 4]
         print(f"Running shard {cli_args.shard}/4: Processing {len(doc_stems)} documents.\n")
     else:
