@@ -256,22 +256,6 @@ def _set_autofit_to_contents(table):
     table.autofit = True
 
 
-def _ensure_table_separator(doc):
-    """
-    Word visually merges two tables that touch with no paragraph between them.
-    If the document body currently ends with a table, insert an empty paragraph
-    so the next table stays a separate table.
-    """
-    for child in reversed(list(doc.element.body)):
-        tag = child.tag
-        if tag == qn("w:tbl"):
-            doc.add_paragraph()
-            return
-        if tag == qn("w:p"):
-            return
-        # skip sectPr / bookmarks / other markers and keep looking upward
-
-
 # ---------------------------------------------------------------------------
 # Portrait vs. landscape decision — content-aware
 # ---------------------------------------------------------------------------
@@ -377,8 +361,6 @@ def add_excel_table_to_docx(doc, table_data: dict, total_width_inches: float = 6
     num_rows = len(rows)
     num_cols = len(columns)
 
-    _ensure_table_separator(doc)  # keep this table distinct from a preceding one
-
     # Default table style has no borders; we apply our own full grid at the table level.
     table = doc.add_table(rows=num_rows, cols=num_cols)
 
@@ -396,13 +378,16 @@ def add_excel_table_to_docx(doc, table_data: dict, total_width_inches: float = 6
     _set_table_grid_borders(table)
     _set_autofit_to_contents(table)
 
+    # Trailing empty paragraph: Word merges tables that touch with no
+    # paragraph between them, so every table always leaves one behind.
+    doc.add_paragraph()
+
 def add_isolated_landscape_table(doc, table_data: dict, caption_text: str = ""):
     """
     Isolates a table on a new landscape page, then reverts the document to portrait.
     Uses narrow margins (0.5") to maximize table space.
     Caption is rendered on the landscape page before the section break.
     """
-    _ensure_table_separator(doc)  # keep this table distinct from a preceding one
     landscape_section = doc.add_section(WD_SECTION.NEW_PAGE)
     landscape_section.orientation = WD_ORIENT.LANDSCAPE
     
@@ -516,12 +501,14 @@ def add_docx_table_from_data(doc, table_data: Dict):
     clean styling so all tables look consistent regardless of source format.
     """
     from complex_table_schema import add_docx_table_from_data as add_complex_table
-    _ensure_table_separator(doc)  # keep this table distinct from a preceding one
     add_complex_table(doc, table_data)
 
     # Post-process: the table just added is the last one in the document
     if doc.tables:
         _restyle_existing_table(doc.tables[-1])
+
+    # Trailing empty paragraph so adjacent tables never merge in Word.
+    doc.add_paragraph()
 
 
 def add_figure_caption(doc, text: str):

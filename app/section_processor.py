@@ -927,23 +927,28 @@ def group_elements_with_bbox(elements: List[Dict]) -> List[Dict]:
 
 def get_page_id_from_object(page_obj: Dict, fallback_key: str = "0") -> int:
     """
-    Extract page ID from a page object.
+    Extract page ID for a page object.
+
+    The outer dict KEY is the primary source — it's what classify_agent numbers
+    pages by, so content_start_page and the page sort must agree with it. The
+    inner page_Id/page_num field is only a fallback for non-numeric keys.
     """
+    try:
+        return int(fallback_key)
+    except (ValueError, TypeError):
+        pass
+
     page_id = page_obj.get('page_Id') or page_obj.get('page_num')
-    
     if page_id is not None:
         try:
             return int(page_id)
         except (ValueError, TypeError):
             pass
-    
-    try:
-        return int(fallback_key)
-    except (ValueError, TypeError):
-        digits = re.findall(r'\d+', str(fallback_key))
-        if digits:
-            return int(digits[0])
-        return 0
+
+    digits = re.findall(r'\d+', str(fallback_key))
+    if digits:
+        return int(digits[0])
+    return 0
 
 
 def get_page_dict_from_object(page_obj: Any) -> Optional[Dict]:
@@ -1063,18 +1068,28 @@ def load_raw_ocr_pages(input_path: str) -> List[Tuple[int, Dict, Dict]]:
 
     # Handle dict structure (keyed by page number)
 
+    mismatches = 0
     for key, val in data.items():
         # val is the full page object containing 'page_dict' and 'image_meta'
         page_dict = get_page_dict_from_object(val)
 
         if page_dict is not None:
             page_id = get_page_id_from_object(val, fallback_key=key)
+            # Diagnostic: a page_Id that disagrees with the dict key means the
+            # source numbering is inconsistent — page ordering may be affected.
+            inner_id = val.get('page_Id') if isinstance(val, dict) else None
+            if inner_id is not None and str(inner_id) != str(key):
+                mismatches += 1
             # Ensure we pass the original 'val' so extract_page_metadata sees 'image_meta'
             page_meta = extract_page_metadata(page_dict, page_obj=val)
             pages_to_process.append((page_id, page_dict, page_meta))
-            
 
+    if mismatches:
+        print(f"  - [Warning] {mismatches} page(s) have page_Id disagreeing with their dict key; "
+              f"using the dict key for ordering.")
 
+    # Numeric sort — dict keys are strings, so relying on file order (or string
+    # sort: '1','10','2',...) scrambles pages.
     pages_to_process.sort(key=lambda x: x[0])
     return pages_to_process
 
@@ -1194,15 +1209,20 @@ def run_section_processing_on_file(
                     dropped_repeat_lines += 1
                     continue
 
-            # --- HEADER FILTER (fixed-threshold backstop) ---
-            if header_rel_threshold > 0 and norm_top < header_rel_threshold:
-                dropped_header_lines += 1
-                continue
+            # --- HEADER/FOOTER FILTER (fixed-threshold backstop) ---
+            # Lines that parse as section headers are exempt: some documents
+            # print real headings high/low enough to enter the band, and losing
+            # them means missed sections. Running headers/footers are already
+            # caught by the repeated-text filter above; residual false headings
+            # get pruned by the ML step.
+            if not is_header:
+                if header_rel_threshold > 0 and norm_top < header_rel_threshold:
+                    dropped_header_lines += 1
+                    continue
 
-            # --- FOOTER FILTER (fixed-threshold backstop) ---
-            if footer_rel_threshold > 0 and norm_top > footer_rel_threshold:
-                dropped_footer_lines += 1
-                continue
+                if footer_rel_threshold > 0 and norm_top > footer_rel_threshold:
+                    dropped_footer_lines += 1
+                    continue
 
             # --- YOLO ASSET / ABANDON OVERLAP FILTER ---
             # Filter out text that overlaps detected figures/tables/abandon regions
